@@ -1,0 +1,13 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# 编译产物 / 大文件 (模型权重不进仓库)
+bin/
+engine/
+onnx/
+dataset/
+*.engine
+*.onnx
+trt_timing_cache.cache
