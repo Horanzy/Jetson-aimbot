@@ -90,18 +90,16 @@ Predictor (Smith, dt-normalized): α=min(.9, PRED_ALPHA0·dt/DT0), β=min(.6, PR
 Convergence bandwidth: wn = (90°−PM)π/180 / L̂   (PM=50°, no hand tuning, auto-scales with L)
   Kp = 2ζ·wn, Ki = wn²   (ζ=1 critical damping, no overshoot)
   gate = FF_I_GATE/(FF_I_GATE+|ê|)                     // settled-region gate / I distance decay
-  hp = in − in_mean  (in_mean ← β·in, learned only while |in| < FF_I_GATE/2)   // high-passed innovation: bias-free maneuver evidence
-  w = min(1, (|hp[k]+hp[k−1]| / FF_I_GATE)²)           // 2-frame same-sign accumulation: bursts pass, zero-mean oscillation cancels
-  FF = FF_GAIN_VAL · gate · (1−w_eff) · gap_scale · v̂_target
-    w_eff = 0 when the intent command (PI+full FF) is at vmax           // saturation guard: fleeing, not stopping
-    gap_scale = 1 − clamp((age−frame_dt)/L̂, 0, 1)                       // detection gap: withdraw the open-loop term on the L timescale
-  v = clamp(Kp·ê + Ki·∫err·gate + FF, ±vmax)
+  Direction-contradiction CUSUM (per axis, σ-normalized, σ online-estimated):
+    S = max(0, S + clip(∓sign(v̂)·in/σ, 0, C) − K);  alarm S > H → reset that axis v̂=0 (position kept)
+  v = clamp(Kp·ê + Ki·∫err·gate + FF_GAIN_VAL·gate·gap_scale·v̂_target, ±vmax)
+    gap_scale = 1 − clamp((age−frame_dt)/L̂, 0, 1)       // detection gap: withdraw the open-loop term on the L timescale
 Quantization: rem += v·h/s; counts = clamp(trunc(rem), ±120); rem −= counts
 ```
 
 The **P term** `Kp·ê` is the fast channel: flicks and instant corrections. The **I term** `Ki·∫err` is the slow channel: it removes the steady-state trail behind constant-velocity targets; the integrator is a low-pass, so zero-mean periodic disturbances like recoil cannot accumulate → rejected as a side effect. **No D term**: D amplifies high frequencies and would feed recoil noise back into the commands.
 
-**Type-2 velocity feedforward with maneuver withdrawal**: `FF_GAIN_VAL=1` is the **exact open-loop command** for zero trail on constant-velocity targets (the plant is an integrator; derived from the plant model, not tuned). FF is the loop's only open-loop term — when the measurement evidence says the target model broke (stop ghost v̂, reversal, detection gap), it is *withdrawn* rather than re-aimed (re-aiming needs a fast v̂, which raises estimator loop gain → mismatch divergence, measured). The gate on the I term stays the distance gate (anti-windup); the gate on FF is measurement trust.
+**Direction-contradiction CUSUM → velocity reset (归零重拉)**: every large overshoot on moving targets traces to one root — the target model breaks (stop/ADAD reversal) and v̂ becomes a ghost that simultaneously pushes FF the wrong way AND masks the error in the Smith prediction (the loop can't see its own trail → mushy pull-back). When the CUSUM (Page sequential change test, σ-normalized, σ online-estimated — **no absolute-px constants**; K/C/H are σ multiples so the gate auto-widens with device noise) detects innovation sustained against v̂, that axis's velocity is reset to zero while the position estimate is kept: the loop re-runs the step response (the best-tuned behavior: settle 277ms / 3.1px) with no ghost in the projection (P sees the full true error → sharp pull-back) and FF rebuilding from zero in the correct direction (no wrong-way push, no re-engagement kick). Only contradiction-direction innovation accumulates, so the chase after a reset cannot re-trigger (innovation then agrees with the rebuilding v̂); the per-frame increment cap (3σ) rejects single-frame kicks (recoil).
 
 **No hand tuning & anti-windup**: the bandwidth `wn` depends only on the calibrated `L` (tracking speed is recovered by the feedforward; PM=50 is the fastest design point that passes the full mismatch band L20–80 — battery-chosen, not feel-chosen). Anti-windup = conditional integration (freeze the integrator when the output is saturated and the error still pushes toward saturation) + integrator clamp `±FF_I_FRAC·vmax/Ki`, preventing windup overshoot on long flicks.
 
@@ -223,7 +221,7 @@ Dependencies: stdlib + numpy (Kalman/MPC) + scipy (DARE solve for MPC); see `req
 - **Damping ratio ζ and phase margin PM are dimensionless design choices** (ffpi2/ballistic ζ=1 critical damping; sliding ζ=0.5; PM=50° chosen by the mismatch-band battery, PM=60° was the previous conservative point).
 - The truly free knobs are few, and each is explainable from principle; empirical ones are explicitly labeled in each law's docstring.
 
-**Why ffpi2 is the main aimbot** (replaces ff_pi): it improves **both axes at once** — overshoot events AND tracking/lock. vs ff_pi: matched composite 171.3→152.9 (every scenario better: step settle 377→277ms, accel 11.3→9.1px), FPS behavior battery event overshoot 47.4→43.3px on stops / mean 25.8→24.3 / worst 80.9→77.9, tracking RMSE −9%, approach trail −25%, relock 483→356ms — while keeping the **full delay band L20–80 and s0.7–1.3 with no divergence** (L80 edge 152.4 ≈ ff_pi's 152.5). The withdrawal mechanism is principled: FF is the loop's only open-loop term; when the target model breaks, withdraw it rather than re-aim it.
+**Why ffpi2 is the main aimbot** (replaces ff_pi): it improves **both axes at once** — tracking/lock AND maneuver overshoot. vs ff_pi: matched composite 171.3→146.9 (every scenario better: step settle 377→278ms, accel 11.3→7.3px, maneuver 23.1→19.8px), FPS behavior battery ADAD strafe-switch RMSE 32.6→23.9 (−27%) and event overshoot 68.6→56.6 (−17%), stop RMSE −16% with recovery 267→167ms, approach trail −25%, relock 483→356ms — while keeping the **full delay band L20–80 and s0.7–1.3 with no divergence** (band numbers better than ff_pi across L30–70). The CUSUM-reset mechanism is principled: a broken target model (stop/reversal) is handled by discarding the contradicted velocity state and re-running the proven step response, not by patching gains.
 
 **The two alternatives** (each a Pareto point; estimator/quantization/counts match their arena laws line for line):
 
