@@ -20,6 +20,10 @@ try:
 except Exception:
     pass
 try:
+    from arena.laws import ff_pi2       # noqa: F401
+except Exception:
+    pass
+try:
     from arena.laws import sliding      # noqa: F401
 except Exception:
     pass
