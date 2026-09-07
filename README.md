@@ -1,4 +1,4 @@
-# Jetson-aimbot
+﻿# Jetson-aimbot
 
 AI visual aimbot (mouse pass-through) running on an NVIDIA Jetson Orin. The Jetson receives the game picture through a capture card, detects targets with TensorRT YOLO, and computes mouse corrections with a delay-aware control law. Commands are merged with the real mouse and emitted through a USB gadget (the device identifies as a Generic USB Mouse), so it behaves like an ordinary mouse.
 
@@ -12,13 +12,13 @@ Capture card (UVC 1080p NV12) → GStreamer nvvidconv → CUDA preprocess → Te
 
 ## No hand-tuned gains
 
-Aim at a static background with texture and hold both side keys for 5 seconds: the program excites the loop (draws a square), measures background motion with block phase correlation, and estimates sensitivity `s` (px/count) and loop delay `L` (ms) online with least squares. The control-law bandwidth is then derived from the calibrated `L` via phase margin (`wn=(90°−PM)π/180/L`, PM=60°) — no hand-tuned magic numbers, adapts to PC/PS5 and 60/120fps. The calibration values are written back into the per-game launch script automatically.
+Aim at a static background with texture and hold both side keys for 5 seconds: the program excites the loop (draws a square), measures background motion with block phase correlation, and estimates sensitivity `s` (px/count) and loop delay `L` (ms) online with least squares. The control-law bandwidth is then derived from the calibrated `L` via phase margin (`wn=(90°−PM)π/180/L`, PM=50°) — no hand-tuned magic numbers, adapts to PC/PS5 and 60/120fps. The calibration values are written back into the per-game launch script automatically.
 
 ## Control laws
 
 | binary | law | character |
 |---|---|---|
-| `bin/aimbot` | ffpi — pole-placement PI + type-2 velocity feedforward | **main program**; the only fast law with zero divergence across the full delay/sensitivity sweep; optional training-data collection (`-o`) |
+| `bin/aimbot` | ffpi2 — pole-placement PI + type-2 velocity feedforward with maneuver-withdrawal FF | **main program**; zero divergence across the full delay/sensitivity sweep, wins both axes (overshoot + lock) vs the previous law; optional training-data collection (`-o`) |
 | `bin/aimbot_ballistic` | ballistic flick + critically damped convergence | fastest flick + best maneuver tracking (alternative) |
 | `bin/aimbot_sliding` | boundary-layer sliding mode + ballistic flick | most robust: zero divergence + flattest mismatch profile, but slowest (alternative) |
 

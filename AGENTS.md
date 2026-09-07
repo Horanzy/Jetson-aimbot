@@ -1,4 +1,4 @@
-# AGENTS.md
+﻿# AGENTS.md
 
 ## Overview
 
@@ -12,7 +12,7 @@ Capture card (UVC 1080p NV12) → GStreamer nvvidconv → CUDA preprocess → Te
 
 No hand-tuned gains: a bilateral side-key trigger runs auto-calibration, estimating sensitivity s (px/count) and loop delay L (ms) online. Adapts to PC / PS5 / 60fps / 120fps.
 
-**Control law**: the main program `src/aimbot.cu` uses **ffpi** (pole-placement PI + type-2 velocity feedforward) — the convergence bandwidth `wn` is derived from the calibrated delay `L` via phase margin (`wn=(90°−PM)π/180/L`, PM=60°), **no hand-tuned magic numbers**, good generalization. The same binary has **optional training-data collection** (enabled with `-o`, otherwise pure aimbot). `src/aimbot_ballistic.cu` / `src/aimbot_sliding.cu` are **alternative control laws**, kept as-is (no collection), each a Pareto point in speed/robustness (see the "arena control-law simulation" section). All control-law exploration/comparison/tuning happens in the pure-Python `arena/` simulation (this machine cannot compile .cu).
+**Control law**: the main program `src/aimbot.cu` uses **ffpi2** (pole-placement PI + type-2 velocity feedforward **with maneuver-withdrawal FF + detection-gap decay**) — the convergence bandwidth `wn` is derived from the calibrated delay `L` via phase margin (`wn=(90°−PM)π/180/L`, PM=50°), **no hand-tuned magic numbers**, good generalization. The same binary has **optional training-data collection** (enabled with `-o`, otherwise pure aimbot). `src/aimbot_ballistic.cu` / `src/aimbot_sliding.cu` are **alternative control laws**, kept as-is (no collection), each a Pareto point in speed/robustness (see the "arena control-law simulation" section). All control-law exploration/comparison/tuning happens in the pure-Python `arena/` simulation (this machine cannot compile .cu).
 
 ## Environment
 
@@ -21,7 +21,7 @@ No hand-tuned gains: a bilateral side-key trigger runs auto-calibration, estimat
 
 ```
 /mnt/TF/aimbot/
-├── src/         aimbot.cu (ffpi + optional collection) / aimbot_ballistic.cu / aimbot_sliding.cu
+├── src/         aimbot.cu (ffpi2 + optional collection) / aimbot_ballistic.cu / aimbot_sliding.cu
 ├── scripts/     compile.sh / convert.sh / setup_mouse.sh
 │   └── game/    per-game launch scripts (battlefield.sh)
 ├── bin/         build outputs (aimbot / aimbot_ballistic / aimbot_sliding)
@@ -38,14 +38,14 @@ No hand-tuned gains: a bilateral side-key trigger runs auto-calibration, estimat
 
 | File | Role |
 |---|---|
-| `src/aimbot.cu` | **Main program**: full aimbot + optional training-data collection. Control law ffpi (pole-placement PI + type-2 velocity feedforward; wn derived from L, no hand tuning). Without `-o` it is pure aimbot |
+| `src/aimbot.cu` | **Main program**: full aimbot + optional training-data collection. Control law ffpi2 (pole-placement PI + type-2 velocity feedforward with maneuver-withdrawal FF + detection-gap decay; wn derived from L, no hand tuning). Without `-o` it is pure aimbot |
 | `src/aimbot_ballistic.cu` | Alternative law: ballistic flick + critically damped convergence (brake point = Vmax·L, wn derived from L). Fastest flick + best maneuver tracking + frame-rate independent. Pure aimbot, no collection |
 | `src/aimbot_sliding.cu` | Alternative law: boundary-layer sliding mode + ballistic flick (wn from the full delay at PM=60). Robustness first: zero divergence under all mismatches + flattest profile, but slowest. Pure aimbot, no collection |
 | `scripts/compile.sh` | nvcc build of aimbot / aimbot_ballistic / aimbot_sliding → `bin/` (run on the Jetson) |
 | `scripts/convert.sh` | Batch ONNX → TensorRT engine conversion |
 | `scripts/setup_mouse.sh` | USB Gadget config, creates `/dev/hidg0` |
 | `scripts/game/*.sh` | Per-game launch scripts (relative paths; screenshot-collection switch `CAPTURE`; auto write-back of calibration values `S_EST`/`L_EST`) |
-| `arena/` | Pure-Python control-law simulation evaluator (neutral simulator + 8 laws + standard battery); see dedicated section |
+| `arena/` | Pure-Python control-law simulation evaluator (neutral simulator + 9 laws + standard + FPS batteries); see dedicated section |
 
 Linking note: all three binaries need `-lopencv_video` (calibration uses `phaseCorrelate`); `aimbot` additionally needs `-lopencv_imgcodecs` (collection `imwrite`). The alternative laws have no collection and don't need imgcodecs.
 
@@ -59,7 +59,7 @@ Linking note: all three binaries need `-lopencv_video` (calibration uses `phaseC
 -S write-back script path  -k trigger key (fire/ads/both)  -v preview
 ```
 
-Note: the ffpi bandwidth is derived automatically from the calibrated `L`; **there are no hand-tuning parameters**. Structural parameters (PM/ζ/FF_GAIN_VAL/FF_I_GATE/over-compensation) are header constants in `src/aimbot.cu`, see "Tuning".
+Note: the ffpi2 bandwidth is derived automatically from the calibrated `L`; **there are no hand-tuning parameters**. Structural parameters (PM/ζ/FF_GAIN_VAL/FF_I_GATE/over-compensation) are header constants in `src/aimbot.cu`, see "Tuning".
 
 **Collection options** (enabled with `-o`, otherwise pure aimbot):
 
@@ -81,24 +81,29 @@ Note: the ffpi bandwidth is derived automatically from the calibrated `L`; **the
 | Sensitivity s | least-squares calibration (coarse 8ms + fine 2ms sweep) | hip-fire calibration | constant |
 | Delay L | phase-correlation delay sweep (same two rounds) | hip-fire calibration | constant |
 
-### Control law (ffpi, `src/aimbot.cu`)
+### Control law (ffpi2, `src/aimbot.cu`)
 
 ```
 Predictor (Smith, dt-normalized): α=min(.9, PRED_ALPHA0·dt/DT0), β=min(.6, PRED_BETA0·dt/DT0)
   Lc = L̂·PRED_L_COMP                                   // over-compensation; favors the under-compensated side (the dangerous one)
   ê = f + fvx·(age+Lc) − s·Σcounts(in flight)          // delay-removed error
-Convergence bandwidth: wn = (90°−PM)π/180 / L̂   (PM=60°, no hand tuning, auto-scales with L)
+Convergence bandwidth: wn = (90°−PM)π/180 / L̂   (PM=50°, no hand tuning, auto-scales with L)
   Kp = 2ζ·wn, Ki = wn²   (ζ=1 critical damping, no overshoot)
   gate = FF_I_GATE/(FF_I_GATE+|ê|)                     // settled-region gate / I distance decay
-  v = clamp(Kp·ê + Ki·∫err·gate + FF_GAIN_VAL·gate·v̂_target, ±vmax)   // PI + type-2 velocity feedforward
+  hp = in − in_mean  (in_mean ← β·in, learned only while |in| < FF_I_GATE/2)   // high-passed innovation: bias-free maneuver evidence
+  w = min(1, (|hp[k]+hp[k−1]| / FF_I_GATE)²)           // 2-frame same-sign accumulation: bursts pass, zero-mean oscillation cancels
+  FF = FF_GAIN_VAL · gate · (1−w_eff) · gap_scale · v̂_target
+    w_eff = 0 when the intent command (PI+full FF) is at vmax           // saturation guard: fleeing, not stopping
+    gap_scale = 1 − clamp((age−frame_dt)/L̂, 0, 1)                       // detection gap: withdraw the open-loop term on the L timescale
+  v = clamp(Kp·ê + Ki·∫err·gate + FF, ±vmax)
 Quantization: rem += v·h/s; counts = clamp(trunc(rem), ±120); rem −= counts
 ```
 
 The **P term** `Kp·ê` is the fast channel: flicks and instant corrections. The **I term** `Ki·∫err` is the slow channel: it removes the steady-state trail behind constant-velocity targets; the integrator is a low-pass, so zero-mean periodic disturbances like recoil cannot accumulate → rejected as a side effect. **No D term**: D amplifies high frequencies and would feed recoil noise back into the commands.
 
-**Type-2 velocity feedforward**: `FF_GAIN_VAL·gate·v̂_target`. `FF_GAIN_VAL=1` is the **exact open-loop command** for zero trail on constant-velocity targets (the plant is an integrator; derived from the plant model, not tuned). `gate` gates the integrator and the feedforward into the settled region together (no buildup during a flick → no overshoot on static targets; buildup after arrival → zero trail on movers). Estimator noise carried by the feedforward is smoothed by the velocity gain `PRED_BETA0`; no extra filter.
+**Type-2 velocity feedforward with maneuver withdrawal**: `FF_GAIN_VAL=1` is the **exact open-loop command** for zero trail on constant-velocity targets (the plant is an integrator; derived from the plant model, not tuned). FF is the loop's only open-loop term — when the measurement evidence says the target model broke (stop ghost v̂, reversal, detection gap), it is *withdrawn* rather than re-aimed (re-aiming needs a fast v̂, which raises estimator loop gain → mismatch divergence, measured). The gate on the I term stays the distance gate (anti-windup); the gate on FF is measurement trust.
 
-**No hand tuning & anti-windup**: the bandwidth `wn` depends only on the calibrated `L` (a deliberately low bandwidth buys delay margin; tracking speed is recovered by the feedforward instead of raising wn). Anti-windup = conditional integration (freeze the integrator when the output is saturated and the error still pushes toward saturation) + integrator clamp `±FF_I_FRAC·vmax/Ki`, preventing windup overshoot on long flicks.
+**No hand tuning & anti-windup**: the bandwidth `wn` depends only on the calibrated `L` (tracking speed is recovered by the feedforward; PM=50 is the fastest design point that passes the full mismatch band L20–80 — battery-chosen, not feel-chosen). Anti-windup = conditional integration (freeze the integrator when the output is saturated and the error still pushes toward saturation) + integrator clamp `±FF_I_FRAC·vmax/Ki`, preventing windup overshoot on long flicks.
 
 ### Calibration
 
@@ -117,19 +122,19 @@ The **P term** `Kp·ê` is the fast channel: flicks and instant corrections. The
 
 ## Tuning
 
-**The main aimbot (ffpi) needs no hand tuning**: after calibrating `s,L`, `wn` scales with `L` automatically. Structural parameters are header constants in `src/aimbot.cu`:
+**The main aimbot (ffpi2) needs no hand tuning**: after calibrating `s,L`, `wn` scales with `L` automatically. Structural parameters are header constants in `src/aimbot.cu`:
 
 | Constant | Default | Meaning | On-device adjustment |
 |---|---|---|---|
-| `FF_PM_DEG` | 60 | Phase margin (wn=(90−PM)π/180/L) | Mismatch oscillation → raise (lower wn: stabler, slower) |
+| `FF_PM_DEG` | 50 | Phase margin (wn=(90−PM)π/180/L) | Mismatch oscillation → raise (lower wn: stabler, slower); 50 = fastest passing the full delay band |
 | `FF_ZETA` | 1.0 | Convergence damping ratio (critical) | Overshoot → raise; too slow → lower (<0.7 overshoots) |
 | `FF_GAIN_VAL` | 1.0 | Velocity feedforward gain (type-2 exact value) | Fixed by principle; normally don't touch |
-| `FF_I_GATE` | 8.0 | Settled-region gate / I distance-decay scale (px) | Tracking trail → raise; flick overshoot → lower |
+| `FF_I_GATE` | 8.0 | Settled-region gate / I distance-decay scale / withdrawal-weight scale (px) | Tracking trail → raise; flick overshoot → lower |
 | `FF_I_FRAC` | 1.0 | Integrator clamp (×vmax/Ki) | Windup overshoot → lower |
-| `PRED_ALPHA0/BETA0` | 0.50/0.04 | Filter position/velocity gains @120fps | Model jitter → lower ALPHA0; **real device much noisier → lower BETA0 first** (FF noise goes through it) |
+| `PRED_ALPHA0/BETA0` | 0.50/0.03 | Filter position/velocity gains @120fps | Model jitter → lower ALPHA0; **real device much noisier → lower BETA0 first** (FF noise goes through it; 0.03 = band-edge margin) |
 | `PRED_L_COMP` | 1.10 | Smith over-compensation factor | Calibrated L too low (dangerous) → keep >1; too high → 1.0 |
 
-On-device workflow: ① calibrate s,L (L too low is the dangerous direction). ② If real-device noise is far above arena's 0.5px: **lower `PRED_BETA0` first** — don't rush to add filters (that becomes hidden control tuning). ③ Mismatch oscillation → raise `FF_PM_DEG` (lower wn) or raise `FF_ZETA`. ④ After changing any estimator/compensation constant, rerun the wide-delay sweep of `arena.integrate ff_pi` to confirm no divergence. `FOV_RADIUS`, `KEEP_ALIVE_MS` and the `CalibSeg` trajectory segments are also in the header constants area.
+On-device workflow: ① calibrate s,L (L too low is the dangerous direction). ② If real-device noise is far above arena's 0.5px: **lower `PRED_BETA0` first** — don't rush to add filters (that becomes hidden control tuning). ③ Mismatch oscillation → raise `FF_PM_DEG` (lower wn) or raise `FF_ZETA`. ④ After changing any estimator/compensation constant, rerun the wide-delay sweep of `arena.integrate ff_pi ff_pi2` and the FPS battery `arena.fps_eval ff_pi2` to confirm no divergence and no event regression. `FOV_RADIUS`, `KEEP_ALIVE_MS` and the `CalibSeg` trajectory segments are also in the header constants area.
 
 For alternative-law (ballistic/sliding) tuning, see each `.cu`'s header constants and the "arena control-law simulation → header constants" table.
 
@@ -166,7 +171,8 @@ arena/
 ├── AUTHORING.md   law author guide (interface/plant ground truth/evaluation method)
 └── laws/          control laws (base interface + registry; one file per law, @register)
     ├── reference.py  Smith+PI baseline (self-test)
-    ├── ff_pi.py      pole-placement PI + type-2 velocity feedforward (chosen as the main aimbot)
+    ├── ff_pi.py      pole-placement PI + type-2 velocity feedforward (previous main aimbot)
+    ├── ff_pi2.py     ff_pi + maneuver-withdrawal FF + gap decay (chosen as the main aimbot)
     ├── ballistic.py  open-loop ballistic flick + critically damped convergence (alternative)
     ├── sliding.py    boundary-layer sliding mode + ballistic flick (alternative, most robust)
     ├── pi_pm.py      pole-placement PI + PM cap
@@ -197,7 +203,8 @@ Dependencies: stdlib + numpy (Kalman/MPC) + scipy (DARE solve for MPC); see `req
 | law | OVERALL | matched | worst mismatch | relock | fps delta | mismatch divergence boundary | compute |
 |---|---|---|---|---|---|---|---|
 | mpc | 144.8 | 160.3 | **113.4** | 444 | 4.0% | L20 **and** L80 | **heavy (QP/tick)** |
-| **ff_pi (main aimbot)** | 153.2 | 171.3 | 122.9 | 483 | 3.0% | **no divergence** (L20–80, s0.7–1.3) | light |
+| **ff_pi2 (main aimbot)** | 168.8* | **152.9** | 124.5 | **356** | 15.1%* | **no divergence** (L20–80, s0.7–1.3) | light |
+| **ff_pi (previous main)** | 153.2 | 171.3 | 122.9 | 483 | 3.0% | **no divergence** (L20–80, s0.7–1.3) | light |
 | **ballistic (alternative)** | 157.8 | 173.5 | 142.0 | 437 | **0.0%** | L80 | light |
 | kalman_pi | 163.4 | 189.9 | 129.4 | 477 | 1.8% | L80 | medium |
 | pi_pm | 164.9 | 199.1 | 128.0 | 483 | 0.6% | no divergence | light |
@@ -205,32 +212,34 @@ Dependencies: stdlib + numpy (Kalman/MPC) + scipy (DARE solve for MPC); see `req
 | smith_filt | 180.0 | 182.9 | 161.2 | 198 | 4.0% | L80 + s0.7 | light |
 | reference | 209.7 | 235.8 | 173.9 | 771 | 2.4% | L80 | light |
 
-### The chosen law (ffpi → `src/aimbot.cu`)
+\* ff_pi2's OVERALL/fps-delta numbers are inflated by a settle knife-edge metric artifact: at 60fps it beats ff_pi on 4/5 scenarios per-scenario (step 216<407ms, const_vel 0.88<1.07px, accel 12.3<14.3px, maneuver 20.2<21.0px) — the composite's 60/120 ratio jumps on step_diag's marginal band crossing. The FPS behavior battery (`arena.fps_eval`) is the meaningful law-vs-law comparison: ff_pi2 wins on both axes (event overshoot mean/worst AND tracking RMSE).
+
+### The chosen law (ffpi2 → `src/aimbot.cu`)
 
 **Core constraint (low patch-smell / generalization first)**: reject parameters "tuned by trial that cannot be explained from principle" (games change, and the tests don't run in-game). Therefore:
 
-- **The convergence bandwidth `wn` is always derived from the calibrated delay `L`**: `wn = (90°−PM)·π/180 / L`, PM=60° (a dimensionless design choice), auto-scaling with `L`; **no hardcoded tuned constants**. At L=50, wn≈0.01047 rad/ms.
-- **The type-2 velocity feedforward `FF_GAIN_VAL=1`** comes from the plant model (integrator): it is the exact open-loop command for zero trail on constant-velocity targets, not a tuning knob; the deliberately low bandwidth buys delay margin, and tracking speed is recovered by the feedforward.
-- **Damping ratio ζ and phase margin PM are dimensionless design choices** (ffpi/ballistic ζ=1 critical damping; sliding ζ=0.5; PM=60°).
+- **The convergence bandwidth `wn` is always derived from the calibrated delay `L`**: `wn = (90°−PM)·π/180 / L`, PM=50° (a dimensionless design choice — the fastest point whose full delay band L20–80 passes the battery), auto-scaling with `L`; **no hardcoded tuned constants**. At L=50, wn≈0.01396 rad/ms.
+- **The type-2 velocity feedforward `FF_GAIN_VAL=1`** comes from the plant model (integrator): it is the exact open-loop command for zero trail on constant-velocity targets, not a tuning knob; when the target model breaks the FF is **withdrawn on measurement evidence** (innovation-gated), not re-aimed — re-aiming needs a fast v̂, which raises estimator loop gain and diverges under mismatch (measured).
+- **Damping ratio ζ and phase margin PM are dimensionless design choices** (ffpi2/ballistic ζ=1 critical damping; sliding ζ=0.5; PM=50° chosen by the mismatch-band battery, PM=60° was the previous conservative point).
 - The truly free knobs are few, and each is explainable from principle; empirical ones are explicitly labeled in each law's docstring.
-- **Accept giving up some arena score (speed) in exchange for generalization.**
 
-**Why ffpi is the main aimbot**: it is the **only fast law with zero divergence across the full delay/sensitivity sweep (L20–80, s0.7–1.3)** — flick ~377ms, overshoot ~3.5px, balanced and deployable. Cost: mid-pack maneuver tracking (the feedforward is gated while not settled).
+**Why ffpi2 is the main aimbot** (replaces ff_pi): it improves **both axes at once** — overshoot events AND tracking/lock. vs ff_pi: matched composite 171.3→152.9 (every scenario better: step settle 377→277ms, accel 11.3→9.1px), FPS behavior battery event overshoot 47.4→43.3px on stops / mean 25.8→24.3 / worst 80.9→77.9, tracking RMSE −9%, approach trail −25%, relock 483→356ms — while keeping the **full delay band L20–80 and s0.7–1.3 with no divergence** (L80 edge 152.4 ≈ ff_pi's 152.5). The withdrawal mechanism is principled: FF is the loop's only open-loop term; when the target model breaks, withdraw it rather than re-aim it.
 
 **The two alternatives** (each a Pareto point; estimator/quantization/counts match their arena laws line for line):
 
 - **`src/aimbot_ballistic.cu` (fastest + best tracking)**: open-loop ballistic flick (brake point = Vmax·L) + ζ=1 critically damped convergence. Among the fastest flicks (~361ms) + best maneuver tracking (~19.6px) + best frame-rate independence (0.0%). Cost: highest worst-case mismatch (142); diverges at L80 (+30ms).
 - **`src/aimbot_sliding.cu` (most robust)**: boundary-layer sliding mode (convergence gains set from the **full delay** at PM=60 as a floor, not relying on exact Smith cancellation) + ballistic flick. Flattest mismatch profile (range 14); **zero divergence across wide delay L20–80 and sensitivity s0.7–1.3**. Cost: slowest matched speed (flick ~563ms).
 
-**Candidates not shipped**: `mpc` is strongest on paper (first in OVERALL/worst-mismatch/overshoot/maneuver in-band), but it solves a QP per tick — unverified against Jetson 500Hz embedded compute — and has the narrowest delay band (diverges at both L20 and L80); kept in arena for future needs. `pi_pm` is subsumed by `ff_pi` (ff_pi = pi_pm + principled feedforward) and is not shipped separately. `kalman_pi`/`smith_filt` are covered by the above on the Pareto front.
+**Candidates not shipped**: `mpc` is strongest on paper (first in OVERALL/worst-mismatch/overshoot/maneuver in-band), but it solves a QP per tick — unverified against Jetson 500Hz embedded compute — and has the narrowest delay band (diverges at both L20 and L80); kept in arena for future needs. `pi_pm` is subsumed by `ff_pi` (ff_pi = pi_pm + principled feedforward) and is not shipped separately. `kalman_pi`/`smith_filt` are covered by the above on the Pareto front. **Rejected paths (documented so they aren't re-explored)**: re-aiming the FF through a fast second velocity channel raises estimator loop gain and diverges at L30–70; hot design points (PM45–55 × β0≥0.06) pass matched but their estimator contamination makes step hunting at the band edges — the mismatch band is the hard constraint of the linear Smith+PI+FF family, and PM50/β0.03 is its battery-selected fastest point.
 
 **Header constants** (constants area of each `.cu`; principled rationale in the docstrings of the corresponding `arena/laws/*.py`):
 
 | law | key constants | default | source |
 |---|---|---|---|
-| shared | `wn=(90−PM)π/180/L` | PM=60 | principle: delay phase margin, auto-scales with L |
-| ff_pi | `FF_GAIN_VAL` / `FF_ZETA` / `FF_I_GATE` | 1.0 / 1.0 / 8.0px | principle (type-2 exact FF) / principle (critical damping) / empirical (settled-region gate) |
-| ff_pi | `PRED_ALPHA0/BETA0/L_COMP` | 0.50/0.04/1.10 | estimator (dt-normalized) / estimator / Smith over-comp |
+| ff_pi2 (main) | `wn=(90−PM)π/180/L` | PM=50 | principle: delay phase margin, auto-scales with L; 50 = fastest passing the full delay band (battery) |
+| ff_pi2 | `FF_GAIN_VAL` / `FF_ZETA` / `FF_I_GATE` | 1.0 / 1.0 / 8.0px | principle (type-2 exact FF) / principle (critical damping) / empirical (settled-region gate + withdrawal scale) |
+| ff_pi2 | `PRED_ALPHA0/BETA0/L_COMP` | 0.50/0.03/1.10 | estimator (dt-normalized) / estimator (band-edge margin) / Smith over-comp |
+| ballistic/sliding | `wn=(90−PM)π/180/L` | PM=60 | principle: delay phase margin, auto-scales with L |
 | ballistic | `BALL_BRAKE_FACTOR` / `BALL_ZETA` | 1.0 / 1.0 | physics (brake point = Vmax·L) / principle (critical damping) |
 | ballistic | `BALL_BOUND_FRAC` / `BALL_I_GATE_FRAC` / `BALL_VMAX_FRAC` | 0.20/0.20/0.95 | empirical (scaling, blend band) / empirical (scaling) / empirical (quantization margin) |
 | ballistic | `PRED_ALPHA0/BETA0/L_COMP` | 0.30/0.08/1.00 | estimator (dt-normalized) / estimator / no over-comp |
