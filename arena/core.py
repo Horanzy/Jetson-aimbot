@@ -38,12 +38,13 @@ class LawConfig:
 class ArenaConfig:
     s_true: float = 1.0        # 真灵敏度 px/count
     L_true: float = 50.0       # 真延迟 ms
-    h: float = 2.0             # 控制拍 ms
+    h: float = 2.0             # 控制拍 ms (500Hz -> 2)
     fps: int = 120             # 帧率
     noise_std: float = 0.0     # 检测噪声 std (px, 每轴)
     duration: float = 3000.0   # 场景时长 ms
     count_limit: int = 120     # 植物侧 counts 限幅 (忠实复现硬件)
     fov_radius: float = 150.0
+    drop_p: float = 0.0        # 每帧独立丢失概率 (检测闪烁; 0=不丢帧)
 
 
 class _StateHistory:
@@ -120,6 +121,10 @@ class Arena:
         while self._next_cap <= t - cfg.L_true:
             cap = self._next_cap
             avail = cap + cfg.L_true
+            self._next_cap += self.frame_dt
+            # 传感器丢帧: 帧已采集但不交付 (真实设备上快目标常伴随检测闪烁)
+            if cfg.drop_p > 0.0 and self.rng.random() < cfg.drop_p:
+                continue
             st = self.hist.at(cap)   # 反映采集时刻的世界
             if st is not None:
                 tx, ty, cx, cy = st
@@ -127,7 +132,6 @@ class Arena:
                 ny = self.rng.gauss(0.0, cfg.noise_std) if cfg.noise_std > 0 else 0.0
                 self._pending.append(
                     Observation(t=avail, dx=(tx - cx) + nx, dy=(ty - cy) + ny, new=True))
-            self._next_cap += self.frame_dt
 
     def run(self, law, s_belief: float, L_belief: float, max_v: float):
         """主循环。law.step(t, obs|None) -> (cx, cy) 整数 counts。"""
