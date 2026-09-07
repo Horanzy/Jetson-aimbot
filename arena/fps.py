@@ -47,15 +47,15 @@ VZ_JUMP = 0.55         # 起跳屏幕竖直速度 px/ms (≈5.7m/s @10m)
 
 
 class _FpsBase(Target):
-    """公共骨架: strafe 沿 heading 角累积; 跳跃弧只叠加在屏幕 y 上。"""
+    """公共骨架: base 位置按当前速度增量积分 (heading 可变, 转向连续);
+    跳跃弧是绝对 y 偏移, 叠加在 base y 上。"""
 
     def __init__(self, x, y, heading_deg=0.0):
         super().__init__(x, y)
         self.vx, self.vy = 0.0, 0.0           # 屏幕 px/ms (检视用)
         self.hd = math.radians(heading_deg)
         self.cx_, self.sy_ = math.cos(self.hd), math.sin(self.hd)
-        self._x0, self._y0 = x, y
-        self._sx = 0.0                         # 沿 strafe 方向路径长 (px)
+        self._bx, self._by = x, y
         self._t = 0.0
 
     def _speed(self) -> float:
@@ -74,9 +74,9 @@ class _FpsBase(Target):
         self._pre_advance(h, t)
         sp = self._speed()
         self.vx, self.vy = sp * self.cx_, sp * self.sy_
-        self._sx += sp * h
-        self.x = self._x0 + self._sx * self.cx_
-        self.y = self._y0 + self._sx * self.sy_ + self._jump_dy()
+        self._bx += self.vx * h
+        self._by += self.vy * h
+        self.x, self.y = self._bx, self._by + self._jump_dy()
 
 
 def _flip_speed(t, v, first_flip_t, interval, n_flips, switch_ms, done_sign):
@@ -169,7 +169,8 @@ class JumpLandTarget(_FpsBase):
 
 class WallBounceTarget(_FpsBase):
     """Apex 蹬墙跳: 空中 t_bounce 时刻 strafe 速度全额折返 (bounce_keep=1
-    即 +V→−V, 阶跃幅度 2V — 比急停更狠) 并蹬出一次向上的新弧 (kick×vz0)。"""
+    即 +V→−V, 阶跃幅度 2V — 比急停更狠) 并蹬出一次向上的新弧 (kick×vz0)。
+    蹬墙点高度由第一跳抛物线决定, 落地时刻从该高度解出。"""
 
     def __init__(self, x, vx, t_jump, vz0=VZ_JUMP, g=G_SCREEN, t_bounce=None,
                  bounce_keep=1.0, kick=0.6, heading_deg=0.0, y=0.0):
@@ -180,7 +181,10 @@ class WallBounceTarget(_FpsBase):
         self.t_bounce = t_bounce if t_bounce is not None else t_jump + vz0 / g
         self.bounce_keep = bounce_keep
         self.kick = kick
-        self.t_land = self.t_bounce + 2.0 * kick * vz0 / g
+        y_b = vz0 * (self.t_bounce - t_jump) \
+            - 0.5 * g * (self.t_bounce - t_jump) ** 2      # 蹬墙点高度
+        vk = kick * vz0
+        self.t_land = self.t_bounce + (vk + math.sqrt(vk * vk + 2 * g * y_b)) / g
         self._jvy, self._jy = 0.0, 0.0
         self._airborne = False
         self._sign = 1.0
@@ -255,9 +259,10 @@ class JiggleTarget(_FpsBase):
 
 class BhopTarget(_FpsBase):
     """连跳/滑跳链 (CS bhop / Titanfall slide-hop): 每 period 一跳,
-    strafe 速度全程保持, 每次落地 = 一次 y 轴硬停。"""
+    strafe 速度全程保持, 每次落地 = 一次 y 轴硬停。period 必须 >= 滞空
+    2·vz0/g (落地才起跳)。"""
 
-    def __init__(self, x, vx, t0_jump, period=700.0, n_jumps=3,
+    def __init__(self, x, vx, t0_jump, period=750.0, n_jumps=3,
                  vz0=VZ_JUMP, g=G_SCREEN, heading_deg=0.0, y=0.0):
         super().__init__(x, y, heading_deg)
         self.v = vx
@@ -267,6 +272,7 @@ class BhopTarget(_FpsBase):
         self.vz0, self.g = vz0, g
         self.t_air = 2.0 * vz0 / g
         self._jvy, self._jy = 0.0, 0.0
+        self._cur = None
 
     def land_times(self):
         return [self.t0 + i * self.period + self.t_air
@@ -280,30 +286,35 @@ class BhopTarget(_FpsBase):
 
     def _pre_advance(self, h, t):
         self._t = t
-        k = int((t - self.t0) // self.period)
-        jump_t = self.t0 + k * self.period
-        in_air = 0 <= k < self.n and jump_t <= t < jump_t + self.t_air
-        if in_air:
-            if self._jvy == 0.0 and self._jy == 0.0:
-                self._jvy = self.vz0
-            self._jvy -= self.g * h
-            self._jy = max(0.0, self._jy + self._jvy * h)
-        else:
+        grounded = True
+        if t >= self.t0:
+            i = int((t - self.t0) // self.period)
+            if i < self.n and t < self.t0 + i * self.period + self.t_air:
+                grounded = False
+                if self._cur != i:
+                    self._cur = i           # 落地即起跳 (bhop 无停顿)
+                    self._jvy = self.vz0
+                    self._jy = 0.0
+                self._jvy -= self.g * h
+                self._jy = max(0.0, self._jy + self._jvy * h)
+        if grounded:
+            self._cur = None
             self._jvy, self._jy = 0.0, 0.0
 
 
 class SlideTarget(_FpsBase):
     """滑铲 (Apex/CFHD): t_slide 以 boost×V 起滑, 摩擦指数衰减 (tau),
     slide_ms 后 end='stop' 停 / 'keep' 恢复 V; 屏幕 y 同时下蹲 crouch_dy
-    (瞄准点下移), 结束回站。"""
+    (瞄准点下移, crouch_ms 内平滑过渡), 结束回站。"""
 
     def __init__(self, x, vx, t_slide, boost=1.5, tau=350.0, slide_ms=700.0,
-                 crouch_dy=-40.0, end="stop", heading_deg=0.0, y=0.0):
+                 crouch_dy=-40.0, crouch_ms=150.0, end="stop",
+                 heading_deg=0.0, y=0.0):
         super().__init__(x, y, heading_deg)
         self.v = vx
         self.t_slide = t_slide
         self.boost, self.tau, self.slide_ms = boost, tau, slide_ms
-        self.crouch_dy = crouch_dy
+        self.crouch_dy, self.crouch_ms = crouch_dy, crouch_ms
         self.end = end
 
     def _speed(self):
@@ -316,8 +327,14 @@ class SlideTarget(_FpsBase):
         return 0.0 if self.end == "stop" else self.v
 
     def _jump_dy(self):
-        if self.t_slide <= self._t < self.t_slide + self.slide_ms:
+        t = self._t
+        t0, t1 = self.t_slide, self.t_slide + self.slide_ms
+        if t0 <= t < t0 + self.crouch_ms:
+            return self.crouch_dy * (t - t0) / self.crouch_ms
+        if t0 + self.crouch_ms <= t < t1:
             return self.crouch_dy
+        if t1 <= t < t1 + self.crouch_ms:
+            return self.crouch_dy * (1.0 - (t - t1) / self.crouch_ms)
         return 0.0
 
 
@@ -420,7 +437,8 @@ def fps_suite():
         lambda rng: WallBounceTarget(40.0, 0.6, 600.0, t_bounce=950.0),
         (0.0, 0.0), "track", steady_from=0.0,
         events=((950.0, "bounce-2V"),
-                (950.0 + 2 * 0.6 * 0.55 / 0.0015, "land"))))
+                (WallBounceTarget(
+                    0.0, 0.6, 600.0, t_bounce=950.0).t_land, "land"))))
     add(FpsScenario(
         "fps_strafe_switch", 3000.0,
         lambda rng: StrafeSwitchTarget(40.0, 0.5, period=900.0, n_switches=3),
@@ -435,10 +453,10 @@ def fps_suite():
         + ((1500.0, "stop"),)))
     add(FpsScenario(
         "fps_bhop", 3200.0,
-        lambda rng: BhopTarget(40.0, 0.5, 600.0, period=700.0, n_jumps=3),
+        lambda rng: BhopTarget(40.0, 0.5, 600.0, period=750.0, n_jumps=3),
         (0.0, 0.0), "track", steady_from=0.0,
         events=tuple((t, "land") for t in
-                     BhopTarget(0.0, 0.0, 600.0, period=700.0,
+                     BhopTarget(0.0, 0.0, 600.0, period=750.0,
                                 n_jumps=3).land_times())))
     add(FpsScenario(
         "fps_slide", 2500.0,
@@ -446,8 +464,8 @@ def fps_suite():
         (0.0, 0.0), "track", steady_from=0.0,
         events=((700.0, "slide"), (1400.0, "rise"))))
     add(FpsScenario(
-        "fps_turn_90", 2600.0,
-        lambda rng: TurnTarget(40.0, 0.5, phi_deg=90.0, turn_ms=120.0,
+        "fps_turn_90", 2200.0,
+        lambda rng: TurnTarget(40.0, 0.35, phi_deg=90.0, turn_ms=120.0,
                                t_turn=1000.0, heading_deg=0.0, y=10.0),
         (0.0, 0.0), "track", steady_from=0.0,
         events=((1000.0, "turn"),)))
