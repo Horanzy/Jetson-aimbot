@@ -65,3 +65,36 @@ def compute(res, scenario):
     if scenario.kind == "step":
         return step_metrics(res, scenario)
     return track_metrics(res, scenario)
+
+
+def event_metrics(res, events, pre_ms=200.0, window_ms=600.0, band=3.0):
+    """事件后过冲/恢复 (急停/落地/折返/变向等, 事件由场景声明)。
+
+    每个事件 (t, kind) 报告:
+      pre   事件前 pre_ms 窗口 |e| 中位数 (基线拖尾)
+      peak  事件后 window_ms 内最大 |e|
+      over  peak − pre (事件注入的额外误差激励, ≥0) — 核心指标
+      rec   事件后首次 |e| ≤ max(band, pre) 的时刻偏移 (ms, inf=未恢复)
+    对所有 law 完全中立; 发散场景全部 inf。
+    """
+    if res["diverged"]:
+        return [{"t": te, "kind": kd, "pre": float("inf"),
+                 "peak": float("inf"), "over": float("inf"),
+                 "rec": float("inf")} for te, kd in events]
+    t, ex, ey = res["t"], res["ex"], res["ey"]
+    e = [math.hypot(a, b) for a, b in zip(ex, ey)]
+    out = []
+    for te, kd in events:
+        pre = [v for tt, v in zip(t, e) if te - pre_ms <= tt < te]
+        pre_v = sorted(pre)[len(pre) // 2] if pre else 0.0
+        seg = [(tt, v) for tt, v in zip(t, e) if te <= tt <= te + window_ms]
+        peak_v = max(v for _, v in seg) if seg else float("inf")
+        thr = max(band, pre_v)
+        rec = float("inf")
+        for tt, v in seg:
+            if v <= thr:
+                rec = tt - te
+                break
+        out.append({"t": te, "kind": kd, "pre": pre_v, "peak": peak_v,
+                    "over": max(0.0, peak_v - pre_v), "rec": rec})
+    return out
