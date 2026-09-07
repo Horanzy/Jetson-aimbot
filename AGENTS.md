@@ -154,11 +154,13 @@ Collection uses raw NV12 (not MJPEG): NV12 is the only format both the Hagibis a
 
 ```
 arena/
-├── core.py        neutral simulator (plant+sensor, Observation/LawConfig/ArenaConfig)
+├── core.py        neutral simulator (plant+sensor, Observation/LawConfig/ArenaConfig; drop_p = per-frame detection dropout)
 ├── scenarios.py   target motion (static/const-vel/const-accel/random maneuver/relock jump) + standard suite
-├── metrics.py     metrics from ground truth (settle time/overshoot/RMSE/in-band fraction/divergence)
+├── fps.py         FPS behavior library in screen space (stop/jump-land/wall-bounce/strafe-switch/jiggle/bhop/slide/turn/approach/dash) + fps_suite
+├── metrics.py     metrics from ground truth (settle time/overshoot/RMSE/in-band fraction/divergence) + event_metrics (post-event overshoot/recovery)
 ├── runner.py      runs law × scenario, composite score, leaderboard
 ├── eval.py        standard battery: multi-scenario + delay-mismatch sweep + 60/120fps
+├── fps_eval.py    FPS behavior battery: fps_suite × {clean, flaky drop_p=0.12}, per-event overshoot/recovery table
 ├── integrate.py   integration: all-law leaderboard + relock + wide-delay sweep + sensitivity mismatch
 ├── selftest.py    reference-law self-test
 ├── AUTHORING.md   law author guide (interface/plant ground truth/evaluation method)
@@ -180,7 +182,11 @@ Dependencies: stdlib + numpy (Kalman/MPC) + scipy (DARE solve for MPC); see `req
 .venv\Scripts\python.exe -m arena.eval ff_pi          # single-law standard battery: matched L=50 + mismatch sweep {30..70} + 60/120fps
 .venv\Scripts\python.exe -m arena.integrate           # all-law integrated leaderboard + relock + wide delay {20..80} + s mismatch
 .venv\Scripts\python.exe -m arena.integrate ff_pi mpc # run only the given laws
+.venv\Scripts\python.exe -m arena.fps_eval            # FPS behavior battery (default ff_pi + reference)
+.venv\Scripts\python.exe -m arena.fps_eval ff_pi ballistic sliding  # chosen laws only
 ```
+
+**Why 2D screen space is the right arena (and not "3D")**: the whole sense-control loop lives in screen pixels (capture → detect → dx,dy → law → counts → crosshair); the 3D game world is just one generator of screen-space trajectories, and the law never sees the world. The FPS behavior library (`fps.py`) therefore models the *screen-space shape* of 3D behaviors: jumps are parabolas on screen-y only (world-vertical motion projects to screen-vertical, orthogonal to any strafe heading), strafe heading is a free angle, wall-bounce is a full 2V velocity reversal, jump-landing is a hard y-velocity step. The only unmodeled 3D effect is tan-projection nonlinearity (s varies by sec² across the screen): ~2.4% inside the ±150px FOV circle — negligible; a 3D world+camera+projection Target subclass can be added later without touching core. A continuity assertion (position step < 5px/tick for every suite target) guards against trajectory-model bugs (they happened: a heading-rotation "teleport" and a parabola chopped mid-air).
 
 **Adding a new law**: create a file in `laws/`, subclass `Law`, `@register("name")`, implement `reset(cfg)`/`step(t,obs)->(cx,cy)`, and add a try-import line in `laws/__init__.py`. See `arena/AUTHORING.md`.
 **Adding a new scenario**: write a `Target` subclass + `Scenario` in `scenarios.py` and add it to `standard_suite()` (all laws are then evaluated on the same scenario automatically).
