@@ -5,7 +5,7 @@
 //        → CUDA 预处理 → TensorRT YOLO 检测 → alpha-beta 目标跟踪
 //        → 控制律 (极点配置 PI + type-2 速度前馈) → USB Gadget 透传
 //
-//  控制律: 收敛带宽 wn 由标定延迟 L 自动导出 (wn=(90°−PM)π/180/L, PM=60°, 免手调),
+//  控制律: 收敛带宽 wn 由标定延迟 L 自动导出 (wn=(90°−PM)π/180/L, PM=50°, 免手调),
 //    ζ=1 临界阻尼; type-2 速度前馈 (ff_gain=1) 补匀速跟踪零拖尾。结构参数为头部常量,
 //    详见 arena/laws/ff_pi.py 与 AGENTS.md。
 //
@@ -75,18 +75,19 @@ const uint16_t BOTH_SIDE_KEYS = SIDE_KEY | SIDE_KEY2;
 
 // ========================= 跟踪滤波器 (Smith 预测器, dt 归一) =========================
 const float PRED_ALPHA0   = 0.50f;                   // 位置增益 @120fps; 实际 α=ALPHA0·dt/DT0 (帧率无关)
-const float PRED_BETA0    = 0.04f;                   // 速度增益 @120fps; 实际 β=BETA0·dt/DT0
+const float PRED_BETA0    = 0.03f;                   // 速度增益 @120fps; 实际 β=BETA0·dt/DT0 (0.04→0.03: 换失配带 L80 边缘余量)
 const float PRED_L_COMP   = 1.10f;                   // Smith 过补偿系数 (>1 帮欠补偿侧 L真>L̂, 危险方向)
 const float PRED_DT0      = 1000.0f / 120.0f;        // 增益归一参考帧周期
 const float TRACK_JUMP_GATE = 100.0f;                // 创新超此值 → 重置滤波器
 const float TARGET_STALE_MS = 200.0f;                // 目标超时 → 暂停自瞄
 
-// ========================= 控制律: 极点配置 PI + type-2 速度前馈 =========================
-//  带宽由标定延迟 L 导出 (免手调); 前馈补跟踪速度。详见 arena/laws/ff_pi.py 与 AGENTS.md。
-const float FF_PM_DEG = 60.0f;                       // 相位裕度: wn=(90°−PM)π/180/L (无量纲设计选择)
+// ========================= 控制律: 极点配置 PI + type-2 速度前馈 (ffpi2) =========================
+//  带宽由标定延迟 L 导出 (免手调); 前馈补跟踪速度; 机动时按测量证据撤回前馈。
+//  详见 arena/laws/ff_pi2.py 与 AGENTS.md。
+const float FF_PM_DEG = 50.0f;                       // 相位裕度: wn=(90°−PM)π/180/L (60→50: 失配带 L20-80 全过的最快设计点, wn+26%/Ki+59%)
 const float FF_ZETA   = 1.0f;                        // 收敛阻尼比 (临界阻尼, 无过冲)
 const float FF_GAIN_VAL   = 1.0f;                        // 速度前馈增益: =1 是匀速目标零拖尾的精确开环指令
-const float FF_I_GATE = 8.0f;                        // 收敛区门控 / I 距离衰减尺度 (px)
+const float FF_I_GATE = 8.0f;                        // 收敛区门控 / I 距离衰减尺度 / 撤回权重尺度 (px)
 const float FF_I_FRAC = 1.0f;                        // 积分限幅 = I_FRAC×max_v/Ki
 
 // ========================= 标定 =========================
@@ -136,6 +137,7 @@ static inline double elapsed_ms(
 // ---- 目标状态 ----
 struct TargetState {
     float px = 0, py = 0, vx = 0, vy = 0;
+    float w = 0;                                 // 机动撤回权重 (创新量门控, 见 ff_pi2)
     bool  valid = false;
     std::chrono::steady_clock::time_point t_pub;
     float s_est = 1.0f, l_est_ms = 60.0f;
@@ -484,6 +486,7 @@ void ai_thread(std::string model_path, float conf_thr, int target_cls,
     std::cout<<"✅ AI 线程已启动 ("<<cam_fps<<" fps, "<<cam_dev<<")\n";
 
     bool filt_init=false; float fx=0,fy=0,fvx=0,fvy=0;
+    float in_mx=0,in_my=0,hp_px=0,hp_py=0,wdraw=0;   // 撤回门控状态 (ffpi2)
     auto t_prev=std::chrono::steady_clock::now();
 
     float s_est=init_s, l_est=init_l;
@@ -585,7 +588,8 @@ void ai_thread(std::string model_path, float conf_thr, int target_cls,
         dt=std::clamp(dt,1.0f,100.0f);
 
         if (found) {
-            if (!filt_init) { fx=best_dx;fy=best_dy;fvx=0;fvy=0;filt_init=true; }
+            if (!filt_init) { fx=best_dx;fy=best_dy;fvx=0;fvy=0;filt_init=true;
+                              in_mx=in_my=hp_px=hp_py=0;wdraw=0; }
             else {
                 float Lc=l_est*PRED_L_COMP;
                 auto c0=g_counts.at(shift_ms(now,-(double)Lc-dt));
@@ -593,15 +597,26 @@ void ai_thread(std::string model_path, float conf_thr, int target_cls,
                 float cax=(float)(c1.first-c0.first), cay=(float)(c1.second-c0.second);
                 float px_pred=fx+fvx*dt-s_est*cax, py_pred=fy+fvy*dt-s_est*cay;
                 float inx=best_dx-px_pred, iny=best_dy-py_pred;
-                if (std::hypot(inx,iny)>TRACK_JUMP_GATE) { fx=best_dx;fy=best_dy;fvx=0;fvy=0; }
+                if (std::hypot(inx,iny)>TRACK_JUMP_GATE) { fx=best_dx;fy=best_dy;fvx=0;fvy=0;
+                    in_mx=in_my=hp_px=hp_py=0;wdraw=0; }
                 else { float rr=dt/PRED_DT0;
                        float alpha=std::min(0.90f,PRED_ALPHA0*rr);
                        float beta=std::min(0.60f,PRED_BETA0*rr);
+                       // 高通去偏置: 均值只从容差内 (|in|<I_GATE/2) 创新学习 —
+                       // 急停的长持续创新若被均值吸收, 撤回会中途缩水成极限环
+                       if (std::fabs(inx)<FF_I_GATE*0.5f && std::fabs(iny)<FF_I_GATE*0.5f) {
+                           in_mx+=beta*inx; in_my+=beta*iny; }
+                       float hpx=inx-in_mx, hpy=iny-in_my;
+                       // 两帧同号累加: 机动爆发超门限; 零均值振荡 (饱和/噪声) 相消
+                       float w=std::min(1.0f,(float)(std::hypot(hpx+hp_px,hpy+hp_py)/FF_I_GATE));
+                       wdraw=w*w;
+                       hp_px=hpx; hp_py=hpy;
                        fx=px_pred+alpha*inx; fy=py_pred+alpha*iny;
                        fvx+=(beta/dt)*inx; fvy+=(beta/dt)*iny; }
             }
             { std::lock_guard<std::mutex> lk(g_target.mtx);
               g_target.px=fx;g_target.py=fy;g_target.vx=fvx;g_target.vy=fvy;
+              g_target.w=wdraw;
               g_target.s_est=s_est;g_target.l_est_ms=l_est;
               g_target.t_pub=now;g_target.valid=true; }
         } else {
@@ -763,7 +778,7 @@ void send_report(int fd, int16_t rx, int16_t ry, int8_t w, int8_t hw, uint16_t b
 // ========================= main =========================
 int main(int argc, char* argv[]) {
     std::cout<<"========================================\n"
-             <<"  AI 视觉自瞄 (ffpi 控制律)\n"
+             <<"  AI 视觉自瞄 (ffpi2 控制律)\n"
              <<"========================================\n";
 
     std::string a_m,a_c,a_t,a_y,a_d,a_f,a_x,a_s,a_l,a_S,a_k,a_v;
@@ -919,11 +934,11 @@ int main(int argc, char* argv[]) {
             bool aiming=std::chrono::duration_cast<std::chrono::milliseconds>(
                             now-last_press).count()<=KEEP_ALIVE_MS;
             if (aiming) {
-                float px,py,vx,vy,se,le;bool valid;
+                float px,py,vx,vy,se,le,wd;bool valid;
                 std::chrono::steady_clock::time_point tp;
                 { std::lock_guard<std::mutex> lk(g_target.mtx);
                   px=g_target.px;py=g_target.py;vx=g_target.vx;vy=g_target.vy;
-                  se=g_target.s_est;le=g_target.l_est_ms;
+                  se=g_target.s_est;le=g_target.l_est_ms;wd=g_target.w;
                   valid=g_target.valid;tp=g_target.t_pub; }
                 double age=elapsed_ms(now,tp);
                 if (valid&&age<TARGET_STALE_MS) {
@@ -935,7 +950,7 @@ int main(int argc, char* argv[]) {
                     float ex=px+vx*(float)(age+Lc)-ifx;
                     float ey=py+vy*(float)(age+Lc)-ify;
                     float r=std::hypot(ex,ey);
-                    // 收敛带宽由标定延迟导出: wn=(90°−PM)π/180/L (PM=60, 免手调, 随 L 自动缩放)
+                    // 收敛带宽由标定延迟导出: wn=(90°−PM)π/180/L (PM=50, 失配带电池选点, 随 L 自动缩放)
                     float L=std::max(1.0f,le);
                     float wn=(90.0f-FF_PM_DEG)*3.14159265358979f/180.0f/L;
                     float kp=2.0f*FF_ZETA*wn;
@@ -951,9 +966,19 @@ int main(int argc, char* argv[]) {
                         if(!wx)int_x=std::clamp(int_x+ex*TICK_MS*gate,-i_lim,i_lim);
                         if(!wy)int_y=std::clamp(int_y+ey*TICK_MS*gate,-i_lim,i_lim);
                     }
-                    // type-2 速度前馈: ff_gain=1 是匀速目标零拖尾的精确开环指令 (门控到收敛区)
-                    vx_u+=FF_GAIN_VAL*gate*vx;
-                    vy_u+=FF_GAIN_VAL*gate*vy;
+                    // FF = 门控 × (1−机动撤回) × (1−丢帧撤回):
+                    //  机动撤回: 目标模型破缺 (急停幽灵 v̂/折返) 时撤掉开环项
+                    //  饱和守卫: 意图命令顶帽时 (在逃不是在停) 撤回不生效
+                    //  丢帧衰减: 检测中断按标定 L 时间尺度撤 FF, 盲推 v̂·STALE → ~v̂·L
+                    bool sat=std::fabs(vx_u+FF_GAIN_VAL*gate*vx)>=max_v
+                          || std::fabs(vy_u+FF_GAIN_VAL*gate*vy)>=max_v;
+                    float w_eff=sat?0.0f:wd;
+                    float frame_dt=1000.0f/(float)cam_fps;
+                    float gap_scale=1.0f-std::clamp((float)(age-frame_dt)/std::max(1.0f,L),
+                                                    0.0f,1.0f);
+                    float ff_eff=FF_GAIN_VAL*gate*(1.0f-w_eff)*gap_scale;
+                    vx_u+=ff_eff*vx;
+                    vy_u+=ff_eff*vy;
                     float vcx=std::clamp(vx_u,-max_v,max_v);
                     float vcy=std::clamp(vy_u,-max_v,max_v);
                     float s=std::clamp(se,S_MIN,S_MAX);
