@@ -73,7 +73,7 @@
 // ========================= 系统常量 =========================
 constexpr size_t HID_REPORT_LEN  = 9;
 constexpr int    DEFAULT_FREQ    = 500;              // 透传频率 Hz
-constexpr const char* DEFAULT_KEYWORD  = "";
+constexpr const char* DEFAULT_KEYWORD  = "";         // 空 = 匹配任意 *-event-mouse 设备
 constexpr const char* DEFAULT_VIRT_DEV = "/dev/hidg0";
 constexpr const char* DEV_SEARCH_PATH  = "/dev/input/by-id/";
 
@@ -738,7 +738,7 @@ void extract_and_clear(MouseState& s, int16_t& x, int16_t& y,
 }
 
 std::string find_mouse_device(const std::string& kw) {
-    if (kw.front() == '/') return access(kw.c_str(), R_OK)==0 ? kw : "";
+    if (!kw.empty() && kw.front() == '/') return access(kw.c_str(), R_OK)==0 ? kw : "";
     std::string cmd = "find " + std::string(DEV_SEARCH_PATH)
                     + " -name '*" + kw + "*-event-mouse' -print -quit 2>/dev/null";
     FILE* fp = popen(cmd.c_str(), "r");

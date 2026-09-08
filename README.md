@@ -1,6 +1,6 @@
 ﻿# Jetson-aimbot
 
-AI visual aimbot (mouse pass-through) running on an NVIDIA Jetson Orin. The Jetson receives the game picture through a capture card, detects targets with TensorRT YOLO, and computes mouse corrections with a delay-aware control law. Commands are merged with the real mouse and emitted through a USB gadget (the device identifies as a Generic USB Mouse), so it behaves like an ordinary mouse.
+AI visual aimbot (mouse pass-through) running on an NVIDIA Jetson Orin. The Jetson receives the game picture through a capture card, detects targets with TensorRT YOLO, and computes mouse corrections with a delay-aware control law. Commands are merged with the real mouse and emitted through a USB gadget (the device identifies as a generic USB mouse), so it behaves like an ordinary mouse.
 
 ## Pipeline
 

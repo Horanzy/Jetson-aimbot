@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# setup_mouse_ultimate.sh
-# 通用 USB HID 鼠标 (Gadget) 配置
+# setup_mouse.sh
+# USB Gadget HID 鼠标配置 - 创建 /dev/hidg0
 
 modprobe libcomposite
 modprobe usb_f_hid
@@ -9,7 +9,7 @@ modprobe usb_f_hid
 CONFIGFS="/sys/kernel/config/usb_gadget"
 GADGET="$CONFIGFS/g_mouse"
 
-# 深度清理
+# 清理旧配置
 if [ -d "$GADGET" ]; then
     echo "" > "$GADGET/UDC" 2>/dev/null || true
     rm -f $GADGET/configs/c.1/hid.usb* 2>/dev/null
@@ -27,7 +27,7 @@ cd $GADGET || exit
 echo 0x1d6b > idVendor     # Linux Foundation VID
 echo 0x0104 > idProduct    # 通用 gadget PID
 echo 0x0300 > bcdDevice
-echo 0x0200 > bcdUSB       # 纯USB 2.0，不声明支持SuperSpeed（关键！）
+echo 0x0200 > bcdUSB       # USB 2.0
 
 # 标准单一HID设备
 echo 0x00 > bDeviceClass
@@ -35,7 +35,7 @@ echo 0x00 > bDeviceSubClass
 echo 0x00 > bDeviceProtocol
 
 mkdir -p strings/0x409
-echo "000000000002" > strings/0x409/serialnumber
+echo "000000000001" > strings/0x409/serialnumber
 echo "Generic" > strings/0x409/manufacturer
 echo "USB Mouse" > strings/0x409/product
 

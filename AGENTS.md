@@ -7,7 +7,7 @@ AI visual aimbot (mouse pass-through). Target hardware: **NVIDIA Jetson Orin** (
 ```
 Capture card (UVC 1080p NV12) → GStreamer nvvidconv → CUDA preprocess → TensorRT YOLO
 → alpha-beta tracking → control law (pole-placement PI + type-2 velocity feedforward)
-→ merged with the real mouse → USB Gadget (/dev/hidg0, USB Mouse) → game
+→ merged with the real mouse → USB Gadget (/dev/hidg0, generic HID mouse) → game
 ```
 
 No hand-tuned gains: a bilateral side-key trigger runs auto-calibration, estimating sensitivity s (px/count) and loop delay L (ms) online. Adapts to PC / PS5 / 60fps / 120fps.
