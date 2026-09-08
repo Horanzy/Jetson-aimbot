@@ -142,6 +142,7 @@ static inline double elapsed_ms(
 // ---- 目标状态 ----
 struct TargetState {
     float px = 0, py = 0, vx = 0, vy = 0;
+    float cs = 0;                                // CUSUM 告警电平 (σ 倍数归一, 信任度来源)
     bool  valid = false;
     std::chrono::steady_clock::time_point t_pub;
     float s_est = 1.0f, l_est_ms = 60.0f;
@@ -629,6 +630,7 @@ void ai_thread(std::string model_path, float conf_thr, int target_cls,
             }
             { std::lock_guard<std::mutex> lk(g_target.mtx);
               g_target.px=fx;g_target.py=fy;g_target.vx=fvx;g_target.vy=fvy;
+              g_target.cs=std::max(csx,csy)/CUSUM_H;
               g_target.s_est=s_est;g_target.l_est_ms=l_est;
               g_target.t_pub=now;g_target.valid=true; }
         } else {
@@ -946,11 +948,11 @@ int main(int argc, char* argv[]) {
             bool aiming=std::chrono::duration_cast<std::chrono::milliseconds>(
                             now-last_press).count()<=KEEP_ALIVE_MS;
             if (aiming) {
-                float px,py,vx,vy,se,le;bool valid;
+                float px,py,vx,vy,se,le,cs;bool valid;
                 std::chrono::steady_clock::time_point tp;
                 { std::lock_guard<std::mutex> lk(g_target.mtx);
                   px=g_target.px;py=g_target.py;vx=g_target.vx;vy=g_target.vy;
-                  se=g_target.s_est;le=g_target.l_est_ms;
+                  se=g_target.s_est;le=g_target.l_est_ms;cs=g_target.cs;
                   valid=g_target.valid;tp=g_target.t_pub; }
                 double age=elapsed_ms(now,tp);
                 if (valid&&age<TARGET_STALE_MS) {
@@ -978,12 +980,20 @@ int main(int argc, char* argv[]) {
                         if(!wx)int_x=std::clamp(int_x+ex*TICK_MS*gate,-i_lim,i_lim);
                         if(!wy)int_y=std::clamp(int_y+ey*TICK_MS*gate,-i_lim,i_lim);
                     }
-                    // FF = 门控 × 丢帧衰减 (v̂ 已由 CUSUM 归零机制保证可信):
-                    //  检测中断时按标定 L 时间尺度撤 FF, 盲推 v̂·STALE → ~v̂·L
+                    // FF 门控 = 信任度插值: 信任满格 (稳态追击) → 无门控全力
+                    // 前馈 (sharp); CUSUM 告警 (模型破缺, 该轴 v̂ 已归零重拉)
+                    // → 回到距离门控保守形态 (重拉期防二次过冲), 信任按标定
+                    // L 尺度渐恢复 (无踢脚)。丢帧期按 L 时间尺度额外衰减。
+                    static float w_state=0;
+                    float w_inst=cs;
+                    float rate=(w_inst>w_state)?(1.0f-std::exp(-TICK_MS/(2.0f*PRED_DT0)))
+                                               :(1.0f-std::exp(-TICK_MS/std::max(1.0f,L)));
+                    w_state+=rate*(w_inst-w_state);
                     float frame_dt=1000.0f/(float)cam_fps;
                     float gap_scale=1.0f-std::clamp((float)(age-frame_dt)/std::max(1.0f,L),
                                                     0.0f,1.0f);
-                    float ff_eff=FF_GAIN_VAL*gate*gap_scale;
+                    float ff_gate=gate+(1.0f-gate)*(1.0f-w_state);
+                    float ff_eff=FF_GAIN_VAL*ff_gate*gap_scale;
                     vx_u+=ff_eff*vx;
                     vy_u+=ff_eff*vy;
                     float vcx=std::clamp(vx_u,-max_v,max_v);
