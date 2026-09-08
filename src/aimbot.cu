@@ -512,6 +512,7 @@ void ai_thread(std::string model_path, float conf_thr, int target_cls,
     cv::Mat frame, cap_img;
     int read_fails=0;
     long fps_cnt=0; auto fps_t0=std::chrono::steady_clock::now();
+    auto sig_t0=std::chrono::steady_clock::time_point{};
 
     while (global_running) {
         if (!cap.read(frame)) {
@@ -524,6 +525,10 @@ void ai_thread(std::string model_path, float conf_thr, int target_cls,
         double fps_dt=std::chrono::duration<double>(fps_now-fps_t0).count();
         if (fps_dt>=60.0) { std::cout<<"[AI FPS] "<<(int)(fps_cnt/fps_dt)<<" fps (上限 "
                             <<cam_fps<<")\n"; fps_cnt=0; fps_t0=fps_now; }
+        if (fps_now-sig_t0>=std::chrono::seconds(5)) {
+            std::cout<<"[创新σ] x="<<std::sqrt(sig2x)<<"px y="<<std::sqrt(sig2y)
+                     <<"px  (跟踪中有效; i_gate=8 建议保持 >4σ)\n";
+            sig_t0=fps_now; }
 
         cap_img=(preview&&frame.cols>cap_w)?frame(cv::Rect(crop_x,crop_y,cap_w,cap_h)):frame;
 
