@@ -18,7 +18,7 @@ Aim at a static background with texture and hold both side keys for 5 seconds: t
 
 | binary | law | character |
 |---|---|---|
-| `bin/aimbot` | ffpi2 — pole-placement PI + type-2 velocity feedforward with maneuver-withdrawal FF | **main program**; zero divergence across the full delay/sensitivity sweep, wins both axes (overshoot + lock) vs the previous law; optional training-data collection (`-o`) |
+| `bin/aimbot` | ffpi — pole-placement PI + type-2 velocity feedforward with direction-contradiction CUSUM reset | **main program**; best balanced law (ADAD −31%, accel −37%, relock −20% vs previous), delay band L20–70 + s0.7–1.3; optional training-data collection (`-o`) |
 | `bin/aimbot_ballistic` | ballistic flick + critically damped convergence | fastest flick + best maneuver tracking (alternative) |
 | `bin/aimbot_sliding` | boundary-layer sliding mode + ballistic flick | most robust: zero divergence + flattest mismatch profile, but slowest (alternative) |
 

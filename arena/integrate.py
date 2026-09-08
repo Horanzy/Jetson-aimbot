@@ -1,7 +1,7 @@
-"""arena/integrate.py — 阶段4 统合评测。
+﻿"""arena/integrate.py — 阶段4 统合评测。
 
 所有 law 在完全相同的多组场景下:
-  1. 标准电池 (arena.eval.battery): 标准多组场景 + 失配扫描 + 帧率。
+  1. 标准电池 (arena.eval.test_suite): 标准多组场景 + 失配扫描 + 帧率。
   2. 重新锁定: 目标瞬间大跳变 (切目标/丢失重锁), 测二次拉枪稳定时间与过冲。
   3. 宽延迟扫描: L_真 ∈ {20..80}, 找发散边界。
   4. 灵敏度失配: s_真=1, s_相信 ∈ {0.7..1.3} (标定误差)。
@@ -17,7 +17,7 @@ from arena.laws.base import all_laws
 from arena.scenarios import Scenario, JumpTarget
 from arena import metrics as M
 from arena import runner
-from arena.eval import battery, NOMINAL_L, NOISE, SEEDS
+from arena.eval import test_suite, NOMINAL_L, NOISE, SEEDS
 
 RELOCK_JUMP_T = 700.0
 
@@ -103,7 +103,7 @@ def s_mismatch(law_factory, L_belief=NOMINAL_L, max_v=1.5, seeds=(1, 2)):
 
 def full(name, law_factory):
     print(f"\n################## {name} ##################")
-    b = battery(law_factory)
+    b = test_suite(law_factory)
     rl = run_relock(law_factory)
     print(f"\n--- 重新锁定 (目标 +80→(-60,30) @700ms) ---")
     if rl["diverged"]:
@@ -118,7 +118,7 @@ def full(name, law_factory):
     sm = s_mismatch(law_factory)
     for sb, (sc, div) in sm.items():
         print(f"  s_belief={sb:.2f}  composite={sc:8.2f}  {'DIVERGED' if div else ''}")
-    return {"battery": b, "relock": rl, "wide_delay": wd, "s_mismatch": sm}
+    return {"test_suite": b, "relock": rl, "wide_delay": wd, "s_mismatch": sm}
 
 
 def main():
@@ -133,11 +133,11 @@ def main():
         results[nm] = full(nm, lambda c=cls: c())
 
     print("\n\n================== 总排行榜 (OVERALL, 越小越好) ==================")
-    ranked = sorted(results.items(), key=lambda kv: kv[1]["battery"]["overall"])
+    ranked = sorted(results.items(), key=lambda kv: kv[1]["test_suite"]["overall"])
     print(f"{'law':12s} {'OVERALL':>9s} {'matched':>9s} {'worst_MM':>9s} "
           f"{'relock':>8s} {'fpsΔ%':>6s}")
     for nm, r in ranked:
-        b = r["battery"]
+        b = r["test_suite"]
         rl = r["relock"]
         rls = f"{rl['relock_settle']:.0f}" if not rl["diverged"] else "DIV"
         print(f"{nm:12s} {b['overall']:9.2f} {b['matched_120']['score']:9.2f} "

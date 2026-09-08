@@ -16,7 +16,7 @@ LIBS="-L/usr/local/cuda/lib64 -L/usr/lib/aarch64-linux-gnu"
 OCV="-lopencv_core -lopencv_videoio -lopencv_highgui -lopencv_imgproc -lopencv_video"
 TRT="-lnvinfer -lnvinfer_plugin -lcudart -Xcompiler -pthread"
 
-# 主程序: ffpi2 控制律 + 可选训练数据采集 (截图写盘需要 imgcodecs)
+# 主程序: ffpi 控制律 + 可选训练数据采集 (截图写盘需要 imgcodecs)
 $NVCC "$SRC/aimbot.cu" $NVCC_FLAGS $INCLUDES $LIBS \
     $OCV -lopencv_imgcodecs $TRT -o "$BIN/aimbot"
 

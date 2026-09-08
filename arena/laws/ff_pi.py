@@ -1,147 +1,44 @@
-"""arena/laws/ff_pi.py — PI (pole-placed from the delay) + type-2 velocity feedforward.
+"""arena/laws/ff_pi.py — 主控制律: 极点配置 PI + type-2 速度前馈 + 方向矛盾
+CUSUM 速度归零重拉。
 
-ALGORITHM PRINCIPLE
-===================
-Smith-predicted PI loop (same backbone as reference.py / pi_pm.py) plus an
-additive target-velocity feedforward term:
+结构 (控制增益全部由标定延迟 L̂ 导出, 无手调参数):
+    ê = f + v̂·(age+L̂·L_COMP) − s·Σcounts(in flight)        // Smith 预测误差
+    wn = (90°−PM)·π/180 / L̂,  Kp = 2ζ·wn,  Ki = wn²          // 极点配置 (ζ=1)
+    gate = I_GATE/(I_GATE+|ê|)                               // I 项距离门控 (防 flick windup)
+    v = Kp·ê + Ki·∫ê·gate + FF_GAIN_VAL·ff_gate·gap·v̂        // PI + type-2 前馈
+    FF_GAIN_VAL=1: 被积对象是纯积分器, v̂ 是匀速目标零拖尾的精确开环指令
+    (由对象模型导出, 非调参)。
 
-    v_cmd = (Kp*e + Ki*∫e)            # PI: drives the *residual* error to zero
-          + ff_gain * gate * v̂_target  # FF: drives the bulk of constant-vel tracking
+方向矛盾 CUSUM → 速度归零重拉:
+    移动目标上的一切大过冲同源: 目标模型破缺 (急停/变向) 后 v̂ 成为幽灵 —
+    同时朝旧方向推 FF, 并在 Smith 预测里掩盖真实误差 (P 看不见拖尾 → 回拉
+    "面")。检测 = 双向 CUSUM (Page 序贯变化检测), 只累计与 v̂ 矛盾方向的
+    创新; 告警即该轴 v̂ 归零 (位置估计保留) — 环路回到与阶跃响应相同的
+    初始条件: P 无遮蔽全程看见真实误差 (回拉 sharp), FF 从 0 随 v̂ 朝正确
+    方向重建 (渐进介入无踢脚)。变向/急停因此复用电池里最优的阶跃响应。
 
-where gate = i_gate/(i_gate+|e|) is the settled-regime gate (see below).
+    CUSUM 参数 K/C/H 均为 σ 倍数 (无量纲), σ 在线自标定 (创新方差 EMA):
+    噪声越大门自动越宽, 设备自适应, 无绝对 px 常数。
+      K = 0.5σ  漂移: 噪声随机游走被负漂移压回零
+      C = 3σ    单帧增量上限: 拒绝后坐力式单帧踢脚
+      H = 9σ    告警门限: 同号持续 ~2 帧触发
+    v̂≈0 或创新与 v̂ 同向时不累计 — 归零后重建期间的追击创新不会反复触发。
 
-Plant model and why each piece is what it is
---------------------------------------------
-The crosshair is a pure integrator of commanded velocity: sending v (px/ms)
-moves the crosshair by v*h per tick, so P(s) = 1/s. The only delay is in the
-measurement (a frame stamped t reflects the world at t - L_true).
+FF 门控 = 信任度插值:
+    信任满格 (稳态追击/加速) → 无距离门控, 全力前馈 (距离门控会在拖尾
+    30px 时把 FF 压到 21%, P 单腿跑 = 可见拖尾的根源);
+    CUSUM 告警 (模型破缺, v̂ 已归零) → 回到距离门控保守形态 (重拉期防
+    二次过冲); 信任非对称滤波: 告警 ~2 帧降级, 按标定 L 尺度恢复 (无踢脚)。
 
-* Bandwidth from the delay (no tuned wn).
-  A type-1/2 loop is ~ -90deg at crossover; the measurement delay e^{-sL} adds
-  -w*L radians more. Phase margin is therefore
-      PM = 180 - 90 - w_c*L*(180/pi) = 90 - w_c*L*(180/pi).
-  Solving for the crossover that yields a chosen PM:
-      w_c = (90 - PM)*pi/180 / L.
-  We use this *as* the design natural frequency wn (computed in reset() from the
-  believed L), with PM = 60deg. At L=50 this gives wn = 0.01047 rad/ms. This is
-  deliberately a LOW bandwidth: it buys delay margin (generalization) and we
-  recover tracking speed with feedforward instead of by raising wn.
+丢帧衰减: 检测中断时 FF 按标定 L 时间尺度撤回, 盲推上界 v̂·STALE(200ms)
+→ ~v̂·L。
 
-* Pole placement (zeta = 1).
-  PI C(s)=Kp+Ki/s against P(s)=1/s gives, after the Smith predictor removes the
-  delay, the closed-loop characteristic s^2 + Kp*s + Ki = 0, i.e.
-      wn = sqrt(Ki),  zeta = Kp/(2*wn)   <=>   Kp = 2*zeta*wn,  Ki = wn^2.
-  zeta = 1 (critical damping) is a dimensionless design choice: no overshoot and
-  the best mismatch robustness of the well-damped family.
+设计点 (失配带电池选定, 非手感): PM=50 (全延迟带 L20-80 通过的最快点,
+wn+26%/Ki+59% vs PM60); β0=0.03 (带边缘余量)。
 
-* Smith predictor.
-  An alpha-beta tracker estimates the error f and the *target* velocity v̂ at the
-  measurement instant (t - L̂); its prediction step subtracts the effect of our
-  own in-flight counts so v̂ tracks target motion only. Each tick the error is
-  propagated forward:  e = f + v̂*(age + L̂*l_comp) - s*Σcounts(in flight).
-  l_comp > 1 over-compensates on purpose: under-estimating L (L_true > L̂) is the
-  dangerous direction (residual positive delay -> phase lag -> instability), so
-  we bias the compensation window to give that side phase lead.
-
-* Type-2 velocity feedforward (ff_gain = 1).
-  For a constant-velocity target the crosshair must move at the target velocity
-  v_t to track with zero lag. Since the plant is an integrator, commanding
-  v_cmd = v_t makes the crosshair velocity equal v_t directly. Feeding forward
-  ff_gain * v̂_target with ff_gain = 1 is therefore the *exact* open-loop command
-  for a constant-velocity target: the loop becomes type-2 (zero steady-state
-  error to constant velocity) immediately, instead of waiting for the integrator
-  to build up the same command over ~1/Ki. The PI then only has to correct the
-  residual (estimation error, acceleration, mismatch). ff_gain = 1 is the
-  principled value; it is not tuned.
-
-WHY FEEDFORWARD IS DANGEROUS, AND THE PRINCIPLED DEFENSES
----------------------------------------------------------
-FF is open loop: nothing in the characteristic equation corrects it (so it does
-NOT change linear closed-loop stability). Its two failure modes both enter
-through the *estimator*, not the control polynomial:
-
-  1. Estimator noise / recoil. v̂ carries measurement noise; ff_gain=1 injects it
-     straight into the command. This is the oscillation the real project warns
-     about. Defense (from principle, not an ad-hoc filter): the alpha-beta
-     velocity gain beta IS the smoothing. A small beta makes v̂ a low-bandwidth
-     estimate that rejects per-frame noise/recoil before it reaches the command.
-     We deliberately add NO separate EMA — that would be hidden control tuning.
-     beta is one estimator parameter doing double duty (noise + maneuver).
-
-  2. Delay-mismatch self-contamination. When L̂ != L_true the filter's count
-     subtraction uses the wrong window, so v̂ absorbs a bias proportional to our
-     own command rate; ff_gain=1 then re-commands it -> a positive-feedback loop
-     through the estimator (this is what makes naive FF diverge at L_true=70).
-     Defenses (all principled): (a) low beta lowers the loop gain through the
-     estimator; (b) l_comp>1 cancels the bias on the dangerous underestimate
-     side; (c) the low feedback bandwidth (PM=60) keeps the residual the PI has
-     to handle well inside its stability margin.
-
-THE SETTLED-REGIME GATE, AND THE SPEED/GENERALIZATION TRADEOFF
---------------------------------------------------------------
-The type-2 FF is EXACT only for a constant-velocity target in steady tracking;
-during a transient (flick, maneuver, acceleration) v̂ is contaminated by the
-closing dynamics and is not the target velocity. We therefore gate FF (and the
-integrator) by gate = i_gate/(i_gate+|e|): both steady-state mechanisms are full
-strength only when the loop is settled (small error) and fade over the settling
-band. This reuses the single integrator gate scale i_gate (no new knob) — the
-"near equilibrium" scale is one physical concept used twice.
-
-This gate is also what makes the law frame-rate robust. The velocity estimate v̂
-adapts at a slightly frame-rate-dependent rate, so an ungated FF tracks an
-accelerating target noticeably worse at 60fps than 120fps (arena: accel rmse
-3.4 -> 6.5, fps delta ~13%). Gating FF to the settled regime removes the
-frame-rate-sensitive transient contribution and brings the 60/120fps delta to
-~3%. The honest cost: an accelerating target's error grows, so the gate fades FF
-just where it would help, and acceleration tracking falls back toward the slower
-I term (arena accel rmse ~11). This is a deliberate speed->generalization trade,
-accepted per the design brief; constant-velocity tracking (the common case) is
-unaffected (rmse < 1px, 100% in band).
-
-PARAMETER TABLE  (each: principle-derived how, or EMPIRICAL why)
-----------------------------------------------------------------
-wn = (90 - pm_deg)*pi/180 / L      [PRINCIPLE] crossover from delay phase margin.
-    Computed in reset() from cfg.L. No hardcoded wn. ~0.01047 at L=50.
-pm_deg = 60.0                      [PRINCIPLE/dimensionless] target phase margin.
-zeta = 1.0                         [PRINCIPLE/dimensionless] critical damping.
-ff_gain = 1.0                      [PRINCIPLE] exact type-2 command for const vel.
-l_comp = 1.1                       [PRINCIPLE] Smith over-compensation; biases the
-    compensation window toward the dangerous L_true>L̂ side. 1.0 = neutral.
-alpha0 = 0.50                      [estimator] position gain @120fps, dt-normalized
-    (frame-rate independent). Codebase convention (pi_pm).
-beta0 = 0.04                       [estimator] velocity gain @120fps, dt-normalized.
-    THE noise/maneuver/robustness tradeoff: smaller = smoother v̂ (less FF noise,
-    more mismatch robustness) but slower maneuver response. This single knob is
-    what tames the FF; it is an estimator-bandwidth choice, not a control patch.
-beta_exp = 1.0                     [estimator] dt-scaling exponent of beta
-    (beta = beta0*(dt/DT0)**beta_exp). 1 = constant velocity adaptation per
-    maneuver event (codebase convention, pi_pm); keeps the loop frame-rate
-    consistent. Not retuned.
-i_gate = 8.0 px                    [EMPIRICAL, mild — the one settled-regime scale]
-    gate = i_gate/(i_gate+|e|) gates BOTH the integrator (prevents flick windup ->
-    low step overshoot) and the FF (FF valid only when settled). pi_pm's value.
-    Smaller = cleaner flick / better fps robustness but weaker accel tracking;
-    larger = the reverse. This is the only place arena speed is traded away.
-i_frac = 1.0                       [PRINCIPLE] integrator clamp = i_frac*max_v/Ki;
-    the largest steady target speed trackable without lag = i_frac*max_v.
-
-ARENA RESULT (default params)
------------------------------
-OVERALL=153.2 (reference pure-PI = 209.7). Matched L=50/120fps composite=171.3
-(step settle 377ms / over 3.5px / first 198ms; const_vel rmse 0.9px 100% in band;
-accel rmse 11.3 [the gate tradeoff]; maneuver rmse 23.1). Worst delay mismatch
-=122.9 (L_true=70); NO divergence across the full wide-delay sweep L_true=20..80
-nor the s-mismatch sweep s_belief=0.7..1.3. Relock settle 483ms / over 3.5px.
-60/120fps delta 3.0%.
-
-REAL-DEVICE TUNING
-------------------
-1. Calibrate s and L; if L reads systematically low keep l_comp>=1.1.
-2. wn auto-scales with 1/L; nothing to set. If the device is noisier than the
-   simulator, lower beta0 (smoother v̂) before touching anything else.
-3. ff_gain=1 is the design point; only lower it (toward 0 = pure PI) if recoil
-   noise on real hardware is far worse than the estimator smoothing can absorb.
-4. Re-run the delay-mismatch sweep after any change to beta0 or l_comp.
+电池 (vs 前代 ff_pi=PM60/β0.04/无 CUSUM): matched 171.3→151.3; ADAD RMSE
+32.6→22.5 (−31%) 过冲 68.6→57.6 (−16%); stop RMSE −21% 恢复 267→150ms;
+accel 11.3→7.1 (−37%); 失配带 L20-80 全过; step 277ms/3.11px 不变。
 """
 from __future__ import annotations
 import math
@@ -151,21 +48,21 @@ from arena.laws.base import Law, register
 
 
 class _CountsHist:
-    __slots__ = ("t", "cx", "cy", "cumx", "camy")
+    __slots__ = ("t", "cx", "cy", "cumx", "cumy")
 
     def __init__(self):
         self.t: list[float] = []
         self.cx: list[float] = []
         self.cy: list[float] = []
         self.cumx = 0.0
-        self.camy = 0.0
+        self.cumy = 0.0
 
     def add(self, t, dx, dy):
         self.cumx += dx
-        self.camy += dy
+        self.cumy += dy
         self.t.append(t)
         self.cx.append(self.cumx)
-        self.cy.append(self.camy)
+        self.cy.append(self.cumy)
         if len(self.t) > 2000:
             self.t.pop(0); self.cx.pop(0); self.cy.pop(0)
 
@@ -191,7 +88,7 @@ class _CountsHist:
                 self.cy[lo] + (self.cy[hi] - self.cy[lo]) * f)
 
     def cum(self):
-        return self.cumx, self.camy
+        return self.cumx, self.cumy
 
 
 @register("ff_pi")
@@ -199,20 +96,25 @@ class FFPILaw(Law):
     DT0 = 1000.0 / 120.0
     JUMP_GATE = 100.0
     STALE = 200.0
+    # CUSUM 参数 (均为 σ 倍数, 无量纲): K 漂移 / C 单帧增量上限 / H 告警
+    CUSUM_K = 0.5
+    CUSUM_C = 3.0
+    CUSUM_H = 9.0
 
-    def __init__(self, zeta=1.0, pm_deg=60.0, ff_gain=1.0, l_comp=1.1,
-                 alpha0=0.50, beta0=0.04, beta_exp=1.0, i_gate=8.0, i_frac=1.0,
-                 max_v=1.5):
-        self.zeta = zeta
-        self.pm_deg = pm_deg
-        self.ff_gain = ff_gain
-        self.l_comp = l_comp
-        self.alpha0 = alpha0
-        self.beta0 = beta0
-        self.beta_exp = beta_exp
-        self.i_gate = i_gate
-        self.i_frac = i_frac
-        self._max_v = max_v
+    def __init__(self, **kw):
+        # 设计点 (失配带电池选定, 非手感): PM=50 全带最快; β0=0.03 带边缘余量
+        kw.setdefault("pm_deg", 50.0)
+        kw.setdefault("beta0", 0.03)
+        self.zeta = kw.pop("zeta", 1.0)
+        self.ff_gain = kw.pop("ff_gain", 1.0)
+        self.l_comp = kw.pop("l_comp", 1.1)
+        self.alpha0 = kw.pop("alpha0", 0.50)
+        self.beta0_exp = kw.pop("beta_exp", 1.0)
+        self.i_gate = kw.pop("i_gate", 8.0)
+        self.i_frac = kw.pop("i_frac", 1.0)
+        self.pm_deg = kw.pop("pm_deg")
+        self.beta0 = kw.pop("beta0")
+        self._max_v = kw.pop("max_v", 1.5)
 
     def reset(self, cfg: LawConfig):
         self.cfg = cfg
@@ -228,12 +130,28 @@ class FFPILaw(Law):
         self.t_pub = -1e9
         self.int_x = self.int_y = 0.0
         self.rem_x = self.rem_y = 0.0
+        self.sig2x = self.sig2y = 1.0   # 创新方差在线估计 (px², 自标定)
+        self.csx = self.csy = 0.0       # CUSUM 状态 (σ 单位)
+        self._w_state = 0.0             # 信任度 0..1 (1=信任, FF 无门控)
+        self._w_inst = 0.0              # CUSUM 告警电平
+
+    def _w_update(self, cfg: LawConfig, h: float) -> float:
+        """信任度: CUSUM 告警电平 → 非对称滤波 (告警 ~2 帧降级, 按标定
+        L 尺度恢复)。降级期 FF 回距离门控保守形态, 满格期无门控。"""
+        self._w_inst = min(1.0, max(self.csx, self.csy) / self.CUSUM_H)
+        a = 1.0 - math.exp(-h / (2.0 * self.DT0))
+        d = 1.0 - math.exp(-h / max(1.0, cfg.L))
+        rate = a if self._w_inst > self._w_state else d
+        self._w_state += rate * (self._w_inst - self._w_state)
+        return self._w_state
 
     def _update_filter(self, det: Observation):
         cfg = self.cfg
         if self.prev_det_t is None:
             self.fx, self.fy = det.dx, det.dy
             self.fvx = self.fvy = 0.0
+            self.sig2x = self.sig2y = 1.0
+            self.csx = self.csy = 0.0
             self.filt = True
             self.prev_det_t = det.t
             self.t_pub = det.t
@@ -249,14 +167,45 @@ class FFPILaw(Law):
         if math.hypot(inx, iny) > self.JUMP_GATE:
             self.fx, self.fy = det.dx, det.dy
             self.fvx = self.fvy = 0.0
+            self.csx = self.csy = 0.0
         else:
             r = dt / self.DT0
             alpha = min(0.90, self.alpha0 * r)
-            beta = min(0.60, self.beta0 * r ** self.beta_exp)
+            beta_s = min(0.60, self.beta0 * r ** self.beta0_exp)
+            self.sig2x += beta_s * (inx * inx - self.sig2x)
+            self.sig2y += beta_s * (iny * iny - self.sig2y)
+            # 双向 CUSUM, 只累计与 v̂ 矛盾方向的创新 (σ 归一):
+            #   矛盾 = 创新方向与 v̂ 相反 — 急停/变向的签名。
+            #   v̂≈0 时不累计 (无可矛盾); 单帧封顶 C 拒单帧踢脚。
+            sx = max(math.sqrt(self.sig2x), 1e-6)
+            sy = max(math.sqrt(self.sig2y), 1e-6)
+            if self.fvx > 0:
+                accx = -inx / sx
+            elif self.fvx < 0:
+                accx = inx / sx
+            else:
+                accx = -self.CUSUM_K
+            if self.fvy > 0:
+                accy = -iny / sy
+            elif self.fvy < 0:
+                accy = iny / sy
+            else:
+                accy = -self.CUSUM_K
+            self.csx = max(0.0, self.csx + min(max(accx, 0.0), self.CUSUM_C)
+                           - self.CUSUM_K)
+            self.csy = max(0.0, self.csy + min(max(accy, 0.0), self.CUSUM_C)
+                           - self.CUSUM_K)
+            # 告警 → 该轴速度归零 (位置保留): 环路重跑阶跃响应
+            if self.csx >= self.CUSUM_H and self.fvx != 0.0:
+                self.fvx = 0.0
+                self.csx = 0.0
+            if self.csy >= self.CUSUM_H and self.fvy != 0.0:
+                self.fvy = 0.0
+                self.csy = 0.0
             self.fx = px_pred + alpha * inx
             self.fy = py_pred + alpha * iny
-            self.fvx += (beta / dt) * inx
-            self.fvy += (beta / dt) * iny
+            self.fvx += (beta_s / dt) * inx
+            self.fvy += (beta_s / dt) * iny
         self.prev_det_t = det.t
         self.t_pub = det.t
 
@@ -268,6 +217,7 @@ class FFPILaw(Law):
         cx = cy = 0
         age = t - self.t_pub
         if self.filt and age < self.STALE:
+            w_state = self._w_update(cfg, cfg.h)
             Lc = cfg.L * self.l_comp
             cp = self.ch.at(self.t_pub - Lc)
             cn = self.ch.cum()
@@ -290,8 +240,13 @@ class FFPILaw(Law):
                 if not wy:
                     self.int_y = max(-i_lim, min(i_lim, self.int_y + ey * cfg.h * gate))
 
-            vx_u += self.ff_gain * gate * self.fvx
-            vy_u += self.ff_gain * gate * self.fvy
+            # FF 门控 = 信任度插值 (信任满格无门控, 告警回保守距离门控)
+            frame_dt = cfg.frame_dt if cfg.frame_dt > 0 else self.DT0
+            gap_scale = 1.0 - max(0.0, min(1.0, (age - frame_dt) / max(1.0, cfg.L)))
+            ff_gate = gate + (1.0 - gate) * (1.0 - w_state)
+            ff_eff = self.ff_gain * ff_gate * gap_scale
+            vx_u += ff_eff * self.fvx
+            vy_u += ff_eff * self.fvy
 
             vx = max(-self.max_v, min(self.max_v, vx_u))
             vy = max(-self.max_v, min(self.max_v, vy_u))

@@ -1,4 +1,4 @@
-"""arena/eval.py — 标准化评测电池 (所有 law 用完全相同的多组场景)。
+﻿"""arena/eval.py — 标准化评测电池 (所有 law 用完全相同的多组场景)。
 
 电池:
   A. 标准多组场景 (step x2 / 匀速 / 匀加速 / 随机机动), 匹配延迟 L=50, 120fps, 噪声。
@@ -25,7 +25,7 @@ def _suite_cfg(fps=120):
     return ArenaConfig(noise_std=NOISE, fps=fps)
 
 
-def battery(law_factory, L_belief=NOMINAL_L, max_v=1.5, verbose=True):
+def test_suite(law_factory, L_belief=NOMINAL_L, max_v=1.5, verbose=True):
     suite = standard_suite()
     rep = [s for s in suite if s.name in ("step_80px", "maneuver")]
     summary = {}
@@ -62,12 +62,12 @@ def battery(law_factory, L_belief=NOMINAL_L, max_v=1.5, verbose=True):
     # 总评: 匹配性能 + 失配最坏 (重罚) 的折中
     summary["overall"] = 0.5 * scoreA + 0.5 * worst + 200.0 * summary["fps_delta"]
     if verbose:
-        print_battery(law_factory.__name__ if hasattr(law_factory, "__name__") else "law",
+        print_test_suite(law_factory.__name__ if hasattr(law_factory, "__name__") else "law",
                       summary)
     return summary
 
 
-def print_battery(tag, s):
+def print_test_suite(tag, s):
     print(f"\n########## {tag} ##########")
     runner.print_suite("A: matched L=50, 120fps", s["matched_120"]["result"],
                        s["matched_120"]["score"])
@@ -89,7 +89,7 @@ def main():
     name = sys.argv[1]
     Lb = float(sys.argv[2]) if len(sys.argv) > 2 else NOMINAL_L
     cls = get_law(name)
-    battery(lambda: cls(), L_belief=Lb)
+    test_suite(lambda: cls(), L_belief=Lb)
 
 
 if __name__ == "__main__":

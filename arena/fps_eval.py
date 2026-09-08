@@ -1,4 +1,4 @@
-"""arena/fps_eval.py — FPS 行为库评测电池 (急停/跳跃落地/蹬墙跳/变向/…)。
+﻿"""arena/fps_eval.py — FPS 行为库评测电池 (急停/跳跃落地/蹬墙跳/变向/…)。
 
 与 arena.eval (标准电池) 互补: 标准电池覆盖跟踪/阶跃/延迟失配/帧率,
 本电池覆盖"FPS 角色行为"维度的瞬态, 核心指标是事件后过冲 over 与
@@ -54,7 +54,7 @@ def _ev_stats(events):
             sum(rec) / len(rec) if rec else float("inf"))
 
 
-def battery(law_factory, verbose=True):
+def test_suite(law_factory, verbose=True):
     summary = {}
     for tag, drop_p in VARIANTS:
         summary[tag] = run_variant(law_factory, drop_p)
@@ -69,12 +69,12 @@ def battery(law_factory, verbose=True):
 
     summary["totals"] = {tag: tot(summary[tag]) for tag, _ in VARIANTS}
     if verbose:
-        print_battery(law_factory.__name__ if hasattr(law_factory, "__name__")
+        print_test_suite(law_factory.__name__ if hasattr(law_factory, "__name__")
                       else "law", summary)
     return summary
 
 
-def print_battery(tag, s):
+def print_test_suite(tag, s):
     print(f"\n########## {tag} ##########")
     for vtag, _ in VARIANTS:
         print(f"\n=== FPS suite [{vtag}] ===")
@@ -99,7 +99,7 @@ def main():
     names = sys.argv[1:] or ["ff_pi", "reference"]
     for name in names:
         cls = get_law(name)
-        battery(lambda: cls())
+        test_suite(lambda: cls())
 
 
 if __name__ == "__main__":

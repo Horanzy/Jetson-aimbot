@@ -1,4 +1,4 @@
-// ============================================================================
+﻿// ============================================================================
 //  aimbot.cu — AI 视觉自瞄 (鼠标透传式) + 可选训练数据采集
 //
 //  链路: 采集卡 (UVC 1080p NV12, -d 按名字选择) → GStreamer nvvidconv
@@ -81,9 +81,9 @@ const float PRED_DT0      = 1000.0f / 120.0f;        // 增益归一参考帧周
 const float TRACK_JUMP_GATE = 100.0f;                // 创新超此值 → 重置滤波器
 const float TARGET_STALE_MS = 200.0f;                // 目标超时 → 暂停自瞄
 
-// ========================= 控制律: 极点配置 PI + type-2 速度前馈 (ffpi2) =========================
+// ========================= 控制律: 极点配置 PI + type-2 速度前馈 (ffpi) =========================
 //  带宽由标定延迟 L 导出 (免手调); 前馈补跟踪速度; 方向矛盾 CUSUM 告警时
-//  该轴 v̂ 归零重拉 (变向/急停复用阶跃响应)。详见 arena/laws/ff_pi2.py 与 AGENTS.md。
+//  该轴 v̂ 归零重拉 (变向/急停复用阶跃响应)。详见 arena/laws/ff_pi.py 与 AGENTS.md。
 const float FF_PM_DEG = 50.0f;                       // 相位裕度: wn=(90°−PM)π/180/L (60→50: 失配带 L20-80 全过的最快设计点, wn+26%/Ki+59%)
 const float FF_ZETA   = 1.0f;                        // 收敛阻尼比 (临界阻尼, 无过冲)
 const float FF_GAIN_VAL   = 1.0f;                        // 速度前馈增益: =1 是匀速目标零拖尾的精确开环指令
@@ -491,7 +491,7 @@ void ai_thread(std::string model_path, float conf_thr, int target_cls,
     std::cout<<"✅ AI 线程已启动 ("<<cam_fps<<" fps, "<<cam_dev<<")\n";
 
     bool filt_init=false; float fx=0,fy=0,fvx=0,fvy=0;
-    float sig2x=1,sig2y=1,csx=0,csy=0;   // CUSUM 状态 (ffpi2: σ 自标定, 归零重拉)
+    float sig2x=1,sig2y=1,csx=0,csy=0;   // CUSUM 状态 (ffpi: σ 自标定, 归零重拉)
     auto t_prev=std::chrono::steady_clock::now();
 
     float s_est=init_s, l_est=init_l;
@@ -787,7 +787,7 @@ void send_report(int fd, int16_t rx, int16_t ry, int8_t w, int8_t hw, uint16_t b
 // ========================= main =========================
 int main(int argc, char* argv[]) {
     std::cout<<"========================================\n"
-             <<"  AI 视觉自瞄 (ffpi2 控制律)\n"
+             <<"  AI 视觉自瞄 (ffpi 控制律)\n"
              <<"========================================\n";
 
     std::string a_m,a_c,a_t,a_y,a_d,a_f,a_x,a_s,a_l,a_S,a_k,a_v;
