@@ -1,17 +1,17 @@
 # arena control-law author guide
 
-All laws are evaluated on **exactly the same scenario suite**. This guide defines the interface and the evaluation method. Run `python3 -m ...` from the repository root.
+All laws are evaluated on **exactly the same scenario suite**. This guide defines the interface and the evaluation method. Run `python -m ...` from the repository root.
 
 ## Interface (must be followed strictly)
 
-Your file: `arena/laws/<name>.py` (imported via try/except by `__init__.py`, so it is active as soon as it exists).
+Your file: `arena/laws/<name>.py` (imported by `__init__.py` — add an import line there, so it is active as soon as it exists).
 
 ```python
 from __future__ import annotations
 import math
 from typing import Optional, Tuple
 from arena.core import Observation, LawConfig
-from arena.laws.base import Law, register
+from arena.laws.base import CountsHist, Law, register
 
 @register("<law_name>")
 class MyLaw(Law):
@@ -40,27 +40,32 @@ class MyLaw(Law):
 - **The only delay is on the observation side**: a frame stamped `obs.t` reflects the world as of `obs.t − L_true`.
 - Control runs at 500Hz (2ms), observations at 120fps (8.33ms) — about 4 ticks per frame.
 - You keep your own command history and detection history; arena provides nothing else.
+  The cumulative-counts ring buffer (`CountsHist` in `laws/base.py`) is shared infrastructure
+  all laws use for in-flight subtraction and command replay.
 - `cfg.s`/`cfg.L` are the values you **believe**; arena's ground truth may differ (mismatch testing).
 - Units are px / px/ms. To command velocity v (px/ms): `counts = v * cfg.h / cfg.s`.
 - Use remainder-accumulation quantization so small corrections don't truncate to 0.
 
 ## Evaluation (standard battery, identical for everyone)
-CLI: `python3 -m arena.eval <law_name>`
+CLI: `python -m arena.eval <law_name>`
 or:
 ```python
 from arena.laws.base import get_law
-from arena.eval import battery
-battery(lambda: get_law("<law_name>")())
+from arena.eval import test_suite
+test_suite(lambda: get_law("<law_name>")())
 ```
 The battery: (A) standard multi-scenario suite @ matched L=50 / 120fps; (B) delay-mismatch
 sweep L_true ∈ {30,40,50,60,70}, belief=50; (C) 60 vs 120fps. Prints composite + OVERALL
 (lower is better). **Divergence is heavily penalized** — a law that diverges under mismatch
-loses no matter how fast it is.
+loses no matter how fast it is. Also run `python -m arena.integrate <law_name>` for relock +
+the wide-delay sweep L_true ∈ {20..80} + sensitivity mismatch, and `python -m arena.fps_eval
+<law_name>` for the FPS behavior suite.
 
-## Reference baseline (ff_pi, the current main control law)
-OVERALL=153.2, matched composite=171.3 (step settle 377ms / overshoot 3.5px / first reach 198ms;
-const_vel rmse 0.9px; maneuver rmse 23.1), worst mismatch=122.9, zero divergence across wide
-delay L20–80 and sensitivity s0.7–1.3. Goal: beat it across the board.
+## Reference baseline (ff_pi, the current shipped control law)
+OVERALL=156.7, matched composite=151.3 (step settle 277ms / overshoot 3.1px / first reach 177ms;
+const_vel rmse 0.8px; maneuver rmse 19.4px), worst mismatch=125.1, relock 386ms. Passes the
+sensitivity band s0.7–1.3; at the wide-delay corner L_true=80 the step settle rides the 3px
+knife edge (no divergence). Goal: beat it across the board.
 
 ## Rules
 - Only modify your own law file; don't touch core/runner/eval/scenarios/base.

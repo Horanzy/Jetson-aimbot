@@ -1,4 +1,4 @@
-﻿# AGENTS.md
+# AGENTS.md
 
 ## Overview
 
@@ -12,7 +12,7 @@ Capture card (UVC 1080p NV12) → GStreamer nvvidconv → CUDA preprocess → Te
 
 No hand-tuned gains: a bilateral side-key trigger runs auto-calibration, estimating sensitivity s (px/count) and loop delay L (ms) online. Adapts to PC / PS5 / 60fps / 120fps.
 
-**Control law**: the main program `src/aimbot.cu` uses **ffpi** (pole-placement PI + type-2 velocity feedforward **with maneuver-withdrawal FF + detection-gap decay**) — the convergence bandwidth `wn` is derived from the calibrated delay `L` via phase margin (`wn=(90°−PM)π/180/L`, PM=50°), **no hand-tuned magic numbers**, good generalization. The same binary has **optional training-data collection** (enabled with `-o`, otherwise pure aimbot). `src/aimbot_ballistic.cu` / `src/aimbot_sliding.cu` are **alternative control laws**, kept as-is (no collection), each a Pareto point in speed/robustness (see the "arena control-law simulation" section). All control-law exploration/comparison/tuning happens in the pure-Python `arena/` simulation (this machine cannot compile .cu).
+**Control law**: the single program `src/aimbot.cu` uses **ff_pi** (pole-placement PI + type-2 velocity feedforward with direction-contradiction CUSUM velocity reset and detection-gap FF decay) — the convergence bandwidth `wn` is derived from the calibrated delay `L` via phase margin (`wn=(90°−PM)π/180/L`, PM=50°), **no hand-tuned magic numbers**, good generalization. The same binary has **optional training-data collection** (enabled with `-o`, otherwise pure aimbot). All control-law exploration/comparison/tuning happens in the pure-Python `arena/` simulation (this machine cannot compile .cu).
 
 ## Environment
 
@@ -21,10 +21,10 @@ No hand-tuned gains: a bilateral side-key trigger runs auto-calibration, estimat
 
 ```
 /mnt/TF/aimbot/
-├── src/         aimbot.cu (ffpi + optional collection) / aimbot_ballistic.cu / aimbot_sliding.cu
+├── src/         aimbot.cu (ff_pi + optional collection)
 ├── scripts/     compile.sh / convert.sh / setup_mouse.sh
 │   └── game/    per-game launch scripts (battlefield.sh)
-├── bin/         build outputs (aimbot / aimbot_ballistic / aimbot_sliding)
+├── bin/         build output (aimbot)
 ├── engine/      *.engine model library
 ├── onnx/        *.onnx
 └── dataset/     collection output (fire/ det/ auto/)
@@ -38,16 +38,14 @@ No hand-tuned gains: a bilateral side-key trigger runs auto-calibration, estimat
 
 | File | Role |
 |---|---|
-| `src/aimbot.cu` | **Main program**: full aimbot + optional training-data collection. Control law ffpi (pole-placement PI + type-2 velocity feedforward with maneuver-withdrawal FF + detection-gap decay; wn derived from L, no hand tuning). Without `-o` it is pure aimbot |
-| `src/aimbot_ballistic.cu` | Alternative law: ballistic flick + critically damped convergence (brake point = Vmax·L, wn derived from L). Fastest flick + best maneuver tracking + frame-rate independent. Pure aimbot, no collection |
-| `src/aimbot_sliding.cu` | Alternative law: boundary-layer sliding mode + ballistic flick (wn from the full delay at PM=60). Robustness first: zero divergence under all mismatches + flattest profile, but slowest. Pure aimbot, no collection |
-| `scripts/compile.sh` | nvcc build of aimbot / aimbot_ballistic / aimbot_sliding → `bin/` (run on the Jetson) |
+| `src/aimbot.cu` | **The program**: full aimbot + optional training-data collection. Control law ff_pi (pole-placement PI + type-2 velocity feedforward with direction-contradiction CUSUM velocity reset and detection-gap FF decay; wn derived from L, no hand tuning). Without `-o` it is pure aimbot |
+| `scripts/compile.sh` | nvcc build of aimbot → `bin/` (run on the Jetson) |
 | `scripts/convert.sh` | Batch ONNX → TensorRT engine conversion |
 | `scripts/setup_mouse.sh` | USB Gadget config, creates `/dev/hidg0` |
 | `scripts/game/*.sh` | Per-game launch scripts (relative paths; screenshot-collection switch `CAPTURE`; auto write-back of calibration values `S_EST`/`L_EST`) |
 | `arena/` | Pure-Python control-law simulation evaluator (neutral simulator + 8 laws + standard + FPS test suites); see dedicated section |
 
-Linking note: all three binaries need `-lopencv_video` (calibration uses `phaseCorrelate`); `aimbot` additionally needs `-lopencv_imgcodecs` (collection `imwrite`). The alternative laws have no collection and don't need imgcodecs.
+Linking note: `aimbot` needs `-lopencv_video` (calibration uses `phaseCorrelate`) and `-lopencv_imgcodecs` (collection `imwrite`).
 
 ## Parameters
 
@@ -59,15 +57,13 @@ Linking note: all three binaries need `-lopencv_video` (calibration uses `phaseC
 -S write-back script path  -k trigger key (fire/ads/both)  -v preview
 ```
 
-Note: the ffpi bandwidth is derived automatically from the calibrated `L`; **there are no hand-tuning parameters**. Structural parameters (PM/ζ/FF_GAIN_VAL/FF_I_GATE/over-compensation) are header constants in `src/aimbot.cu`, see "Tuning".
+Note: the ff_pi bandwidth is derived automatically from the calibrated `L`; **there are no hand-tuning parameters**. Structural parameters (PM/ζ/FF_GAIN_VAL/FF_I_GATE/over-compensation) are header constants in `src/aimbot.cu`, see "Tuning".
 
 **Collection options** (enabled with `-o`, otherwise pure aimbot):
 
 ```
 -o output dir (auto-creates fire/ det/ auto/)  -F fire interval ms  -A timed interval s  -C cooldown ms  -q JPEG quality
 ```
-
-**Alternative laws** (`aimbot_ballistic` / `aimbot_sliding`): same interface minus the collection options; bandwidth likewise derived from L — no hand-tuning parameters.
 
 **Calibration**: aim at a static background with texture, hold both side keys for 5 s. Start = draw a square; success = nod; failure = shake. With `-S`, `S_EST=`/`L_EST=` are written back into the script automatically (atomic rename).
 
@@ -81,7 +77,7 @@ Note: the ffpi bandwidth is derived automatically from the calibrated `L`; **the
 | Sensitivity s | least-squares calibration (coarse 8ms + fine 2ms sweep) | hip-fire calibration | constant |
 | Delay L | phase-correlation delay sweep (same two rounds) | hip-fire calibration | constant |
 
-### Control law (ffpi, `src/aimbot.cu`)
+### Control law (ff_pi, `src/aimbot.cu`)
 
 ```
 Predictor (Smith, dt-normalized): α=min(.9, PRED_ALPHA0·dt/DT0), β=min(.6, PRED_BETA0·dt/DT0)
@@ -120,7 +116,7 @@ The **P term** `Kp·ê` is the fast channel: flicks and instant corrections. The
 
 ## Tuning
 
-**The main aimbot (ffpi) needs no hand tuning**: after calibrating `s,L`, `wn` scales with `L` automatically. Structural parameters are header constants in `src/aimbot.cu`:
+**The aimbot needs no hand tuning**: after calibrating `s,L`, `wn` scales with `L` automatically. Structural parameters are header constants in `src/aimbot.cu`:
 
 | Constant | Default | Meaning | On-device adjustment |
 |---|---|---|---|
@@ -134,13 +130,11 @@ The **P term** `Kp·ê` is the fast channel: flicks and instant corrections. The
 
 On-device workflow: ① calibrate s,L (L too low is the dangerous direction). ② If real-device noise is far above arena's 0.5px: **lower `PRED_BETA0` first** — don't rush to add filters (that becomes hidden control tuning). ③ Mismatch oscillation → raise `FF_PM_DEG` (lower wn) or raise `FF_ZETA`. ④ After changing any estimator/compensation constant, rerun the wide-delay sweep of `arena.integrate ff_pi` and the FPS behavior test suite `arena.fps_eval ff_pi` to confirm no divergence and no event regression. `FOV_RADIUS`, `KEEP_ALIVE_MS` and the `CalibSeg` trajectory segments are also in the header constants area.
 
-For alternative-law (ballistic/sliding) tuning, see each `.cu`'s header constants and the "arena control-law simulation → header constants" table.
-
 Collection uses raw NV12 (not MJPEG): NV12 is the only format both the Hagibis and the ASUS CU4K30 support at 1080p120, taking ~3Gbps of USB3 bandwidth; don't put two cards on the same USB controller. Preprocessing runs on the GPU (CUDA kernel BGR→RGB CHW) and is no longer the framerate bottleneck.
 
 ## arena control-law simulation
 
-`arena/` is a **neutral pure-Python simulator** for fair evaluation/comparison/tuning of control laws. All control-law conclusions stand on its measurements. This machine has no TRT/GStreamer and can't compile .cu, so all control-law exploration happens here; the winner is then ported into `src/*.cu`.
+`arena/` is a **neutral pure-Python simulator** for fair evaluation/comparison/tuning of control laws. All control-law conclusions stand on its measurements. This machine has no TRT/GStreamer and can't compile .cu, so all control-law exploration happens here; the winner is then ported into `src/aimbot.cu`.
 
 ### Design principles (important)
 
@@ -150,7 +144,7 @@ Collection uses raw NV12 (not MJPEG): NV12 is the only format both the Hagibis a
   - Input law→arena: `step(t, obs) -> (cx, cy)` integer counts. The law keeps its own detection and command history and does its own estimation/prediction/quantization.
 - **Pure timestamp-driven**: sensing uses the real `L_true`; the `L` a law believes internally is its own business (`cfg.L`). Testing delay mismatch is just setting the two differently — arena supports it natively.
 - **Observation cadence ≠ control cadence**: detections are published at framerate (120/60fps); control runs at 500Hz (2ms); the two are modeled separately (~4 ticks per frame).
-- **Faithful plant/sensor**: pure delay (a frame reflects the world at t−L; target and crosshair are both sampled at that moment), framerate/control rate, command quantization and clamping (±120 counts), optional detection noise, near-instant crosshair response to commands (delay only on the observation side).
+- **Faithful plant/sensor**: pure delay (a frame reflects the world at t−L; target and crosshair are both sampled at that moment), framerate/control rate, command quantization and clamping (±120 counts), optional detection noise, per-frame detection dropout (`drop_p`), near-instant crosshair response to commands (delay only on the observation side).
 - **Self-test**: a conservative Smith+PI baseline law (`laws/reference.py`) with known behavior (stable convergence, visible ramp-up) validates the arena — if it fails to reproduce these behaviors, fix arena first. Currently passing.
 
 ### Files & running
@@ -167,11 +161,11 @@ arena/
 ├── integrate.py   integration: all-law leaderboard + relock + wide-delay sweep + sensitivity mismatch
 ├── selftest.py    reference-law self-test
 ├── AUTHORING.md   law author guide (interface/plant ground truth/evaluation method)
-└── laws/          control laws (base interface + registry; one file per law, @register)
+└── laws/          control laws (base interface + registry + shared CountsHist; one file per law, @register)
     ├── reference.py  Smith+PI baseline (self-test)
     ├── ff_pi.py      pole-placement PI + type-2 velocity FF + direction-contradiction CUSUM reset (the main aimbot)
-    ├── ballistic.py  open-loop ballistic flick + critically damped convergence (alternative)
-    ├── sliding.py    boundary-layer sliding mode + ballistic flick (alternative, most robust)
+    ├── ballistic.py  open-loop ballistic flick + critically damped convergence
+    ├── sliding.py    boundary-layer sliding mode + ballistic flick (most robust)
     ├── pi_pm.py      pole-placement PI + PM cap
     ├── kalman_pi.py  Kalman predictor + PM-PI
     ├── smith_filt.py filtered Smith predictor
@@ -189,70 +183,60 @@ Dependencies: stdlib + numpy (Kalman/MPC) + scipy (DARE solve for MPC); see `req
 .venv\Scripts\python.exe -m arena.fps_eval ff_pi ballistic sliding  # chosen laws only
 ```
 
-**Why 2D screen space is the right arena (and not "3D")**: the whole sense-control loop lives in screen pixels (capture → detect → dx,dy → law → counts → crosshair); the 3D game world is just one generator of screen-space trajectories, and the law never sees the world. The FPS behavior library (`fps.py`) therefore models the *screen-space shape* of 3D behaviors: jumps are parabolas on screen-y only (world-vertical motion projects to screen-vertical, orthogonal to any strafe heading), strafe heading is a free angle, wall-bounce is a full 2V velocity reversal, jump-landing is a hard y-velocity step. The only unmodeled 3D effect is tan-projection nonlinearity (s varies by sec² across the screen): ~2.4% inside the ±150px FOV circle — negligible; a 3D world+camera+projection Target subclass can be added later without touching core. A continuity assertion (position step < 5px/tick for every suite target) guards against trajectory-model bugs (they happened: a heading-rotation "teleport" and a parabola chopped mid-air).
+**Why 2D screen space is the right arena (and not "3D")**: the whole sense-control loop lives in screen pixels (capture → detect → dx,dy → law → counts → crosshair); the 3D game world is just one generator of screen-space trajectories, and the law never sees the world. The FPS behavior library (`fps.py`) therefore models the *screen-space shape* of 3D behaviors: jumps are parabolas on screen-y only (world-vertical motion projects to screen-vertical, orthogonal to any strafe heading), strafe heading is a free angle, wall-bounce is a full 2V velocity reversal, jump-landing is a hard y-velocity step. The only unmodeled 3D effect is tan-projection nonlinearity (s varies by sec² across the screen): ~2.4% inside the ±150px FOV circle — negligible; a 3D world+camera+projection Target subclass can be added later without touching core.
 
-**Adding a new law**: create a file in `laws/`, subclass `Law`, `@register("name")`, implement `reset(cfg)`/`step(t,obs)->(cx,cy)`, and add a try-import line in `laws/__init__.py`. See `arena/AUTHORING.md`.
+**Adding a new law**: create a file in `laws/`, subclass `Law`, `@register("name")`, implement `reset(cfg)`/`step(t,obs)->(cx,cy)`, and add an import line in `laws/__init__.py`. See `arena/AUTHORING.md`.
 **Adding a new scenario**: write a `Target` subclass + `Scenario` in `scenarios.py` and add it to `standard_suite()` (all laws are then evaluated on the same scenario automatically).
 **Adding a new metric**: add a function in `metrics.py`, aggregate in `runner.py`.
 
-### Leaderboard results (`arena.integrate`, all laws re-tuned from principles; lower is better)
+### Leaderboard results (`arena.integrate`, all laws tuned from principles; lower is better)
 
 | law | OVERALL | matched | worst mismatch | relock | fps delta | mismatch divergence boundary | compute |
 |---|---|---|---|---|---|---|---|
 | mpc | 144.8 | 160.3 | **113.4** | 444 | 4.0% | L20 **and** L80 | **heavy (QP/tick)** |
-| **ff_pi (main aimbot)** | 156.7* | **151.3** | 125.1 | **386** | 9.2%* | L20–70 + s0.7–1.3 pass; L80 edge settle-fail | light |
-| **ballistic (alternative)** | 157.8 | 173.5 | 142.0 | 437 | **0.0%** | L80 | light |
+| **ff_pi (shipped)** | 156.7* | **151.3** | 125.1 | **386** | 9.2%* | L20–70 + s0.7–1.3 pass; L80 edge settle-fail | light |
+| ballistic | 157.8 | 173.5 | 142.0 | 437 | **0.0%** | L80 | light |
 | kalman_pi | 163.4 | 189.9 | 129.4 | 477 | 1.8% | L80 | medium |
 | pi_pm | 164.9 | 199.1 | 128.0 | 483 | 0.6% | no divergence | light |
-| **sliding (alternative)** | 174.4 | 213.5 | 123.9 | 619 | 2.9% | **no divergence + flattest profile** | light |
+| sliding | 174.4 | 213.5 | 123.9 | 619 | 2.9% | **no divergence + flattest profile** | light |
 | smith_filt | 180.0 | 182.9 | 161.2 | 198 | 4.0% | L80 + s0.7 | light |
 | reference | 209.7 | 235.8 | 173.9 | 771 | 2.4% | L80 | light |
 
-\* ff_pi's fps-delta number is inflated by a settle knife-edge metric artifact: at 60fps it beats the previous PM60/β0.04 law on 4/5 scenarios per-scenario (step 216<407ms, const_vel 0.88<1.07px, accel 12.3<14.3px, maneuver 20.2<21.0px) — the composite's 60/120 ratio jumps on step_diag's marginal band crossing. The FPS behavior tests (`arena.fps_eval`) are the meaningful law-vs-law comparison: ff_pi wins on both axes vs the previous law (ADAD RMSE −31%, event overshoot −16%, tracking RMSE overall −19%).
+\* ff_pi's fps-delta number is inflated by a settle knife-edge metric artifact: at 60fps it is better on 4/5 scenarios per-scenario (step 216ms, const_vel 0.88px, accel 12.3px, maneuver 20.2px) — the composite's 60/120 ratio jumps on step_diag's marginal band crossing. The FPS behavior tests (`arena.fps_eval`) are the meaningful law-vs-law comparison.
 
-### The chosen law (ffpi → `src/aimbot.cu`)
+### The shipped law (ff_pi → `src/aimbot.cu`)
 
 **Core constraint (low patch-smell / generalization first)**: reject parameters "tuned by trial that cannot be explained from principle" (games change, and the tests don't run in-game). Therefore:
 
 - **The convergence bandwidth `wn` is always derived from the calibrated delay `L`**: `wn = (90°−PM)·π/180 / L`, PM=50° (a dimensionless design choice — the fastest point whose full delay band L20–80 passes the test suite), auto-scaling with `L`; **no hardcoded tuned constants**. At L=50, wn≈0.01396 rad/ms.
 - **The type-2 velocity feedforward `FF_GAIN_VAL=1`** comes from the plant model (integrator): it is the exact open-loop command for zero trail on constant-velocity targets, not a tuning knob; when the target model breaks the FF is **withdrawn on measurement evidence** (innovation-gated), not re-aimed — re-aiming needs a fast v̂, which raises estimator loop gain and diverges under mismatch (measured).
-- **Damping ratio ζ and phase margin PM are dimensionless design choices** (ffpi/ballistic ζ=1 critical damping; sliding ζ=0.5; PM=50° chosen by the mismatch-band test suite, PM=60° was the previous conservative point).
+- **Damping ratio ζ and phase margin PM are dimensionless design choices** (ff_pi ζ=1 critical damping; PM=50° chosen by the mismatch-band test suite).
 - The truly free knobs are few, and each is explainable from principle; empirical ones are explicitly labeled in each law's docstring.
 
-**Why ffpi is the main aimbot** (replaces ff_pi): it improves **both axes at once** — tracking/lock AND maneuver overshoot. vs ff_pi: matched composite 171.3→146.9 (every scenario better: step settle 377→278ms, accel 11.3→7.3px, maneuver 23.1→19.8px), FPS behavior test suite ADAD strafe-switch RMSE 32.6→23.9 (−27%) and event overshoot 68.6→56.6 (−17%), stop RMSE −16% with recovery 267→167ms, approach trail −25%, relock 483→356ms — while keeping the **full delay band L20–80 and s0.7–1.3 with no divergence** (band numbers better than ff_pi across L30–70). The CUSUM-reset mechanism is principled: a broken target model (stop/reversal) is handled by discarding the contradicted velocity state and re-running the proven step response, not by patching gains.
+**Why ff_pi is the shipped law** — best balance of tracking/lock AND maneuver overshoot: matched composite 151.3 (step settle 277ms / 3.11px, accel rmse 7.1px, maneuver rmse 19.4px, relock 386ms — best relock of all laws), FPS behavior suite ADAD rmse 24.1px / event overshoot 28.0px, while holding the **full delay band L20–80 and s0.7–1.3 with no divergence** (at the L80 corner step settle rides the 3px knife edge — see Known limitations). The CUSUM-reset mechanism is principled: a broken target model (stop/reversal) is handled by discarding the contradicted velocity state and re-running the proven step response, not by patching gains.
 
-**The two alternatives** (each a Pareto point; estimator/quantization/counts match their arena laws line for line):
+**Laws not shipped** (kept in `arena/`): `ballistic` is the fastest flick + best maneuver tracking + frame-rate independent, but has the highest worst-case mismatch and diverges at L80. `sliding` is the most robust (zero divergence across L20–80 + s0.7–1.3, flattest profile) but slowest. `mpc` is strongest on paper but solves a QP per tick — unverified against Jetson 500Hz embedded compute — and has the narrowest delay band (diverges at both L20 and L80). `pi_pm` is subsumed by ff_pi (ff_pi = pi_pm + principled feedforward). `kalman_pi`/`smith_filt` are covered by the above on the Pareto front. If a different trade-off is ever needed, port the corresponding law's `step()` into `src/aimbot.cu` (units/quantization/counts/estimator must match line for line).
 
-- **`src/aimbot_ballistic.cu` (fastest + best tracking)**: open-loop ballistic flick (brake point = Vmax·L) + ζ=1 critically damped convergence. Among the fastest flicks (~361ms) + best maneuver tracking (~19.6px) + best frame-rate independence (0.0%). Cost: highest worst-case mismatch (142); diverges at L80 (+30ms).
-- **`src/aimbot_sliding.cu` (most robust)**: boundary-layer sliding mode (convergence gains set from the **full delay** at PM=60 as a floor, not relying on exact Smith cancellation) + ballistic flick. Flattest mismatch profile (range 14); **zero divergence across wide delay L20–80 and sensitivity s0.7–1.3**. Cost: slowest matched speed (flick ~563ms).
+**Rejected paths (documented so they aren't re-explored)**: re-aiming the FF through a fast second velocity channel raises estimator loop gain and diverges at L30–70; hot design points (PM45–55 × β0≥0.06) pass matched but their estimator contamination makes step hunting at the band edges — the mismatch band is the hard constraint of the linear Smith+PI+FF family, and PM50/β0.03 is its test-suite-selected fastest point.
 
-**Candidates not shipped**: `mpc` is strongest on paper (first in OVERALL/worst-mismatch/overshoot/maneuver in-band), but it solves a QP per tick — unverified against Jetson 500Hz embedded compute — and has the narrowest delay band (diverges at both L20 and L80); kept in arena for future needs. `pi_pm` is subsumed by `ff_pi` (ff_pi = pi_pm + principled feedforward) and is not shipped separately. `kalman_pi`/`smith_filt` are covered by the above on the Pareto front. **Rejected paths (documented so they aren't re-explored)**: re-aiming the FF through a fast second velocity channel raises estimator loop gain and diverges at L30–70; hot design points (PM45–55 × β0≥0.06) pass matched but their estimator contamination makes step hunting at the band edges — the mismatch band is the hard constraint of the linear Smith+PI+FF family, and PM50/β0.03 is its test-suite-selected fastest point.
+**Header constants** (constants area of `src/aimbot.cu`; principled rationale in `arena/laws/ff_pi.py`'s docstring):
 
-**Header constants** (constants area of each `.cu`; principled rationale in the docstrings of the corresponding `arena/laws/*.py`):
-
-| law | key constants | default | source |
-|---|---|---|---|
-| ff_pi (main) | `wn=(90−PM)π/180/L` | PM=50 | principle: delay phase margin, auto-scales with L; 50 = fastest passing the full delay band (test suite) |
-| ff_pi | `FF_GAIN_VAL` / `FF_ZETA` / `FF_I_GATE` | 1.0 / 1.0 / 8.0px | principle (type-2 exact FF) / principle (critical damping) / empirical (settled-region gate + withdrawal scale) |
-| ff_pi | `PRED_ALPHA0/BETA0/L_COMP` | 0.50/0.03/1.10 | estimator (dt-normalized) / estimator (band-edge margin) / Smith over-comp |
-| ballistic/sliding | `wn=(90−PM)π/180/L` | PM=60 | principle: delay phase margin, auto-scales with L |
-| ballistic | `BALL_BRAKE_FACTOR` / `BALL_ZETA` | 1.0 / 1.0 | physics (brake point = Vmax·L) / principle (critical damping) |
-| ballistic | `BALL_BOUND_FRAC` / `BALL_I_GATE_FRAC` / `BALL_VMAX_FRAC` | 0.20/0.20/0.95 | empirical (scaling, blend band) / empirical (scaling) / empirical (quantization margin) |
-| ballistic | `PRED_ALPHA0/BETA0/L_COMP` | 0.30/0.08/1.00 | estimator (dt-normalized) / estimator / no over-comp |
-| sliding | `SLID_ZETA` / `SLID_BRAKE_FACTOR` | 0.5 / 1.0 | principle (ζ=0.5→Ki=wn², integral corner=wn) / physics (brake=min stable layer) |
-| sliding | `SLID_BLEND_FRAC` / `SLID_I_GATE_FRAC` / `SLID_VMAX_FRAC` | 0.30/0.25/0.95 | empirical (handoff smoothing) / empirical (anti-windup) / empirical (quantization margin) |
-| sliding | `PRED_ALPHA0/BETA0/L_COMP` | 0.40/0.18/1.00 | estimator (**fixed gains, no dt normalization**) / estimator / no over-comp |
+| constant | default | source |
+|---|---|---|
+| `wn=(90−PM)π/180/L` | PM=50 | principle: delay phase margin, auto-scales with L; 50 = fastest passing the full delay band (test suite) |
+| `FF_GAIN_VAL` / `FF_ZETA` / `FF_I_GATE` | 1.0 / 1.0 / 8.0px | principle (type-2 exact FF) / principle (critical damping) / empirical (settled-region gate + withdrawal scale) |
+| `PRED_ALPHA0/BETA0/L_COMP` | 0.50/0.03/1.10 | estimator (dt-normalized) / estimator (band-edge margin) / Smith over-comp |
 
 ### Known limitations
 
-- arena's default 0.5px noise is optimistic; on a noisier real device fast laws converge slower — lower `PRED_BETA0` first (see Tuning); in extreme cases consider the sliding approach (more robust, slower).
+- arena's default 0.5px noise is optimistic; on a noisier real device ff_pi converges slower — lower `PRED_BETA0` first (see Tuning); in extreme cases fall back to a more conservative design point (raise `FF_PM_DEG`), or port the sliding law from arena (most robust, slowest).
 - The constant-velocity (CV) predictor cannot predict acceleration: constant-accel targets have an a/Ki steady-state lag, removed slowly by the I term (maneuver RMSE ~20px is mostly the delay lower bound, not a law flaw).
 - mpc solves a QP per tick; 500Hz embedded compute is unverified (feasible in arena); shipping it would need explicit MPC or a lower solve rate.
-- Every law degrades under extreme mismatch (|L_true−L̂|>~30ms or s error >~40%) — beyond what calibration should ever produce; ffpi holds L20–70 + s0.7–1.3 fully, and at the L80 (+30ms) corner its step settle rides the 3px knife edge (final ≈3–4px, no divergence). Rely on calibration, not on the law toughing it out.
+- Every law degrades under extreme mismatch (|L_true−L̂|>~30ms or s error >~40%) — beyond what calibration should ever produce; ff_pi holds L20–70 + s0.7–1.3 fully, and at the L80 (+30ms) corner its step settle rides the 3px knife edge (final ≈3–4px, no divergence). Rely on calibration, not on the law toughing it out.
 
 ### How to rerun & extend
 
 1. `.venv\Scripts\python.exe -m arena.selftest` to confirm arena alignment.
 2. After changing/adding a law: `arena.eval <law>` for the standard test suite; `arena.integrate <law>` for the integration (mismatch/relock/framerate included).
-3. Once a better law is found, port its `step()` logic line for line into the corresponding `.cu` under `src/` (main law → the control section of `src/aimbot.cu`; or a new alternative-law file). Units/quantization/counts/estimator must match the winning law exactly.
+3. Once a better law is found, port its `step()` logic line for line into the control section of `src/aimbot.cu`. Units/quantization/counts/estimator must match the winning law exactly.
 4. Tuning stands on arena measurements, and **delay mismatch must be tested** (the wide-delay sweep in `integrate.py`); a scheme that diverges under mismatch loses, no matter how fast.
