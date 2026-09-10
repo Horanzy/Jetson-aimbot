@@ -100,49 +100,7 @@ from __future__ import annotations
 import math
 from typing import Optional, Tuple
 from arena.core import Observation, LawConfig
-from arena.laws.base import Law, register
-
-
-class _CountsHist:
-    def __init__(self):
-        self.t: list[float] = []
-        self.cx: list[float] = []
-        self.cy: list[float] = []
-        self.cumx = 0.0
-        self.camy = 0.0
-
-    def add(self, t, dx, dy):
-        self.cumx += dx
-        self.camy += dy
-        self.t.append(t)
-        self.cx.append(self.cumx)
-        self.cy.append(self.camy)
-        if len(self.t) > 2000:
-            self.t.pop(0); self.cx.pop(0); self.cy.pop(0)
-
-    def at(self, t):
-        ts = self.t
-        n = len(ts)
-        if n == 0:
-            return 0.0, 0.0
-        if t <= ts[0]:
-            return self.cx[0], self.cy[0]
-        if t >= ts[-1]:
-            return self.cx[-1], self.cy[-1]
-        lo, hi = 0, n - 1
-        while hi - lo > 1:
-            mid = (lo + hi) // 2
-            if ts[mid] <= t:
-                lo = mid
-            else:
-                hi = mid
-        span = ts[hi] - ts[lo]
-        f = (t - ts[lo]) / span if span > 0 else 0.0
-        return (self.cx[lo] + (self.cx[hi] - self.cx[lo]) * f,
-                self.cy[lo] + (self.cy[hi] - self.cy[lo]) * f)
-
-    def cum(self):
-        return self.cumx, self.camy
+from arena.laws.base import CountsHist, Law, register
 
 
 @register("sliding")
@@ -171,7 +129,7 @@ class SlidingLaw(Law):
         self.brake_dist = self.vmax * L * self._brake_factor
         self.boundary_layer = max(1.0, self._blend_frac * self.brake_dist)
         self.i_gate = self._i_gate_frac * self.brake_dist
-        self.ch = _CountsHist()
+        self.ch = CountsHist()
         self.filt = False
         self.fx = self.fy = self.fvx = self.fvy = 0.0
         self.prev_det_t = None

@@ -101,51 +101,7 @@ import math
 from typing import Optional, Tuple
 import numpy as np
 from arena.core import Observation, LawConfig
-from arena.laws.base import Law, register
-
-
-class _CountsHist:
-    __slots__ = ("t", "cx", "cy", "cumx", "camy")
-
-    def __init__(self):
-        self.t: list[float] = []
-        self.cx: list[float] = []
-        self.cy: list[float] = []
-        self.cumx = 0.0
-        self.camy = 0.0
-
-    def add(self, t, dx, dy):
-        self.cumx += dx
-        self.camy += dy
-        self.t.append(t)
-        self.cx.append(self.cumx)
-        self.cy.append(self.camy)
-        if len(self.t) > 2000:
-            self.t.pop(0); self.cx.pop(0); self.cy.pop(0)
-
-    def at(self, t):
-        ts = self.t
-        n = len(ts)
-        if n == 0:
-            return 0.0, 0.0
-        if t <= ts[0]:
-            return self.cx[0], self.cy[0]
-        if t >= ts[-1]:
-            return self.cx[-1], self.cy[-1]
-        lo, hi = 0, n - 1
-        while hi - lo > 1:
-            mid = (lo + hi) // 2
-            if ts[mid] <= t:
-                lo = mid
-            else:
-                hi = mid
-        span = ts[hi] - ts[lo]
-        f = (t - ts[lo]) / span if span > 0 else 0.0
-        return (self.cx[lo] + (self.cx[hi] - self.cx[lo]) * f,
-                self.cy[lo] + (self.cy[hi] - self.cy[lo]) * f)
-
-    def cum(self):
-        return self.cumx, self.camy
+from arena.laws.base import CountsHist, Law, register
 
 
 @register("kalman_pi")
@@ -177,7 +133,7 @@ class KalmanPILaw(Law):
         self.q = self.R * (self.sep * wn) ** 4
 
         self.H = np.array([[1.0, 0.0]])
-        self.ch = _CountsHist()
+        self.ch = CountsHist()
         self.x_x = np.zeros(2)
         self.x_y = np.zeros(2)
         self.P_x = np.array([[self.R, 0.0], [0.0, self.V0_STD ** 2]])
