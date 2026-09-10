@@ -13,6 +13,7 @@ from arena.laws import sliding_obs  # noqa: F401
 from arena.laws import smith_filt  # noqa: F401
 from arena.laws import mpc         # noqa: F401
 from arena.laws import ff_pi_acc   # noqa: F401
+from arena.laws import ballistic_ff    # noqa: F401
 
 # WIP 实验 law (调试用临时副本): 自动导入 _wip_*.py, 让并行实验不必碰这个
 # 共享文件。单个文件坏了只跳过自身 (stderr 提示), 不拖垮其它 law 的评测。
