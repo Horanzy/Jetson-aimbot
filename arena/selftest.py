@@ -1,7 +1,7 @@
 """arena/selftest.py — 用参考 law 自检 arena。
 
 验证: 参考 law (Smith+PI 基线) 在 arena 中能稳定收敛、表现出手调 τ 的爬坡特性,
-延迟准确时不发散。若发散/不收敛 → arena 植物/传感器没对齐, 先修 arena。
+延迟准确时不发散。若发散/不收敛 → arena 被控对象/传感器没对齐, 先修 arena。
 """
 from __future__ import annotations
 from arena.core import ArenaConfig

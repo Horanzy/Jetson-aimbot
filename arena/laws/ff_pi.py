@@ -15,7 +15,7 @@ CUSUM 速度归零重拉。
     "面")。检测 = 双向 CUSUM (Page 序贯变化检测), 只累计与 v̂ 矛盾方向的
     创新; 告警即该轴 v̂ 归零 (位置估计保留) — 环路回到与阶跃响应相同的
     初始条件: P 无遮蔽全程看见真实误差 (回拉 sharp), FF 从 0 随 v̂ 朝正确
-    方向重建 (渐进介入无踢脚)。变向/急停因此复用电池里最优的阶跃响应。
+    方向重建 (渐进介入无踢脚)。变向/急停因此复用评测组里最优的阶跃响应。
 
     CUSUM 参数 K/C/H 均为 σ 倍数 (无量纲), σ 在线自标定 (创新方差 EMA):
     噪声越大门自动越宽, 设备自适应, 无绝对 px 常数。
@@ -33,12 +33,12 @@ FF 门控 = 信任度插值:
 丢帧衰减: 检测中断时 FF 按标定 L 时间尺度撤回, 盲推上界 v̂·STALE(200ms)
 → ~v̂·L。
 
-设计点 (失配带电池选定, 非手感): PM=50 (全延迟带 L20-80 通过的最快点,
-wn+26%/Ki+59% vs PM60); β0=0.03 (带边缘余量)。
+设计点 (失配带测试选定, 非手感): PM=50 (全延迟带 L20-80 通过的最快点);
+β0=0.03 (带边缘余量)。
 
-电池 (vs 前代 ff_pi=PM60/β0.04/无 CUSUM): matched 171.3→151.3; ADAD RMSE
-32.6→22.5 (−31%) 过冲 68.6→57.6 (−16%); stop RMSE −21% 恢复 267→150ms;
-accel 11.3→7.1 (−37%); 失配带 L20-80 全过; step 277ms/3.11px 不变。
+评测 (arena 实测): matched 151.3 (step settle 277ms / 过冲 3.11px, accel
+rmse 7.1px, maneuver rmse 19.4px); 失配带 L30-70 全过; FPS 行为组 ADAD
+RMSE 24.1px / 事件过冲 28.0px。
 """
 from __future__ import annotations
 import math
@@ -58,14 +58,13 @@ class FFPILaw(Law):
     CUSUM_H = 9.0
 
     def __init__(self, **kw):
-        # 设计点 (失配带电池选定, 非手感): PM=50 全带最快; β0=0.03 带边缘余量
+        # 设计点 (失配带测试选定, 非手感): PM=50 全带最快; β0=0.03 带边缘余量
         kw.setdefault("pm_deg", 50.0)
         kw.setdefault("beta0", 0.03)
         self.zeta = kw.pop("zeta", 1.0)
         self.ff_gain = kw.pop("ff_gain", 1.0)
         self.l_comp = kw.pop("l_comp", 1.1)
         self.alpha0 = kw.pop("alpha0", 0.50)
-        self.beta0_exp = kw.pop("beta_exp", 1.0)
         self.i_gate = kw.pop("i_gate", 8.0)
         self.i_frac = kw.pop("i_frac", 1.0)
         self.pm_deg = kw.pop("pm_deg")
@@ -127,7 +126,7 @@ class FFPILaw(Law):
         else:
             r = dt / self.DT0
             alpha = min(0.90, self.alpha0 * r)
-            beta_s = min(0.60, self.beta0 * r ** self.beta0_exp)
+            beta_s = min(0.60, self.beta0 * r)
             self.sig2x += beta_s * (inx * inx - self.sig2x)
             self.sig2y += beta_s * (iny * iny - self.sig2y)
             # 双向 CUSUM, 只累计与 v̂ 矛盾方向的创新 (σ 归一):

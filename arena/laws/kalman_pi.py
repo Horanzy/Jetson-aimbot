@@ -73,9 +73,8 @@ PARAMETERS (each justified)
                    >1 over-compensates to guard the dangerous under-compensation
                    side (L_true > L̂): calibration L is a lower bound (the
                    bilateral-key procedure measures the minimum observable delay),
-                   so the operating point is placed just past L̂. 1.1 matches the
-                   established pi_pm convention. The PM=60 floor absorbs
-                   residuals beyond this coverage.
+                   so the operating point is placed just past L̂ (10% margin).
+                   The PM=60 floor absorbs residuals beyond this coverage.
   max_v            from cfg (velocity saturation).
 
   Derived in reset(): wn, Kp, Ki, q, R. JUMP_GATE=100 / STALE=200 are

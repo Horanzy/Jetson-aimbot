@@ -1,15 +1,13 @@
 """arena/laws/smith_filt.py — filtered Smith predictor, parameters derived from principle.
 
 ================================================================================
-GOAL OF THIS REVISION (low patch smell)
+DESIGN PRINCIPLE (no trial-and-error gains)
 ================================================================================
-The previous version lived near a stability cliff and shipped several hand-tuned
-magic numbers (wn=0.01, lam=50, L_inflate=1.2) that overfit the arena's L=50
-operating point. This revision DERIVES the two quantities that matter most — the
-controller bandwidth wn and the residual-filter time constant lam — from the
-believed delay L, so the law auto-scales to any latency and is robust by design
-rather than by trial and error. Arena speed is deliberately traded for this
-generalization margin.
+The two quantities that matter most — the controller bandwidth wn and the
+residual-filter time constant lam — are DERIVED from the believed delay L, so
+the law auto-scales to any latency and is robust by design rather than by
+trial and error. Arena speed is deliberately traded for this generalization
+margin.
 
 ================================================================================
 SMITH PREDICTOR PRINCIPLE
@@ -82,8 +80,7 @@ This is conservative BY DESIGN: the loop is guaranteed PM≈60° even with zero
 delay cancellation, so a working Smith predictor (which removes most of the
 delay) can only add margin on top. There is no cliff to fall off, no hardcoded
 tuned wn — wn simply scales as 1/L̂. The cost (accepted) is a lower bandwidth
-than an aggressively-tuned Smith could extract, hence slower step settling than
-the previous near-cliff version.
+than an aggressively-tuned Smith could extract, hence slower step settling.
 
 ================================================================================
 DISTURBANCE EXTRAPOLATION (removes the v·L tracking lag) — physically derived
