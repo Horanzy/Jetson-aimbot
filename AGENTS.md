@@ -161,6 +161,7 @@ arena/
 ├── runner.py      runs law × scenario, composite score, leaderboard
 ├── eval.py        standard test suite: multi-scenario + delay-mismatch sweep + 60/120fps
 ├── fps_eval.py    FPS behavior test suite: fps_suite × {clean, flaky drop_p=0.12}, per-event overshoot/recovery table
+├── trace.py       per-tick process tracer: single law × scenario → terminal process summary + per-tick CSV (+PNG if matplotlib present); optional law debug() hook; pure observation
 ├── integrate.py   integration: all-law leaderboard + relock + wide-delay sweep + sensitivity mismatch
 ├── selftest.py    reference-law self-test
 ├── AUTHORING.md   law author guide (interface/plant ground truth/evaluation method)
@@ -186,6 +187,7 @@ Dependencies: stdlib + numpy (Kalman/MPC) + scipy (DARE solve for MPC); see `req
 .venv\Scripts\python.exe -m arena.integrate ff_pi mpc # run only the given laws
 .venv\Scripts\python.exe -m arena.fps_eval            # FPS behavior test suite (default ff_pi + reference)
 .venv\Scripts\python.exe -m arena.fps_eval ff_pi ballistic sliding  # chosen laws only
+.venv\Scripts\python.exe -m arena.trace ff_pi step_80px [--L-true 30] [--csv out.csv]  # per-tick process trace of one run (debug; see "Process tracing" below)
 ```
 
 **Why 2D screen space is the right arena (and not "3D")**: the whole sense-control loop lives in screen pixels (capture → detect → dx,dy → law → counts → crosshair); the 3D game world is just one generator of screen-space trajectories, and the law never sees the world. The FPS behavior library (`fps.py`) therefore models the *screen-space shape* of 3D behaviors: jumps are parabolas on screen-y only (world-vertical motion projects to screen-vertical, orthogonal to any strafe heading), strafe heading is a free angle, wall-bounce is a full 2V velocity reversal, jump-landing is a hard y-velocity step. The only unmodeled 3D effect is tan-projection nonlinearity (s varies by sec² across the screen): ~2.4% inside the ±150px FOV circle — negligible; a 3D world+camera+projection Target subclass can be added later without touching core.
@@ -193,6 +195,10 @@ Dependencies: stdlib + numpy (Kalman/MPC) + scipy (DARE solve for MPC); see `req
 **Adding a new law**: create a file in `laws/`, subclass `Law`, `@register("name")`, implement `reset(cfg)`/`step(t,obs)->(cx,cy)`, and add an import line in `laws/__init__.py`. See `arena/AUTHORING.md`.
 **Adding a new scenario**: write a `Target` subclass + `Scenario` in `scenarios.py` and add it to `standard_suite()` (all laws are then evaluated on the same scenario automatically).
 **Adding a new metric**: add a function in `metrics.py`, aggregate in `runner.py`.
+
+### Process tracing (`arena/trace.py`, debug-only)
+
+Diagnostics used to be blind (aggregate finals only); `trace.py` replays **one** law × **one** scenario and shows where it breaks: per-tick CSV (`t/ex/ey/|e|/sent counts/new-frame/obs fields`), a compact terminal summary (band-entry ladder 10/5/3/1px, `event_metrics` event windows, worst-1s window, tail-oscillation verdict), event/auto window export, optional PNG. **Pure observation by construction** (law proxy; core/runner untouched) — the three default batteries are bit-identical with or without it (verified by diff). Optional law-side protocol: a law may implement `debug() -> dict[str, float]`; trace records it per tick as `dbg_*` columns — field names/semantics belong to the law's own docstring, arena never interprets them; `debug()` must be side-effect-free and is never called by eval/integrate/fps_eval. `laws/__init__.py` auto-imports `_wip_*.py` experiment copies (register as `wip_<name>`) so parallel debugging never touches the shared file; a broken WIP file is skipped with a stderr note, never blocks the real laws. Trace outputs live in gitignored `arena/trace_out/`.
 
 ### Leaderboard results (`arena.integrate`, all laws tuned from principles; lower is better)
 

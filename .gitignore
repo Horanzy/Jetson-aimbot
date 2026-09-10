@@ -14,3 +14,6 @@ trt_timing_cache.cache
 
 # WebUI 运行时状态 (config/token/profile 参数/历史), 只留在设备上
 webui/data/
+
+# arena trace 过程可视化输出 (CSV/PNG/基线留档, 只留在本地)
+arena/trace_out/

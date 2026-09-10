@@ -67,6 +67,12 @@ const_vel rmse 0.8px; maneuver rmse 19.4px), worst mismatch=125.1, relock 386ms.
 sensitivity band s0.7–1.3; at the wide-delay corner L_true=80 the step settle rides the 3px
 knife edge (no divergence). Goal: beat it across the board.
 
+## Process debugging (`arena/trace.py`, per law)
+
+- `python -m arena.trace <law> <scenario> [--L-true 30] [--csv out.csv]` replays a single run: per-tick CSV (`t/ex/ey/abs_e/sent_cx/sent_cy/obs_t/obs_dx/obs_dy/obs_new`), a terminal process summary (band-entry ladder 10/5/3/1px, event windows via `event_metrics`, worst-1s window, tail-oscillation verdict) and window export (`--event N`, `--auto-window`, `--window a:b`). Outputs go to gitignored `arena/trace_out/`. Pure observation — it never changes any metric.
+- Optional hook: implement `debug(self) -> dict[str, float]` on your law; trace records it per tick as `dbg_*` columns. Document every field's meaning in your law's docstring — arena does not interpret them. `debug()` must be side-effect-free; eval/integrate/fps_eval never call it.
+- While debugging, work on a copy `arena/laws/_wip_<name>.py` registered as `wip_<name>`; `_wip_*.py` files are auto-imported, so no `__init__.py` edit is needed.
+
 ## Rules
 - Only modify your own law file; don't touch core/runner/eval/scenarios/base.
 - You **must actually run arena and iterate** — theory alone doesn't count. Tune the method to its own optimum before reporting.
