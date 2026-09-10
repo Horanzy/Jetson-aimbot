@@ -35,11 +35,11 @@ def run_suite(law_factory, scenarios=None, arena_cfg=None, s_belief=1.0,
                              fov_radius=arena_cfg.fov_radius)
             m = run_one(law_factory(), sc, ac, s_belief, L_belief, max_v, sd)
             per.append(m)
-        out[sc.name] = {"metrics": per, "agg": _aggregate(per, sc.kind)}
+        out[sc.name] = {"metrics": per, "agg": aggregate(per, sc.kind)}
     return out
 
 
-def _aggregate(per, kind):
+def aggregate(per, kind):
     div = any(m["diverged"] for m in per)
     agg = {"diverged": div}
     if kind == "step":
@@ -66,8 +66,7 @@ def composite_score(suite_result, weights=None):
     DIV_PENALTY = 1e6
 
     score = 0.0
-    n_step = n_track = 0
-    for name, d in suite_result.items():
+    for d in suite_result.values():
         a = d["agg"]
         if a["diverged"]:
             score += DIV_PENALTY
@@ -76,11 +75,9 @@ def composite_score(suite_result, weights=None):
             score += w_settle * a["settle_ms"] / 100.0
             score += w_over * a["overshoot_px"]
             score += 0.3 * a["first_reach_ms"] / 100.0
-            n_step += 1
         else:
             score += w_rmse * a["rmse_px"]
             score += w_inband * (1.0 - a["in_band_frac"]) * 50.0
-            n_track += 1
     return score
 
 

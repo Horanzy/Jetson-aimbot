@@ -40,7 +40,7 @@ def run_variant(law_factory, drop_p):
                          max_v=MAX_V)
             per.append(M.compute(res, sc))
             evs.extend(M.event_metrics(res, sc.events))
-        out[sc.name] = {"track": runner._aggregate(per, "track"), "events": evs}
+        out[sc.name] = {"track": runner.aggregate(per, "track"), "events": evs}
     return out
 
 
