@@ -53,9 +53,11 @@ Linking note: `aimbot` needs `-lopencv_video` (calibration uses `phaseCorrelate`
 
 ```
 -m model  -c class  -t confidence  -y height offset  -d capture card (Hagibis/Asus or /dev/videoN)
--f framerate (120/60)  -x speed cap px/s  -s initial s  -l initial L
+-f framerate (120/60)  -x speed cap px/s  -s initial s  -l initial L  -r FOV radius px (default 150)
 -S write-back script path  -k trigger key (fire/ads/both)  -v preview
 ```
+
+Hot params: the binary opens a localhost-only UDP control channel (127.0.0.1:47700, `key=value;...`); the webui pushes whitelisted params (`t`/`y`/`x`/`fov`/`k`, clamped firmware-side) into the running process without restart — protocol in `webui/README.md`. Structural constants stay compile-time.
 
 Note: the ff_pi bandwidth is derived automatically from the calibrated `L`; **there are no hand-tuning parameters**. Structural parameters (PM/ζ/FF_GAIN_VAL/FF_I_GATE/over-compensation) are header constants in `src/aimbot.cu`, see "Tuning".
 
@@ -127,6 +129,7 @@ The **P term** `Kp·ê` is the fast channel: flicks and instant corrections. The
 | `FF_I_FRAC` | 1.0 | Integrator clamp (×vmax/Ki) | Windup overshoot → lower |
 | `PRED_ALPHA0/BETA0` | 0.50/0.03 | Filter position/velocity gains @120fps | Model jitter → lower ALPHA0; **real device much noisier → lower BETA0 first** (FF noise goes through it; 0.03 = band-edge margin) |
 | `PRED_L_COMP` | 1.10 | Smith over-compensation factor | Calibrated L too low (dangerous) → keep >1; too high → 1.0 |
+| `FOV_RADIUS` | 150 px | Default FOV radius — target selection gate AND integrator-start boundary; runtime value overridable via `-r` and hot-param `fov` | Widen: farther targets enter the gate (multi-target grab risk); >~452 px is wasted (capture window diagonal) |
 
 On-device workflow: ① calibrate s,L (L too low is the dangerous direction). ② If real-device noise is far above arena's 0.5px: **lower `PRED_BETA0` first** — don't rush to add filters (that becomes hidden control tuning). ③ Mismatch oscillation → raise `FF_PM_DEG` (lower wn) or raise `FF_ZETA`. ④ After changing any estimator/compensation constant, rerun the wide-delay sweep of `arena.integrate ff_pi` and the FPS behavior test suite `arena.fps_eval ff_pi` to confirm no divergence and no event regression. `FOV_RADIUS`, `KEEP_ALIVE_MS` and the `CalibSeg` trajectory segments are also in the header constants area.
 

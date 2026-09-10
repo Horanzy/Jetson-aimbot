@@ -12,6 +12,9 @@
 //  采集 (可选): 传 -o 输出目录即开启, 按三源触发自动截图 (开火 / 检测 / 定时),
 //    截图 = 模型输入同款中心裁剪, 按来源分子目录, 异步写盘不阻塞推理。不传 -o 则纯自瞄。
 //
+//  热参数: UDP 127.0.0.1 上的极小本地控制通道 (白名单 t/y/x/fov/k, 固件侧强制钳制),
+//    webui 保存后即时生效不重启; 结构常量仍为编译期, 与"无手调魔法数字"哲学一致。
+//
 //  标定: 双侧键长按 5 秒, 程序自动生成激励轨迹 (画正方形), 块相位相关测背景位移,
 //    最小二乘估计灵敏度 s (px/count) + 环路延迟 L (ms); 经 -S 传入脚本路径时自动回写。
 // ============================================================================
@@ -28,6 +31,7 @@
 #include <cctype>
 #include <climits>
 #include <cfloat>
+#include <cstring>
 #include <ctime>
 #include <fcntl.h>
 #include <unistd.h>
@@ -38,6 +42,8 @@
 #include <sys/ioctl.h>
 #include <sys/epoll.h>
 #include <sys/timerfd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
 #include <sys/stat.h>
 #include <linux/input.h>
 #include <chrono>
@@ -62,7 +68,8 @@ constexpr const char* DEFAULT_KEYWORD  = "";         // 空 = 匹配任意 *-eve
 constexpr const char* DEFAULT_VIRT_DEV = "/dev/hidg0";
 constexpr const char* DEV_SEARCH_PATH  = "/dev/input/by-id/";
 
-const float FOV_RADIUS     = 150.0f;                 // 自瞄生效 FOV 半径 (px)
+const float FOV_RADIUS     = 150.0f;                 // FOV 半径默认值 (px): 目标筛选圈兼积分器边界; 经 -r 或热参 fov 覆盖 (运行时 g_fov_radius)
+const int   HOT_CTL_PORT   = 47700;                  // 热参数通道端口 (UDP, 仅绑 127.0.0.1)
 const int   KEEP_ALIVE_MS  = 200;                    // 松开触发键后保持自瞄的时间
 const int   CAP_SIZE       = 640;                    // 最小采集边长 (px): 模型输入更小时也按此尺寸采集, 再居中裁到模型输入
 
@@ -126,6 +133,13 @@ std::atomic<bool> g_calib_request{false};
 std::atomic<int>  g_calib_done{0};                   // 0=计算中 1=成功 2=失败
 
 std::atomic<bool> g_left_down{false};
+
+// ---- 热参数 (webui 经 UDP 127.0.0.1 下发; 白名单外忽略, 数值在固件侧强制钳制) ----
+std::atomic<float> g_conf_thr{0.4f};                 // 置信度阈值 (-t)
+std::atomic<float> g_y_off_pct{65.0f};               // 瞄准高度偏移 % (-y)
+std::atomic<float> g_max_v{1.5f};                    // 速度上限 px/ms (= -x / 1000)
+std::atomic<int>   g_aim_mode{0};                    // 触发键模式 (-k): 0=fire 1=ads 2=both
+std::atomic<float> g_fov_radius{FOV_RADIUS};         // FOV 半径 px (-r / 热参 fov)
 
 // ---- 时间辅助 ----
 static inline std::chrono::steady_clock::time_point shift_ms(
@@ -408,8 +422,9 @@ static std::string resolve_cam_device(const std::string& spec) {
 }
 
 // ========================= AI 推理 + 采集线程 =========================
-void ai_thread(std::string model_path, float conf_thr, int target_cls,
-               float y_off_pct, std::string cam_dev, int cam_fps, bool preview,
+// conf / y_off / fov 每帧从热参数原子取快照 (帧内一致), 未收热参时值与 CLI 一致
+void ai_thread(std::string model_path, int target_cls,
+               std::string cam_dev, int cam_fps, bool preview,
                float init_s, float init_l, std::string persist_path,
                std::string out_dir, int fire_ms, double auto_s,
                int cooldown_ms, int jpeg_quality) {
@@ -518,6 +533,8 @@ void ai_thread(std::string model_path, float conf_thr, int target_cls,
             if (++read_fails>30) { std::cerr<<"AI: 采集卡断开\n"; global_running=false; break; }
             std::this_thread::sleep_for(std::chrono::milliseconds(5)); continue; }
         read_fails=0;
+        const float conf_thr=g_conf_thr.load(), y_off_pct=g_y_off_pct.load(),
+                    fov_r=g_fov_radius.load();
 
         ++fps_cnt;
         auto fps_now=std::chrono::steady_clock::now();
@@ -585,7 +602,7 @@ void ai_thread(std::string model_path, float conf_thr, int target_cls,
         for (auto& d:filtered) {
             float ty=d.cy+d.h*(0.5f-y_off_pct/100.0f);
             float dx=d.cx-cx0, dy=ty-cy0, dist=std::sqrt(dx*dx+dy*dy);
-            if (dist<best_dist&&dist<FOV_RADIUS) { best_dist=dist;best_dx=dx;best_dy=dy;found=true; } }
+            if (dist<best_dist&&dist<fov_r) { best_dist=dist;best_dx=dx;best_dy=dy;found=true; } }
 
         auto now=std::chrono::steady_clock::now();
         float dt=(float)elapsed_ms(now,t_prev); t_prev=now;
@@ -780,13 +797,60 @@ void send_report(int fd, int16_t rx, int16_t ry, int8_t w, int8_t hw, uint16_t b
     if (++errs>10) { std::cerr<<"写入虚拟鼠标失败\n"; global_running=false; }  // 持续硬错误才停
 }
 
+// ========================= 热参数通道 (webui 本地控制) =========================
+// UDP 127.0.0.1 收 "key=value;key=value" (一个数据报可带多对, 分号/换行分隔):
+// 白名单外整对忽略, 数值在此强制钳制 (不信任发送方); 应用即打印, 经日志确认生效。
+void hotctl_thread() {
+    int fd=socket(AF_INET,SOCK_DGRAM,0);
+    if (fd<0) { std::cerr<<"热参数通道: socket 创建失败\n"; return; }
+    sockaddr_in addr{}; addr.sin_family=AF_INET;
+    addr.sin_addr.s_addr=htonl(INADDR_LOOPBACK);
+    addr.sin_port=htons(HOT_CTL_PORT);
+    if (bind(fd,(sockaddr*)&addr,sizeof(addr))<0) {
+        std::cerr<<"⚠ 热参数通道绑定失败 (端口 "<<HOT_CTL_PORT<<" 被占), 热参不可用\n";
+        close(fd); return; }
+    std::cout<<"✅ 热参数通道: 127.0.0.1:"<<HOT_CTL_PORT<<" (t/y/x/fov/k)\n";
+    struct pollfd pfd{}; pfd.fd=fd; pfd.events=POLLIN;
+    char buf[256];
+    while (global_running) {
+        int pr=poll(&pfd,1,200);
+        if (pr<=0) continue;
+        ssize_t n=recvfrom(fd,buf,sizeof(buf)-1,0,nullptr,nullptr);
+        if (n<=0) continue;
+        buf[n]=0;
+        for (char* tok=strtok(buf,";\r\n"); tok; tok=strtok(nullptr,";\r\n")) {
+            char* eq=strchr(tok,'=');
+            if (!eq) continue;
+            *eq=0;
+            const char* key=tok; const char* val=eq+1;
+            if (!strcmp(key,"t")||!strcmp(key,"y")||!strcmp(key,"x")||!strcmp(key,"fov")) {
+                char* end=nullptr;
+                float v=strtof(val,&end);
+                if (end==val||*end!=0) { std::cout<<"[热参] 忽略 "<<key<<"="<<val<<" (非数值)\n"; continue; }
+                if      (!strcmp(key,"t"))   { v=std::clamp(v,0.0f,1.0f);       g_conf_thr.store(v); }
+                else if (!strcmp(key,"y"))   { v=std::clamp(v,0.0f,100.0f);     g_y_off_pct.store(v); }
+                else if (!strcmp(key,"x"))   { v=std::clamp(v,100.0f,20000.0f); g_max_v.store(v/1000.0f); }
+                else                         { v=std::clamp(v,10.0f,1000.0f);   g_fov_radius.store(v); }
+                std::cout<<"[热参] "<<key<<"="<<v<<"\n";
+            } else if (!strcmp(key,"k")) {
+                int m=!strcmp(val,"fire")?0:!strcmp(val,"ads")?1:!strcmp(val,"both")?2:-1;
+                if (m>=0) { g_aim_mode.store(m); std::cout<<"[热参] k="<<val<<"\n"; }
+                else std::cout<<"[热参] 忽略 k="<<val<<" (须 fire/ads/both)\n";
+            } else {
+                std::cout<<"[热参] 忽略未知 key: "<<key<<"\n";
+            }
+        }
+    }
+    close(fd);
+}
+
 // ========================= main =========================
 int main(int argc, char* argv[]) {
     std::cout<<"========================================\n"
              <<"  AI 视觉自瞄 (ff_pi 控制律)\n"
              <<"========================================\n";
 
-    std::string a_m,a_c,a_t,a_y,a_d,a_f,a_x,a_s,a_l,a_S,a_k,a_v;
+    std::string a_m,a_c,a_t,a_y,a_d,a_f,a_x,a_s,a_l,a_S,a_k,a_v,a_r;
     std::string a_o; int fire_ms=300; double auto_s=10;
     int cooldown_ms=500; int jpeg_q=95;
 
@@ -809,6 +873,7 @@ int main(int argc, char* argv[]) {
         else if (arg=="-A"&&i+1<argc) auto_s=std::stod(argv[++i]);
         else if (arg=="-C"&&i+1<argc) cooldown_ms=std::stoi(argv[++i]);
         else if (arg=="-q"&&i+1<argc) jpeg_q=std::stoi(argv[++i]);
+        else if (arg=="-r"&&i+1<argc) a_r=argv[++i];
         else if (arg=="-h"||arg=="--help") {
             std::cout<<"用法: "<<argv[0]<<" [自瞄选项] [采集选项]\n"
                 "\n自瞄选项:\n"
@@ -817,6 +882,7 @@ int main(int argc, char* argv[]) {
                 "  -f <帧率>  120/60     -x <速度> 最大px/s\n"
                 "  -s <s>     初始灵敏度 -l <L>    初始延迟\n"
                 "  -S <脚本>  回写路径   -k <键>   fire/ads/both  -v <y/n> 预览\n"
+                "  -r <半径>  FOV 半径 px (默认 150, 10–1000)\n"
                 "\n采集选项 (不传 -o 则纯自瞄不截图):\n"
                 "  -o <目录>  输出目录 (自动建 fire/ det/ auto/ 子目录)\n"
                 "  -F <ms>    开火截图间隔 (默认 300)\n"
@@ -852,6 +918,11 @@ int main(int argc, char* argv[]) {
     bool preview=(pv=="y"||pv=="Y");
     if(!preview) unsetenv("DISPLAY");
     jpeg_q=std::clamp(jpeg_q,1,100);
+    float fov_r=std::clamp(std::stof(a_r.empty()?"150":a_r),10.0f,1000.0f);
+
+    // 热参数原子初始化 = CLI 值 (未收热参时运行行为与旧版完全一致)
+    g_conf_thr.store(conf); g_y_off_pct.store(y_off); g_max_v.store(max_v);
+    g_aim_mode.store(aim_mode); g_fov_radius.store(fov_r);
 
     const bool do_collect=!a_o.empty();
     if (do_collect) { ensure_dir(a_o); ensure_dir(a_o+"/fire");
@@ -873,7 +944,7 @@ int main(int argc, char* argv[]) {
     { std::lock_guard<std::mutex> lk(g_target.mtx);
       g_target.s_est=init_s; g_target.l_est_ms=init_l; }
 
-    std::cout<<"初始: s="<<init_s<<" L="<<init_l<<"\n";
+    std::cout<<"初始: s="<<init_s<<" L="<<init_l<<" fov="<<fov_r<<"\n";
     if (do_collect)
         std::cout<<"采集: "<<a_o<<"  开火="<<fire_ms<<"ms  定时="<<auto_s
                  <<"s  冷却="<<cooldown_ms<<"ms\n";
@@ -883,7 +954,8 @@ int main(int argc, char* argv[]) {
     MouseState state;
     std::thread reader(reader_thread,real_dev,std::ref(state));
     std::thread writer; if (do_collect) writer=std::thread(writer_thread,jpeg_q);
-    std::thread ai(ai_thread,model_path,conf,cls,y_off,cam_dev,cam_fps,preview,
+    std::thread hot(hotctl_thread);
+    std::thread ai(ai_thread,model_path,cls,cam_dev,cam_fps,preview,
                    init_s,init_l,persist_path,
                    a_o,fire_ms,auto_s,cooldown_ms,jpeg_q);
 
@@ -935,6 +1007,7 @@ int main(int argc, char* argv[]) {
                 } else { cal=0;fx=real_x;fy=real_y; } }
             rem_x=rem_y=0;
         } else {
+            int aim_mode=g_aim_mode.load();
             bool trig=(aim_mode==2)?(left||right):(aim_mode==1)?right:left;
             if(trig&&!side)last_press=now;
             bool aiming=std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -948,6 +1021,7 @@ int main(int argc, char* argv[]) {
                   valid=g_target.valid;tp=g_target.t_pub; }
                 double age=elapsed_ms(now,tp);
                 if (valid&&age<TARGET_STALE_MS) {
+                    const float max_v=g_max_v.load(), fov_r=g_fov_radius.load();
                     float Lc=le*PRED_L_COMP;
                     auto cp=g_counts.at(shift_ms(tp,-(double)Lc));
                     auto cn=g_counts.cum();
@@ -964,7 +1038,7 @@ int main(int argc, char* argv[]) {
                     float i_lim=FF_I_FRAC*max_v/std::max(ki,1e-9f);
                     float vx_u=kp*ex+ki*int_x;
                     float vy_u=kp*ey+ki*int_y;
-                    if (ex*ex+ey*ey>FOV_RADIUS*FOV_RADIUS) { int_x=int_y=0; }
+                    if (ex*ex+ey*ey>fov_r*fov_r) { int_x=int_y=0; }
                     else {
                         bool wx=(vx_u>max_v&&ex>0)||(vx_u<-max_v&&ex<0);
                         bool wy=(vy_u>max_v&&ey>0)||(vy_u<-max_v&&ey<0);
@@ -1022,7 +1096,7 @@ int main(int argc, char* argv[]) {
 
     global_running=false;
     g_save_cv.notify_all();
-    reader.join(); ai.join();
+    reader.join(); hot.join(); ai.join();
     if (do_collect) writer.join();
     close(virt_fd);close(tfd);close(ep);
     std::cout<<"已停止\n";
