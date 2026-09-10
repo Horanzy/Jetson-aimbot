@@ -15,7 +15,7 @@ def run_one(law, scenario, arena_cfg, s_belief, L_belief, max_v, seed):
     tgt = scenario.make_target(rng)
     ar = Arena(arena_cfg, tgt, rng, cross0=scenario.cross0)
     res = ar.run(law, s_belief, L_belief, max_v)
-    return M.compute(res, scenario), res
+    return M.compute(res, scenario)
 
 
 def run_suite(law_factory, scenarios=None, arena_cfg=None, s_belief=1.0,
@@ -33,7 +33,7 @@ def run_suite(law_factory, scenarios=None, arena_cfg=None, s_belief=1.0,
                              fps=arena_cfg.fps, noise_std=arena_cfg.noise_std,
                              duration=sc.duration, count_limit=arena_cfg.count_limit,
                              fov_radius=arena_cfg.fov_radius)
-            m, _ = run_one(law_factory(), sc, ac, s_belief, L_belief, max_v, sd)
+            m = run_one(law_factory(), sc, ac, s_belief, L_belief, max_v, sd)
             per.append(m)
         out[sc.name] = {"metrics": per, "agg": _aggregate(per, sc.kind)}
     return out

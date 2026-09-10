@@ -241,9 +241,6 @@ class JiggleTarget(_FpsBase):
         self.period = period
         self.legs = n_flips
         self.switch_ms = switch_ms
-        self.events = [(period / 2.0 * i, "reverse")
-                       for i in range(1, self.legs)]
-        self.events.append((period / 2.0 * self.legs, "stop"))
 
     def _speed(self):
         t = self._t
@@ -364,14 +361,10 @@ class ApproachTarget(_FpsBase):
     """目标带横向分量向玩家逼近: 屏幕速度随距离缩短线性上升 v=v0+a·t,
     标注越过速度帽 1.5 px/ms 的时刻 (追得上的分界)。"""
 
-    def __init__(self, x, v0=0.3, a=0.00065, duration=2600.0,
+    def __init__(self, x, v0=0.3, a=0.00065,
                  heading_deg=0.0, y=0.0):
         super().__init__(x, y, heading_deg)
         self.v0, self.a = v0, a
-        self.events = []
-        t_cap = (1.5 - v0) / a if a > 0 else float("inf")
-        if 0.0 < t_cap < duration:
-            self.events.append((t_cap, "cap-cross"))
 
     def _speed(self):
         return self.v0 + self.a * self._t
@@ -471,7 +464,7 @@ def fps_suite():
         events=((1000.0, "turn"),)))
     add(FpsScenario(
         "fps_approach", 2600.0,
-        lambda rng: ApproachTarget(40.0, v0=0.3, a=0.00065, duration=2600.0),
+        lambda rng: ApproachTarget(40.0, v0=0.3, a=0.00065),
         (0.0, 0.0), "track", steady_from=0.0, events=()))
     add(FpsScenario(
         "fps_dash", 2500.0,

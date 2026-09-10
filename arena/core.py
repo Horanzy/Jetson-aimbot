@@ -1,4 +1,4 @@
-"""arena/core.py — 中立模拟器 (植物 + 传感器)。
+"""arena/core.py — 中立模拟器 (被控对象 + 传感器)。
 
 arena 只做三件事:
   1. 输出观测: 按帧率发布"最新一帧检测" = 时间戳 + 目标相对准星位置 (目标-准星,
@@ -10,8 +10,8 @@ arena 不含任何估计/预测/控制逻辑。law 是黑盒, 通过最小接口
 单位: 时间 ms, 位置 px, 速度 px/ms, 灵敏度 px/count。
 """
 from __future__ import annotations
-from dataclasses import dataclass, field
-from typing import Optional, Callable
+from dataclasses import dataclass
+from typing import Optional
 import math
 
 
@@ -42,7 +42,7 @@ class ArenaConfig:
     fps: int = 120             # 帧率
     noise_std: float = 0.0     # 检测噪声 std (px, 每轴)
     duration: float = 3000.0   # 场景时长 ms
-    count_limit: int = 120     # 植物侧 counts 限幅 (忠实复现硬件)
+    count_limit: int = 120     # 被控对象侧 counts 限幅 (忠实复现硬件)
     fov_radius: float = 150.0
     drop_p: float = 0.0        # 每帧独立丢失概率 (检测闪烁; 0=不丢帧)
 
@@ -104,7 +104,6 @@ class Arena:
         self._next_cap = 0.0          # 下一帧采集时刻
         self._pending: list[Observation] = []
         self._last_det: Optional[Observation] = None
-        self._t = 0.0
         self.diverged = False
         self.hist.push(0.0, target.x, target.y, self.cross_x, self.cross_y)
 
@@ -145,7 +144,6 @@ class Arena:
 
         for k in range(n_ticks):
             t = k * h
-            self._t = t
             self._make_frames_up_to(t)
 
             obs = None
