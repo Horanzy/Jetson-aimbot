@@ -1,99 +1,84 @@
-"""arena/laws/kalman_pi.py — Kalman state predictor + phase-margin PI.
+"""arena/laws/kalman_pi.py — Kalman 状态预测器 + 相位裕度 PI。
 
-PRINCIPLE
-=========
-Two time-scale-separated stages, every parameter derived from a physical
-quantity or a stated dimensionless design choice. No trial-and-error gains.
+原理
+====
+两段式时间尺度分离, 每个参数都由物理量或声明的无量纲设计选择导出, 无试凑增益。
 
-1) ESTIMATOR — constant-velocity (CV) Kalman filter, per axis.
-   State x = [e, v]ᵀ: e = target−crosshair error (px), v = relative velocity
-   (px/ms) with our own control action removed (Smith-style, via the B·u term).
+1) 估计器 — 常速 (CV) Kalman 滤波, 逐轴。
+   状态 x = [e, v]ᵀ: e = 目标−准星误差 (px), v = 相对速度 (px/ms),
+   自身控制作用已扣除 (Smith 式, 经 B·u 项)。
        F = [[1,dt],[0,1]],  B = [[-dt],[0]],  H = [[1,0]]
-       Q = q·[[dt³/3, dt²/2],[dt²/2, dt]]   (white-acceleration process noise)
-       R = noise_std²                        (measurement variance)
-   The filter is a PURE estimator: it outputs position+velocity at the moment
-   the frame reflected (t_pub − L̂). No control logic lives inside it.
+       Q = q·[[dt³/3, dt²/2],[dt²/2, dt]]   (白加速度过程噪声)
+       R = noise_std²                        (测量方差)
+   滤波器是纯估计器: 只输出帧所反映时刻 (t_pub − L̂) 的位置+速度,
+   内部不含任何控制逻辑。
 
-   Process noise q from the SEPARATION PRINCIPLE. The continuous CV Kalman
-   filter solves to a 2nd-order system with damping ζ_f = 1/√2 and natural
-   frequency ω_f = (q/R)^(1/4) (from the algebraic Riccati equation:
-   P12 = √(qR), P11 = √2·R^(3/4)·q^(1/4) → filter char. poly s²+K1·s+K2,
-   K2 = √(q/R) ⇒ ω_f = √K2 = (q/R)^(1/4)). An observer must be faster than
-   the controller it feeds; choose ω_f = c·wn with separation factor c (a
-   dimensionless design choice, c≈3–5 is standard). Hence
-       q = R·(c·wn)⁴.
-   Because wn ∝ 1/L (below), q auto-scales: more delay → smoother filter.
+   过程噪声 q 由分离原理定。连续 CV Kalman 滤波器解为二阶系统: 阻尼
+   ζ_f = 1/√2, 自然频率 ω_f = (q/R)^(1/4) (由代数 Riccati 方程:
+   P12 = √(qR), P11 = √2·R^(3/4)·q^(1/4) → 滤波器特征多项式 s²+K1·s+K2,
+   K2 = √(q/R) ⇒ ω_f = √K2 = (q/R)^(1/4))。观测器必须快于它馈送的控制器:
+   取 ω_f = c·wn, c 为分离因子 (无量纲设计选择, 惯例 c≈3–5)。故
+       q = R·(c·wn)⁴。
+   因 wn ∝ 1/L (见下), q 自动缩放: 延迟越大滤波越平滑。
 
-   Measurement noise R = noise_std². noise_std is the detector jitter (arena
-   default 0.5 px/axis; on real hardware measure from a static scene).
+   测量噪声 R = noise_std²。noise_std 是检测抖动 (arena 默认 0.5 px/轴;
+   实机在静止场景实测)。
 
-2) DELAY COMPENSATION — linear Smith extrapolation (control rate, 500 Hz).
-   The filtered state lives at (t_pub − L̂); extrapolate to "now" by horizon
-   T = age + L̂ (age = t − t_pub):
-       e_pred = e_filt + v_filt·T − s·(in-flight counts since t_pub − L̂)
-   Pure linear extrapolation (no ad-hoc horizon damping): the loop bandwidth
-   wn is low enough (PM against the FULL delay) that any residual mismatch
-   delay stays inside the phase margin, so bounded-error extrapolation is
-   unnecessary for stability.
+2) 延迟补偿 — 线性 Smith 外推 (控制率 500Hz)。
+   滤波状态锚在 (t_pub − L̂); 以时域 T = age + L̂ (age = t − t_pub)
+   外推到"现在":
+       e_pred = e_filt + v_filt·T − s·(t_pub − L̂ 以来的在途 counts)
+   纯线性外推 (无临时时域阻尼): 环路带宽足够低 (按完整延迟留 PM),
+   残留失配延迟落在相位裕度内, 稳定性无需有界误差外推。
 
-3) CONTROLLER — pole-placement PI on e_pred.
-   Plant ≈ unit integrator (crosshair += s·counts ≈ v·h). PI C(s)=Kp+Ki/s on
-   1/s gives closed loop s²+Kp·s+Ki = 0 ⇒ ωn = √Ki, ζ = Kp/(2ωn). Choose
-       ζ = 1            (critical damping — dimensionless design choice)
-       ωn = (90°−PM)·π/180 / L̂,  PM = 60°   (dimensionless design choice)
-   ωn is the bandwidth that leaves PM=60° of phase margin if the delay L̂ were
-   NOT compensated (ωn·L̂ = 30°). With the Smith predictor the loop is fast;
-   if the predictor fails under mismatch it falls back to this guaranteed
-   60° margin → no divergence. Computed in reset() from cfg.L (auto-scales
-   ~1/L; ≈0.01047 rad/ms at L=50). NOT a hardcoded tuned constant.
-       Kp = 2ζωn,  Ki = ωn².
-   Anti-windup: conditional integration + integral clamp ±max_v/Ki (so the
-   integral can command up to max_v → zero lag for a target at max speed).
-   Distance gate ig = i_gate/(i_gate+|e|): integral off during flicks
-   (|e|≫i_gate → no arrival overshoot), on during tracking (|e|≲i_gate →
-   zero steady-state drag).
+3) 控制器 — 对 e_pred 做极点配置 PI。
+   被控对象 ≈ 单位积分器 (准星 += s·counts ≈ v·h)。PI C(s)=Kp+Ki/s 配
+   1/s 给出闭环 s²+Kp·s+Ki = 0 ⇒ ωn = √Ki, ζ = Kp/(2ωn)。取
+       ζ = 1            (临界阻尼 — 无量纲设计选择)
+       ωn = (90°−PM)·π/180 / L̂,  PM = 60°   (无量纲设计选择)
+   ωn 是延迟 L̂ 完全不补偿时 (ωn·L̂ = 30°) 仍留 PM=60° 相位裕度的带宽。
+   Smith 预测器工作时环路快; 失配下预测器失效则退回这个保底 60° 裕度
+   → 不发散。在 reset() 里由 cfg.L 现算 (随 ~1/L 自动缩放; L=50 时
+   ≈0.01047 rad/ms), 非硬编码调参常数。
+       Kp = 2ζωn,  Ki = ωn²。
+   抗饱和: 条件积分 + 积分限幅 ±max_v/Ki (积分最多命令到 max_v →
+   最高速目标零位置滞后)。距离门控 ig = i_gate/(i_gate+|e|): 拉枪期
+   积分关闭 (|e|≫i_gate → 无到位过冲), 跟踪期开启 (|e|≲i_gate →
+   零稳态拖尾)。
 
-PARAMETERS (each justified)
-===========================
-  pm_deg = 60      DIMENSIONLESS DESIGN CHOICE. Phase margin the loop keeps
-                   even with the delay fully uncompensated. Sets ωn.
-  zeta = 1         DIMENSIONLESS DESIGN CHOICE. Critical damping (no overshoot
-                   from the linear poles; robust under mismatch).
-  sep (c) = 5      DIMENSIONLESS DESIGN CHOICE. Observer/controller separation
-                   factor: filter bandwidth = c·wn. ≈5× is the standard rule of
-                   thumb (observer fast enough to add negligible lag, slow enough
-                   to reject noise). ↑ = more maneuver detail but more noise;
-                   ↓ = smoother.
-  noise_std = 0.5  PHYSICAL. Detector noise std (px/axis). R = noise_std².
-                   Arena default; measure on real hardware from static jitter.
-  i_gate = 8.0     PHYSICAL distance (px). Integral activation scale ≈ a few ×
-                   the settle tolerance; separates flick (gate off) from track
-                   (gate on). Mildly empirical physical scale — flagged.
-  l_comp = 1.1     Smith compensation ratio (extrapolate/subtract over L̂·l_comp).
-                   >1 over-compensates to guard the dangerous under-compensation
-                   side (L_true > L̂): calibration L is a lower bound (the
-                   bilateral-key procedure measures the minimum observable delay),
-                   so the operating point is placed just past L̂ (10% margin).
-                   The PM=60 floor absorbs residuals beyond this coverage.
-  max_v            from cfg (velocity saturation).
+参数表 (每项都有依据)
+=====================
+  pm_deg = 60      无量纲设计选择。延迟完全不补偿时环路仍保留的相位裕度,
+                   定 ωn。
+  zeta = 1         无量纲设计选择。临界阻尼 (线性极点无过冲; 失配下稳)。
+  sep (c) = 5      无量纲设计选择。观测器/控制器分离因子: 滤波带宽 = c·wn。
+                   ≈5× 是标准经验值 (观测器快到滞后可忽略, 慢到能拒噪声)。
+                   ↑ 机动细节多但噪声大; ↓ 更平滑。
+  noise_std = 0.5  物理量。检测噪声 std (px/轴), R = noise_std²。
+                   arena 默认; 实机在静止抖动中实测。
+  i_gate = 8.0     物理距离 (px)。积分激活尺度 ≈ 数倍稳定容差; 划分拉枪
+                   (门关) 与跟踪 (门开)。弱经验的物理尺度 — 已标注。
+  l_comp = 1.1     Smith 补偿系数 (外推/扣除时域 = L̂·l_comp)。>1 过补偿,
+                   守住危险的欠补偿侧 (L_true > L̂): 标定 L 是下界 (双侧键
+                   流程测的是可观测最小延迟), 故工作点放在 L̂ 略过处
+                   (10% 裕度), 更远的残留由 PM=60 地板吸收。
+  max_v            由 cfg 注入 (速度饱和)。
 
-  Derived in reset(): wn, Kp, Ki, q, R. JUMP_GATE=100 / STALE=200 are
-  discontinuity/timeout conventions (reference), not tuned control gains.
+  reset() 里推导: wn, Kp, Ki, q, R。JUMP_GATE=100 / STALE=200 是跳变/
+  超时约定 (同 reference), 非调参控制增益。
 
-KNOWN LIMITATIONS
-=================
-  • CV model cannot predict acceleration; constant-accel targets leave a lag
-    ≈ a/Ki the integral removes slowly (the accel-scenario residual).
-  • ωn = 0.5236/L̂ is deliberately conservative (PM=60 vs full delay) → slower
-    flick than aggressive laws; this buys mismatch robustness / generalization.
-  • Delay-mismatch boundary: stable for L_true ≈ 20–70 at belief=50 (no
-    divergence); at L_true=80 (+60% delay error) the Smith predictor's
-    control-removal window misaligns enough to contaminate the velocity
-    estimate and the step does not settle. l_comp=1.1 pushes this boundary out
-    versus l_comp=1.0 but cannot cover a +60% error at the required PM=60
-    bandwidth. Beyond ±~30ms residual relies on calibration accuracy.
-  • If real detector noise ≫ noise_std, the filter over-trusts measurements;
-    set noise_std from a real static-scene measurement.
+已知局限
+========
+  • CV 模型无法预测加速度; 匀加速目标留 ≈ a/Ki 的滞后, 由积分缓慢消除
+    (accel 场景的残余)。
+  • ωn = 0.5236/L̂ 刻意保守 (按完整延迟 PM=60) → 拉枪慢于激进律;
+    换失配鲁棒性/可推广性。
+  • 延迟失配边界: belief=50 时 L_true ≈ 20–70 稳定 (不发散); L_true=80
+    (+60% 延迟误差) 时 Smith 扣除窗口错位到污染速度估计, 阶跃无法稳定。
+    l_comp=1.1 比 1.0 把边界推远些, 但 PM=60 带宽下盖不住 +60% 误差。
+    超出 ±~30ms 残留靠标定精度保证。
+  • 真机检测噪声 ≫ noise_std 时滤波器过信测量; noise_std 应由真实静止
+    场景实测设定。
 """
 from __future__ import annotations
 import math
@@ -107,7 +92,7 @@ from arena.laws.base import CountsHist, Law, register
 class KalmanPILaw(Law):
     JUMP_GATE = 100.0
     STALE = 200.0
-    V0_STD = 1.0          # initial velocity prior std (px/ms); transient only
+    V0_STD = 1.0          # 初始速度先验 std (px/ms); 仅影响暂态
 
     def __init__(self, pm_deg=60.0, zeta=1.0, sep=5.0, noise_std=0.5,
                  i_gate=8.0, l_comp=1.1, max_v=1.5):
