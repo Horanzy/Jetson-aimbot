@@ -11,3 +11,6 @@ dataset/
 *.engine
 *.onnx
 trt_timing_cache.cache
+
+# WebUI 运行时状态 (config/token/profile 参数/历史), 只留在设备上
+webui/data/
