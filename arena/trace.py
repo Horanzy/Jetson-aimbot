@@ -20,9 +20,9 @@ law 可选调试协议:
   python -m arena.trace --list
 
 常用:
-  python -m arena.trace ff_pi step_80px --csv out.csv
-  python -m arena.trace ff_pi maneuver --L-true 30 --auto-window
-  python -m arena.trace ff_pi fps_stop_hard --event 0 --csv stop.csv
+  python -m arena.trace ff_pi_acc step_80px --csv out.csv
+  python -m arena.trace ff_pi_acc maneuver --L-true 30 --auto-window
+  python -m arena.trace ff_pi_acc fps_stop_hard --event 0 --csv stop.csv
 
 输出: 终端摘要 (十几行) + 可选 CSV (逐拍全量) + 可选 PNG (装了 matplotlib
 才有, 没有则跳过, 不为此新增依赖)。默认输出目录 arena/trace_out/ (gitignore)。

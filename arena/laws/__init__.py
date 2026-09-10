@@ -5,13 +5,11 @@ from arena.laws import reference   # noqa: F401
 from arena.laws import pi_pm       # noqa: F401
 from arena.laws import kalman_pi   # noqa: F401
 from arena.laws import ballistic   # noqa: F401
-from arena.laws import ff_pi       # noqa: F401
 from arena.laws import reseed_pi    # noqa: F401
 from arena.laws import imm_pi      # noqa: F401
 from arena.laws import sliding     # noqa: F401
 from arena.laws import sliding_obs  # noqa: F401
 from arena.laws import smith_filt  # noqa: F401
-from arena.laws import mpc         # noqa: F401
 from arena.laws import ff_pi_acc   # noqa: F401
 from arena.laws import ballistic_ff    # noqa: F401
 from arena.laws import mpc_osc     # noqa: F401

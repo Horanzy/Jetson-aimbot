@@ -8,7 +8,7 @@
   clean  drop_p=0
   flaky  drop_p=0.12 (检测闪烁, 快目标常见; 复现"丢帧撞急停"放大器)
 
-用法: python -m arena.fps_eval [law ...]     (默认 ff_pi reference)
+用法: python -m arena.fps_eval [law ...]     (默认 ff_pi_acc reference)
 """
 from __future__ import annotations
 import sys
@@ -96,7 +96,7 @@ def print_test_suite(tag, s):
 
 
 def main():
-    names = sys.argv[1:] or ["ff_pi", "reference"]
+    names = sys.argv[1:] or ["ff_pi_acc", "reference"]
     for name in names:
         cls = get_law(name)
         test_suite(lambda: cls())
