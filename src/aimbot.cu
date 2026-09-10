@@ -6,7 +6,7 @@
 //        → 控制律 (极点配置 PI + type-2 速度前馈) → USB Gadget 透传
 //
 //  控制律: 收敛带宽 wn 由标定延迟 L 自动导出 (wn=(90°−PM)π/180/L, PM=50°, 免手调),
-//    ζ=1 临界阻尼; type-2 速度前馈 (ff_gain=1) 补匀速跟踪零拖尾。结构参数为头部常量,
+//    ζ=1 临界阻尼; type-2 速度前馈 (FF_GAIN_VAL=1) 补匀速跟踪零拖尾。结构参数为头部常量,
 //    详见 arena/laws/ff_pi.py 与 AGENTS.md。
 //
 //  采集 (可选): 传 -o 输出目录即开启, 按三源触发自动截图 (开火 / 检测 / 定时),
@@ -25,7 +25,6 @@
 #include <array>
 #include <deque>
 #include <functional>
-#include <cstring>
 #include <cctype>
 #include <climits>
 #include <cfloat>
@@ -58,37 +57,37 @@
 
 // ========================= 系统常量 =========================
 constexpr size_t HID_REPORT_LEN  = 9;
-constexpr int    DEFAULT_FREQ    = 500;
+constexpr int    DEFAULT_FREQ    = 500;              // 透传频率 Hz
 constexpr const char* DEFAULT_KEYWORD  = "";         // 空 = 匹配任意 *-event-mouse 设备
 constexpr const char* DEFAULT_VIRT_DEV = "/dev/hidg0";
 constexpr const char* DEV_SEARCH_PATH  = "/dev/input/by-id/";
 
-const float FOV_RADIUS     = 150.0f;
-const int   KEEP_ALIVE_MS  = 200;
-const int   CAP_SIZE       = 640;
+const float FOV_RADIUS     = 150.0f;                 // 自瞄生效 FOV 半径 (px)
+const int   KEEP_ALIVE_MS  = 200;                    // 松开触发键后保持自瞄的时间
+const int   CAP_SIZE       = 640;                    // 最小采集边长 (px): 模型输入更小时也按此尺寸采集, 再居中裁到模型输入
 
 const uint16_t LEFT_KEY  = 0x01;
 const uint16_t RIGHT_KEY = 0x02;
-const uint16_t SIDE_KEY  = 0x10;
-const uint16_t SIDE_KEY2 = 0x08;
-const uint16_t BOTH_SIDE_KEYS = SIDE_KEY | SIDE_KEY2;
+const uint16_t SIDE_KEY  = 0x10;                     // 侧键2: 抑制自瞄
+const uint16_t SIDE_KEY2 = 0x08;                     // 侧键1
+const uint16_t BOTH_SIDE_KEYS = SIDE_KEY | SIDE_KEY2; // 双侧键: 标定触发
 
 // ========================= 跟踪滤波器 (Smith 预测器, dt 归一) =========================
 const float PRED_ALPHA0   = 0.50f;                   // 位置增益 @120fps; 实际 α=ALPHA0·dt/DT0 (帧率无关)
-const float PRED_BETA0    = 0.03f;                   // 速度增益 @120fps; 实际 β=BETA0·dt/DT0 (0.04→0.03: 换失配带 L80 边缘余量)
+const float PRED_BETA0    = 0.03f;                   // 速度增益 @120fps; 实际 β=BETA0·dt/DT0 (0.03 = 失配带边缘余量)
 const float PRED_L_COMP   = 1.10f;                   // Smith 过补偿系数 (>1 帮欠补偿侧 L真>L̂, 危险方向)
 const float PRED_DT0      = 1000.0f / 120.0f;        // 增益归一参考帧周期
 const float TRACK_JUMP_GATE = 100.0f;                // 创新超此值 → 重置滤波器
 const float TARGET_STALE_MS = 200.0f;                // 目标超时 → 暂停自瞄
 
-// ========================= 控制律: 极点配置 PI + type-2 速度前馈 (ffpi) =========================
+// ========================= 控制律: 极点配置 PI + type-2 速度前馈 (ff_pi) =========================
 //  带宽由标定延迟 L 导出 (免手调); 前馈补跟踪速度; 方向矛盾 CUSUM 告警时
 //  该轴 v̂ 归零重拉 (变向/急停复用阶跃响应)。详见 arena/laws/ff_pi.py 与 AGENTS.md。
-const float FF_PM_DEG = 50.0f;                       // 相位裕度: wn=(90°−PM)π/180/L (60→50: 失配带 L20-80 全过的最快设计点, wn+26%/Ki+59%)
-const float FF_ZETA   = 1.0f;                        // 收敛阻尼比 (临界阻尼, 无过冲)
-const float FF_GAIN_VAL   = 1.0f;                        // 速度前馈增益: =1 是匀速目标零拖尾的精确开环指令
-const float FF_I_GATE = 8.0f;                        // 收敛区门控 / I 距离衰减尺度 (px)
-const float FF_I_FRAC = 1.0f;                        // 积分限幅 = I_FRAC×max_v/Ki
+const float FF_PM_DEG   = 50.0f;                     // 相位裕度: wn=(90°−PM)π/180/L (失配带 L20–80 全过的最快设计点)
+const float FF_ZETA     = 1.0f;                      // 收敛阻尼比 (临界阻尼, 无过冲)
+const float FF_GAIN_VAL = 1.0f;                      // 速度前馈增益: =1 是匀速目标零拖尾的精确开环指令
+const float FF_I_GATE   = 8.0f;                      // 收敛区门控 / I 距离衰减尺度 (px)
+const float FF_I_FRAC   = 1.0f;                      // 积分限幅 = I_FRAC×max_v/Ki
 // CUSUM 参数 (均为 σ 倍数, 无量纲 — Page 序贯变化检测): K 漂移 0.5σ,
 // C 单帧增量上限 3σ (拒后坐力式单帧踢脚), H 告警 9σ (同号持续 ~2 帧触发)
 const float CUSUM_K = 0.5f;
@@ -96,12 +95,12 @@ const float CUSUM_C = 3.0f;
 const float CUSUM_H = 9.0f;
 
 // ========================= 标定 =========================
-const int   CALIB_TRIGGER_TICKS    = 2500;
-const int   CALIB_WINDOW           = 90;
-const float CALIB_MIN_EXCITE       = 4000.0f;
+const int   CALIB_TRIGGER_TICKS    = 2500;           // 双侧键长按 5s @500Hz
+const int   CALIB_WINDOW           = 90;             // 最少样本帧数
+const float CALIB_MIN_EXCITE       = 4000.0f;        // 最小 ΣC² 激发量
 const float S_MIN = 0.05f, S_MAX = 20.0f;
 const float L_MIN = 0.0f,  L_MAX = 200.0f;
-const int   CALIB_WAIT_TIMEOUT     = 1000;
+const int   CALIB_WAIT_TIMEOUT     = 1000;           // 等待计算超时 @500Hz
 
 const float TICK_MS = 1000.0f / DEFAULT_FREQ;
 
@@ -124,7 +123,7 @@ void signal_handler(int) { global_running = false; }
 
 std::atomic<bool> g_calib_collect{false};
 std::atomic<bool> g_calib_request{false};
-std::atomic<int>  g_calib_done{0};
+std::atomic<int>  g_calib_done{0};                   // 0=计算中 1=成功 2=失败
 
 std::atomic<bool> g_left_down{false};
 
@@ -491,12 +490,12 @@ void ai_thread(std::string model_path, float conf_thr, int target_cls,
     std::cout<<"✅ AI 线程已启动 ("<<cam_fps<<" fps, "<<cam_dev<<")\n";
 
     bool filt_init=false; float fx=0,fy=0,fvx=0,fvy=0;
-    float sig2x=1,sig2y=1,csx=0,csy=0;   // CUSUM 状态 (ffpi: σ 自标定, 归零重拉)
+    float sig2x=1,sig2y=1,csx=0,csy=0;   // CUSUM 状态 (ff_pi: σ 自标定, 归零重拉)
     auto t_prev=std::chrono::steady_clock::now();
 
     float s_est=init_s, l_est=init_l;
     std::deque<CalibSample> hist; bool was_collecting=false;
-    int collect_frames=0; double collect_resp=0;
+    int collect_frames=0;
     int bs_w=cap_w/6, bs_h=cap_h/6;
     cv::Mat hann; cv::createHanningWindow(hann,cv::Size(bs_w,bs_h),CV_32F);
     cv::Mat prev_gray_f;
@@ -579,7 +578,7 @@ void ai_thread(std::string model_path, float conf_thr, int target_cls,
 
         bool cal_collecting=g_calib_collect.load();
         if (cal_collecting&&!was_collecting) { hist.clear(); prev_gray_f.release();
-            collect_frames=0; collect_resp=0; }
+            collect_frames=0; }
         was_collecting=cal_collecting;
 
         float best_dist=1e9f,best_dx=0,best_dy=0; bool found=false;
@@ -607,11 +606,9 @@ void ai_thread(std::string model_path, float conf_thr, int target_cls,
                 else { float rr=dt/PRED_DT0;
                        float alpha=std::min(0.90f,PRED_ALPHA0*rr);
                        float beta=std::min(0.60f,PRED_BETA0*rr);
-                       // 方向矛盾 CUSUM (σ 自标定, 无 px 常数): 只累计与 v̂ 矛盾
-                       // 方向的创新, 同号持续 ~2 帧告警 → 该轴 v̂ 归零 (位置保留),
-                       // 环路重跑阶跃响应。K 漂移/C 帧增量上限/H 告警均为 σ 倍数。
                        sig2x+=beta*(inx*inx-sig2x);
                        sig2y+=beta*(iny*iny-sig2y);
+                       // 方向矛盾 CUSUM (σ 自标定): 持续矛盾创新 → 告警后该轴 v̂ 归零重拉
                        float sx=std::max(std::sqrt(sig2x),1e-6f);
                        float sy=std::max(std::sqrt(sig2y),1e-6f);
                        float accx=(fvx>0)?-inx/sx:(fvx<0)?inx/sx:-CUSUM_K;
@@ -638,13 +635,12 @@ void ai_thread(std::string model_path, float conf_thr, int target_cls,
             cv::resize(gray,small,cv::Size(cap_w/2,cap_h/2),0,0,cv::INTER_AREA);
             small.convertTo(sf,CV_32F);
             if (!prev_gray_f.empty()) {
-                float shx[9],shy[9];int nv=0;double br=0;
+                float shx[9],shy[9];int nv=0;
                 for(int by=0;by<3;++by)for(int bx=0;bx<3;++bx){
                     cv::Rect r(bx*bs_w,by*bs_h,bs_w,bs_h); double resp=0;
                     cv::Point2d sh=cv::phaseCorrelate(prev_gray_f(r),sf(r),hann,&resp);
-                    if(resp>0.01){shx[nv]=(float)sh.x;shy[nv]=(float)sh.y;++nv;}
-                    if(resp>br)br=resp; }
-                ++collect_frames; collect_resp+=br;
+                    if(resp>0.01){shx[nv]=(float)sh.x;shy[nv]=(float)sh.y;++nv;} }
+                ++collect_frames;
                 if (nv>=4) { std::nth_element(shx,shx+nv/2,shx+nv);
                              std::nth_element(shy,shy+nv/2,shy+nv);
                              hist.push_back({now,dt,-2.0f*shx[nv/2],-2.0f*shy[nv/2]});
@@ -787,7 +783,7 @@ void send_report(int fd, int16_t rx, int16_t ry, int8_t w, int8_t hw, uint16_t b
 // ========================= main =========================
 int main(int argc, char* argv[]) {
     std::cout<<"========================================\n"
-             <<"  AI 视觉自瞄 (ffpi 控制律)\n"
+             <<"  AI 视觉自瞄 (ff_pi 控制律)\n"
              <<"========================================\n";
 
     std::string a_m,a_c,a_t,a_y,a_d,a_f,a_x,a_s,a_l,a_S,a_k,a_v;
@@ -851,6 +847,7 @@ int main(int argc, char* argv[]) {
     std::string aim_key=!a_k.empty()?a_k:get_input_with_default("触发键","fire");
     int aim_mode=0;
     if(aim_key=="ads")aim_mode=1; else if(aim_key=="both")aim_mode=2;
+    else if(aim_key!="fire")std::cerr<<"未知触发键, 用 fire\n";
     std::string pv=!a_v.empty()?a_v:get_input_with_default("预览(y/n)","n");
     bool preview=(pv=="y"||pv=="Y");
     if(!preview) unsetenv("DISPLAY");
@@ -959,7 +956,6 @@ int main(int argc, char* argv[]) {
                     float ex=px+vx*(float)(age+Lc)-ifx;
                     float ey=py+vy*(float)(age+Lc)-ify;
                     float r=std::hypot(ex,ey);
-                    // 收敛带宽由标定延迟导出: wn=(90°−PM)π/180/L (PM=50, 失配带电池选点, 随 L 自动缩放)
                     float L=std::max(1.0f,le);
                     float wn=(90.0f-FF_PM_DEG)*3.14159265358979f/180.0f/L;
                     float kp=2.0f*FF_ZETA*wn;
