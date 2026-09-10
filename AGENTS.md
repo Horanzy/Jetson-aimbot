@@ -43,7 +43,7 @@ No hand-tuned gains: a bilateral side-key trigger runs auto-calibration, estimat
 | `scripts/convert.sh` | Batch ONNX → TensorRT engine conversion |
 | `scripts/setup_mouse.sh` | USB Gadget config, creates `/dev/hidg0` |
 | `scripts/game/*.sh` | Per-game launch scripts (relative paths; screenshot-collection switch `CAPTURE`; auto write-back of calibration values `S_EST`/`L_EST`) |
-| `arena/` | Pure-Python control-law simulation evaluator (neutral simulator + 8 laws + standard + FPS test suites); see dedicated section |
+| `arena/` | Pure-Python control-law simulation evaluator (neutral simulator + 10 laws + standard + FPS test suites); see dedicated section |
 
 Linking note: `aimbot` needs `-lopencv_video` (calibration uses `phaseCorrelate`) and `-lopencv_imgcodecs` (collection `imwrite`).
 
@@ -169,7 +169,9 @@ arena/
     ├── pi_pm.py      pole-placement PI + PM cap
     ├── kalman_pi.py  Kalman predictor + PM-PI
     ├── smith_filt.py filtered Smith predictor
-    └── mpc.py        model predictive control (rate/quantization constraints)
+    ├── mpc.py        model predictive control (rate/quantization constraints)
+    ├── imm_pi.py     per-axis 2-model IMM maneuver-adaptive estimator (best matched/FPS, fails the mismatch band)
+    └── reseed_pi.py  pole-placement PI + type-2 FF + CUSUM alarm re-seeding (tail gains only, net loss under mismatch)
 ```
 
 Dependencies: stdlib + numpy (Kalman/MPC) + scipy (DARE solve for MPC); see `requirements.txt`. **This machine (Windows dev mirror) must use a venv; `--break-system-packages` is forbidden**: `python3.12 -m venv .venv` → `.venv\Scripts\python.exe -m pip install -r requirements.txt`. `.venv/` is not committed (gitignored); after cloning, rebuild with the commands above. All arena commands use the venv interpreter (Windows: `.venv\Scripts\python.exe`; Linux: `.venv/bin/python`). The Jetson doesn't need arena.
@@ -196,11 +198,13 @@ Dependencies: stdlib + numpy (Kalman/MPC) + scipy (DARE solve for MPC); see `req
 | mpc | 144.8 | 160.3 | **113.4** | 444 | 4.0% | L20 **and** L80 | **heavy (QP/tick)** |
 | **ff_pi (shipped)** | 156.7* | **151.3** | 125.1 | **386** | 9.2%* | L20–70 + s0.7–1.3 pass; L80 edge settle-fail | light |
 | ballistic | 157.8 | 173.5 | 142.0 | 437 | **0.0%** | L80 | light |
+| reseed_pi | 161.8 | 148.4 | 133.9 | 386 | 10.3% | L80 edge settle-fail (same as ff_pi) | light |
 | kalman_pi | 163.4 | 189.9 | 129.4 | 477 | 1.8% | L80 | medium |
 | pi_pm | 164.9 | 199.1 | 128.0 | 483 | 0.6% | no divergence | light |
 | sliding | 174.4 | 213.5 | 123.9 | 619 | 2.9% | **no divergence + flattest profile** | light |
 | smith_filt | 180.0 | 182.9 | 161.2 | 198 | 4.0% | L80 + s0.7 | light |
 | reference | 209.7 | 235.8 | 173.9 | 771 | 2.4% | L80 | light |
+| imm_pi | inf | **104.0** | inf | 389 | 10.3% | L20–40 & L70–80 + s0.7 settle-fail | light |
 
 \* ff_pi's fps-delta number is inflated by a settle knife-edge metric artifact: at 60fps it is better on 4/5 scenarios per-scenario (step 216ms, const_vel 0.88px, accel 12.3px, maneuver 20.2px) — the composite's 60/120 ratio jumps on step_diag's marginal band crossing. The FPS behavior tests (`arena.fps_eval`) are the meaningful law-vs-law comparison.
 
@@ -215,9 +219,9 @@ Dependencies: stdlib + numpy (Kalman/MPC) + scipy (DARE solve for MPC); see `req
 
 **Why ff_pi is the shipped law** — best balance of tracking/lock AND maneuver overshoot: matched composite 151.3 (step settle 277ms / 3.11px, accel rmse 7.1px, maneuver rmse 19.4px, relock 386ms — best relock of all laws), FPS behavior suite ADAD rmse 24.1px / event overshoot 28.0px, while holding the **full delay band L20–80 and s0.7–1.3 with no divergence** (at the L80 corner step settle rides the 3px knife edge — see Known limitations). The CUSUM-reset mechanism is principled: a broken target model (stop/reversal) is handled by discarding the contradicted velocity state and re-running the proven step response, not by patching gains.
 
-**Laws not shipped** (kept in `arena/`): `ballistic` is the fastest flick + best maneuver tracking + frame-rate independent, but has the highest worst-case mismatch and diverges at L80. `sliding` is the most robust (zero divergence across L20–80 + s0.7–1.3, flattest profile) but slowest. `mpc` is strongest on paper but solves a QP per tick — unverified against Jetson 500Hz embedded compute — and has the narrowest delay band (diverges at both L20 and L80). `pi_pm` is subsumed by ff_pi (ff_pi = pi_pm + principled feedforward). `kalman_pi`/`smith_filt` are covered by the above on the Pareto front. If a different trade-off is ever needed, port the corresponding law's `step()` into `src/aimbot.cu` (units/quantization/counts/estimator must match line for line).
+**Laws not shipped** (kept in `arena/`): `ballistic` is the fastest flick + best maneuver tracking + frame-rate independent, but has the highest worst-case mismatch and diverges at L80. `sliding` is the most robust (zero divergence across L20–80 + s0.7–1.3, flattest profile) but slowest. `mpc` is strongest on paper but solves a QP per tick — unverified against Jetson 500Hz embedded compute — and has the narrowest delay band (diverges at both L20 and L80). `pi_pm` is subsumed by ff_pi (ff_pi = pi_pm + principled feedforward). `kalman_pi`/`smith_filt` are covered by the above on the Pareto front. `imm_pi` is the best matched-tracking law of the whole set (accel 4.3px / maneuver 13.6px, FPS RMSE 17.1px / event overshoot 26.7px / recovery 7ms) but fails the mismatch band outright (L30/40/70, s0.7 → step limit cycle, OVERALL inf). `reseed_pi` (CUSUM alarm re-seeding) keeps ff_pi's nominal behavior byte-for-byte and trims the post-break rebuild tail (maneuver 17.7px, flaky FPS RMSE −0.4px, friction-stop event −18%) but pays more at the mismatch edge (L70 133.9 vs 125.1) — seed readings inherit the Smith window-misalignment junk ∝ own-accel × Δc. If a different trade-off is ever needed, port the corresponding law's `step()` into `src/aimbot.cu` (units/quantization/counts/estimator must match line for line).
 
-**Rejected paths (documented so they aren't re-explored)**: re-aiming the FF through a fast second velocity channel raises estimator loop gain and diverges at L30–70; hot design points (PM45–55 × β0≥0.06) pass matched but their estimator contamination makes step hunting at the band edges — the mismatch band is the hard constraint of the linear Smith+PI+FF family, and PM50/β0.03 is its test-suite-selected fastest point.
+**Rejected paths (documented so they aren't re-explored)**: re-aiming the FF through a fast second velocity channel raises estimator loop gain and diverges at L30–70; hot design points (PM45–55 × β0≥0.06) pass matched but their estimator contamination makes step hunting at the band edges — the mismatch band is the hard constraint of the linear Smith+PI+FF family, and PM50/β0.03 is its test-suite-selected fastest point. Always-on maneuver-adaptive estimation (IMM, `imm_pi`) dies the same death from inside the estimator: under mismatch the Smith window misalignment turns own-command transients into large innovations, large innovations always favor the wide-covariance maneuver model, and the resulting ghost v̂ closes its loop through the physical plant — every σ̂-normalized gate (NIS authority gate, CUSUM) goes blind exactly when the loop self-oscillates, because the filter's covariance and the σ̂ EMA absorb the oscillation as "noise" (measured σ̂ runaway 0.5→24px, NIS ≡ 1). Online residual-delay adaptation is unobservable in this bookkeeping: the Smith error is first-order exact under constant velocities (the anchor offset cancels between the α-β velocity bias and the ê assembly), so the innovation carries no steady-state signature of Δ = L_true − L̂ — only transient bursts proportional to own-accel × Δ, which are exactly the frames where any estimate is contaminated. Event-overshoot peaks are bounded below by v·L (delay floor) plus the ~2–3 frame CUSUM alarm latency (set by the anti-false-alarm per-frame cap), so no estimator-side fix can cut them; only the post-peak tail is attackable, and paying mismatch margin for it loses on the composite.
 
 **Header constants** (constants area of `src/aimbot.cu`; principled rationale in `arena/laws/ff_pi.py`'s docstring):
 
