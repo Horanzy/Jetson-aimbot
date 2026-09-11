@@ -61,11 +61,11 @@ loses no matter how fast it is. Also run `python -m arena.integrate <law_name>` 
 the wide-delay sweep L_true ∈ {20..80} + sensitivity mismatch, and `python -m arena.fps_eval
 <law_name>` for the FPS behavior suite.
 
-## Reference baseline (ff_pi, the current shipped control law)
-OVERALL=156.7, matched composite=151.3 (step settle 277ms / overshoot 3.1px / first reach 177ms;
-const_vel rmse 0.8px; maneuver rmse 19.4px), worst mismatch=125.1, relock 386ms. Passes the
-sensitivity band s0.7–1.3; at the wide-delay corner L_true=80 the step settle rides the 3px
-knife edge (no divergence). Goal: beat it across the board.
+## Reference baseline (ff_pi_acc, the current shipped control law)
+OVERALL=123.6, matched composite=114.7 (step settle 277ms / overshoot 3.1px / first reach 177ms;
+const_vel rmse 0.8px; accel rmse 4.4px; maneuver rmse 19.4px), worst mismatch=125.1, relock 386ms.
+Passes the sensitivity band s0.7–1.3; at the wide-delay corner L_true=80 the step settle rides the
+3px knife edge (no divergence). Goal: beat it across the board.
 
 ## Process debugging (`arena/trace.py`, per law)
 

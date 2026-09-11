@@ -6,8 +6,10 @@
 //        → 控制律 (极点配置 PI + type-2 速度前馈) → USB Gadget 透传
 //
 //  控制律: 收敛带宽 wn 由标定延迟 L 自动导出 (wn=(90°−PM)π/180/L, PM=50°, 免手调),
-//    ζ=1 临界阻尼; type-2 速度前馈 (FF_GAIN_VAL=1) 补匀速跟踪零拖尾。结构参数为头部常量,
-//    详见 arena/laws/ff_pi.py 与 AGENTS.md。
+//    ζ=1 临界阻尼; type-2 速度前馈 (FF_GAIN_VAL=1) 补匀速跟踪零拖尾; 创新均值反演 â
+//    修正 α-β 对加速目标的结构性滞后 (重建抑制/自身活动门/显著性地板三重门控, 无加速
+//    时 â≡0 指令流与纯 ff_pi 一致)。结构参数为头部常量, 详见 arena/laws/ff_pi_acc.py
+//    与 AGENTS.md。
 //
 //  采集 (可选): 传 -o 输出目录即开启, 按三源触发自动截图 (开火 / 检测 / 定时),
 //    截图 = 模型输入同款中心裁剪, 按来源分子目录, 异步写盘不阻塞推理。不传 -o 则纯自瞄。
@@ -100,6 +102,13 @@ const float FF_I_FRAC   = 1.0f;                      // 积分限幅 = I_FRAC×m
 const float CUSUM_K = 0.5f;
 const float CUSUM_C = 3.0f;
 const float CUSUM_H = 9.0f;
+// â 加速度偏差补偿通道 (创新均值反演, 修 α-β 对匀加速目标的结构滞后; 依据详见
+//   arena/laws/ff_pi_acc.py — 无加速时 â≡0, 指令流与纯 ff_pi 逐位一致):
+const float ACC_SIG_CLIP_K = 2.0f;   // 清洗创新 Huber 截断 (σ̂_r 倍数, M-estimator 标准断点)
+const float ACC_TAU_L      = 4.0f;   // ȳ EMA 记忆 = ACC_TAU_L·L̂ (须 >> CUSUM 告警延迟, << 加速段时长)
+const float ACC_RB_HOLD_N  = 1.5f;   // 重建旗标最短保持 = N·(T/β) (α-β 速度估计自身时间常数)
+const float ACC_OW_ACTIV_K = 2.0f;   // 自身活动门限 θ_a = max_v/(K·L̂) (K 个延迟窗走完速度帽算剧烈)
+const float ACC_SNR        = 10.0f;  // â 显著性地板倍数 (盖过失配带相关 dither 噪声驱动的均值游走)
 
 // ========================= 标定 =========================
 const int   CALIB_TRIGGER_TICKS    = 2500;           // 双侧键长按 5s @500Hz
@@ -151,10 +160,22 @@ static inline double elapsed_ms(
     std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
     return std::chrono::duration<double, std::milli>(a - b).count();
 }
+// â = ȳ·β/T² (创新均值自洽反演加速度, 任何帧率下都精确); ȳ 不过白噪声显著性地板
+//   (ACC_SNR·σ_noise·√(ρ/(2−ρ)), σ_noise² = m₂−ȳ² 精确分解) → â = 0 (硬门限)
+static inline float accel_est(float ybar, float m2, float beta, float dt,
+                              float rho, float lim_a) {
+    float sig_n = std::sqrt(std::max(1e-6f, m2 - ybar * ybar));
+    float floor = ACC_SNR * sig_n * std::sqrt(rho / (2.0f - rho));
+    float eff = (std::fabs(ybar) > floor) ? ybar : 0.0f;
+    return std::clamp(eff * beta / (dt * dt), -lim_a, lim_a);
+}
 
 // ---- 目标状态 ----
 struct TargetState {
     float px = 0, py = 0, vx = 0, vy = 0;
+    float ax_e = 0, ay_e = 0;                    // â 加速度估计 (px/ms², 0=未通过显著性/重建/门控)
+    float last_dt = 1000.0f / 120.0f;            // 最近一帧的滤波增益 (供 â 反演与 ε 修正)
+    float last_alpha = PRED_ALPHA0, last_beta = PRED_BETA0;
     float cs = 0;                                // CUSUM 告警电平 (σ 倍数归一, 信任度来源)
     bool  valid = false;
     std::chrono::steady_clock::time_point t_pub;
@@ -505,7 +526,14 @@ void ai_thread(std::string model_path, int target_cls,
     std::cout<<"✅ AI 线程已启动 ("<<cam_fps<<" fps, "<<cam_dev<<")\n";
 
     bool filt_init=false; float fx=0,fy=0,fvx=0,fvy=0;
-    float sig2x=1,sig2y=1,csx=0,csy=0;   // CUSUM 状态 (ff_pi: σ 自标定, 归零重拉)
+    float sig2x=1,sig2y=1,csx=0,csy=0;   // CUSUM 状态 (σ 自标定, 归零重拉)
+    float sig2rx=1,sig2ry=1;             // â 传感器稳健尺度 σ̂_r (清洗创新二阶矩)
+    float ybar_x=0,ybar_y=0;             // 创新均值 EMA ȳ (â 传感器)
+    float ax_e=0,ay_e=0;                 // 加速度估计 â (0 = 未通过显著性/重建/门控)
+    bool reb_x=true,reb_y=true;          // 重建抑制旗标 (v̂ 自 0 重建期 â 无定义)
+    auto reb_until_x=std::chrono::steady_clock::time_point::min(),
+         reb_until_y=std::chrono::steady_clock::time_point::min();
+    float last_dt=PRED_DT0,last_alpha=PRED_ALPHA0,last_beta=PRED_BETA0;
     auto t_prev=std::chrono::steady_clock::now();
 
     float s_est=init_s, l_est=init_l;
@@ -534,7 +562,7 @@ void ai_thread(std::string model_path, int target_cls,
             std::this_thread::sleep_for(std::chrono::milliseconds(5)); continue; }
         read_fails=0;
         const float conf_thr=g_conf_thr.load(), y_off_pct=g_y_off_pct.load(),
-                    fov_r=g_fov_radius.load();
+                    fov_r=g_fov_radius.load(), max_v=g_max_v.load();
 
         ++fps_cnt;
         auto fps_now=std::chrono::steady_clock::now();
@@ -610,7 +638,8 @@ void ai_thread(std::string model_path, int target_cls,
 
         if (found) {
             if (!filt_init) { fx=best_dx;fy=best_dy;fvx=0;fvy=0;filt_init=true;
-                              sig2x=sig2y=1;csx=csy=0; }
+                              sig2x=sig2y=1;csx=csy=0;
+                              sig2rx=sig2ry=1;ybar_x=ybar_y=0;ax_e=ay_e=0; }
             else {
                 float Lc=l_est*PRED_L_COMP;
                 auto c0=g_counts.at(shift_ms(now,-(double)Lc-dt));
@@ -619,7 +648,13 @@ void ai_thread(std::string model_path, int target_cls,
                 float px_pred=fx+fvx*dt-s_est*cax, py_pred=fy+fvy*dt-s_est*cay;
                 float inx=best_dx-px_pred, iny=best_dy-py_pred;
                 if (std::hypot(inx,iny)>TRACK_JUMP_GATE) { fx=best_dx;fy=best_dy;fvx=0;fvy=0;
-                    csx=csy=0; }
+                    csx=csy=0;
+                    // 跳变 = 目标模型破缺: v̂ 从 0 重建, â 传感器一并清零抑制
+                    sig2rx=sig2ry=1;ybar_x=ybar_y=0;ax_e=ay_e=0;
+                    reb_x=reb_y=true;
+                    float rb_hold=ACC_RB_HOLD_N*dt
+                        /std::max(1e-6f,std::min(0.60f,PRED_BETA0*dt/PRED_DT0));
+                    reb_until_x=reb_until_y=shift_ms(now,rb_hold); }
                 else { float rr=dt/PRED_DT0;
                        float alpha=std::min(0.90f,PRED_ALPHA0*rr);
                        float beta=std::min(0.60f,PRED_BETA0*rr);
@@ -628,17 +663,70 @@ void ai_thread(std::string model_path, int target_cls,
                        // 方向矛盾 CUSUM (σ 自标定): 持续矛盾创新 → 告警后该轴 v̂ 归零重拉
                        float sx=std::max(std::sqrt(sig2x),1e-6f);
                        float sy=std::max(std::sqrt(sig2y),1e-6f);
+                       // â 传感器稳健尺度 (Huber 截断二阶矩): 只喂 â 显著性与重建判定
+                       float srx=std::max(std::sqrt(sig2rx),1e-6f);
+                       float sry=std::max(std::sqrt(sig2ry),1e-6f);
+                       // 清洗创新: 减掉自身已知的 Lc 过补偿伪迹 (matched 下恰好还原
+                       //   真实目标创新; 失配残留 ∝ Δ·a_own, 瞬态成对, 由活动门吸收)
+                       auto c0n=g_counts.at(shift_ms(now,-(double)l_est-dt));
+                       auto c1n=g_counts.at(shift_ms(now,-(double)l_est));
+                       float inx_c=inx-s_est*((c1.first-c0.first)-(float)(c1n.first-c0n.first));
+                       float iny_c=iny-s_est*((c1.second-c0.second)-(float)(c1n.second-c0n.second));
+                       float clx=std::clamp(inx_c,-ACC_SIG_CLIP_K*srx,ACC_SIG_CLIP_K*srx);
+                       float cly=std::clamp(iny_c,-ACC_SIG_CLIP_K*sry,ACC_SIG_CLIP_K*sry);
+                       sig2rx+=beta*(clx*clx-sig2rx);
+                       sig2ry+=beta*(cly*cly-sig2ry);
+                       // 自身加速度活动门: 失配伪创新 ∝ a_own·Δ 与真签名 (∝a_t·T²/β)
+                       //   物理可分 — 自身剧烈加减速期间 â 不采信
+                       float w_own=std::max(1.0f,l_est);
+                       auto s0=g_counts.at(now);
+                       auto s1=g_counts.at(shift_ms(now,-(double)w_own));
+                       auto s2=g_counts.at(shift_ms(now,-(double)dt));
+                       auto s3=g_counts.at(shift_ms(now,-(double)dt-(double)w_own));
+                       float th_a=max_v/(ACC_OW_ACTIV_K*std::max(1.0f,l_est));
+                       float aown_x=(s_est*((float)(s0.first-s1.first)
+                                           -(float)(s2.first-s3.first))/w_own)/dt;
+                       float aown_y=(s_est*((float)(s0.second-s1.second)
+                                           -(float)(s2.second-s3.second))/w_own)/dt;
+                       float tx=aown_x/th_a, ty=aown_y/th_a;
+                       float gx_own=1.0f/(1.0f+tx*tx*tx*tx*tx*tx);
+                       float gy_own=1.0f/(1.0f+ty*ty*ty*ty*ty*ty);
+                       // 重建旗标解除 = 时间常数下限 + 创新回典型水平
+                       if (reb_x && now>=reb_until_x && std::fabs(inx)<=ACC_SIG_CLIP_K*srx)
+                           reb_x=false;
+                       if (reb_y && now>=reb_until_y && std::fabs(iny)<=ACC_SIG_CLIP_K*sry)
+                           reb_y=false;
+                       // 创新均值 EMA ȳ — 无新鲜证据 → 以自然速率向零衰减;
+                       //   有证据 → 按 (自身活动门 × CUSUM 矛盾门) 缩放进入
+                       float rho=1.0f-std::exp(-dt/(ACC_TAU_L*std::max(1.0f,l_est)));
+                       if (reb_x) ybar_x-=rho*ybar_x;
+                       else { float g=gx_own*(1.0f-std::min(1.0f,csx/CUSUM_H));
+                              ybar_x+=rho*(g*clx-ybar_x); }
+                       if (reb_y) ybar_y-=rho*ybar_y;
+                       else { float g=gy_own*(1.0f-std::min(1.0f,csy/CUSUM_H));
+                              ybar_y+=rho*(g*cly-ybar_y); }
                        float accx=(fvx>0)?-inx/sx:(fvx<0)?inx/sx:-CUSUM_K;
                        float accy=(fvy>0)?-iny/sy:(fvy<0)?iny/sy:-CUSUM_K;
                        csx=std::max(0.0f,csx+std::min(std::max(accx,0.0f),CUSUM_C)-CUSUM_K);
                        csy=std::max(0.0f,csy+std::min(std::max(accy,0.0f),CUSUM_C)-CUSUM_K);
-                       if (csx>=CUSUM_H && fvx!=0) { fvx=0; csx=0; }
-                       if (csy>=CUSUM_H && fvy!=0) { fvy=0; csy=0; }
+                       if (csx>=CUSUM_H && fvx!=0) { fvx=0; csx=0;
+                           reb_x=true; reb_until_x=shift_ms(now,ACC_RB_HOLD_N*dt/beta); }
+                       if (csy>=CUSUM_H && fvy!=0) { fvy=0; csy=0;
+                           reb_y=true; reb_until_y=shift_ms(now,ACC_RB_HOLD_N*dt/beta); }
                        fx=px_pred+alpha*inx; fy=py_pred+alpha*iny;
-                       fvx+=(beta/dt)*inx; fvy+=(beta/dt)*iny; }
+                       fvx+=(beta/dt)*inx; fvy+=(beta/dt)*iny;
+                       float lim_a=max_v/(ACC_TAU_L*std::max(1.0f,l_est));
+                       ax_e=accel_est(ybar_x,sig2rx,beta,dt,rho,lim_a);
+                       ay_e=accel_est(ybar_y,sig2ry,beta,dt,rho,lim_a);
+                       if (reb_x) ax_e=0;
+                       if (reb_y) ay_e=0;
+                       last_dt=dt; last_alpha=alpha; last_beta=beta; }
             }
             { std::lock_guard<std::mutex> lk(g_target.mtx);
               g_target.px=fx;g_target.py=fy;g_target.vx=fvx;g_target.vy=fvy;
+              g_target.ax_e=ax_e;g_target.ay_e=ay_e;
+              g_target.last_dt=last_dt;g_target.last_alpha=last_alpha;
+              g_target.last_beta=last_beta;
               g_target.cs=std::max(csx,csy)/CUSUM_H;
               g_target.s_est=s_est;g_target.l_est_ms=l_est;
               g_target.t_pub=now;g_target.valid=true; }
@@ -1015,10 +1103,14 @@ int main(int argc, char* argv[]) {
             if (aiming) {
                 float px,py,vx,vy,se,le,cs;bool valid;
                 std::chrono::steady_clock::time_point tp;
+                float ax_e,ay_e,last_dt,last_alpha,last_beta;
                 { std::lock_guard<std::mutex> lk(g_target.mtx);
                   px=g_target.px;py=g_target.py;vx=g_target.vx;vy=g_target.vy;
                   se=g_target.s_est;le=g_target.l_est_ms;cs=g_target.cs;
-                  valid=g_target.valid;tp=g_target.t_pub; }
+                  valid=g_target.valid;tp=g_target.t_pub;
+                  ax_e=g_target.ax_e;ay_e=g_target.ay_e;
+                  last_dt=g_target.last_dt;last_alpha=g_target.last_alpha;
+                  last_beta=g_target.last_beta; }
                 double age=elapsed_ms(now,tp);
                 if (valid&&age<TARGET_STALE_MS) {
                     const float max_v=g_max_v.load(), fov_r=g_fov_radius.load();
@@ -1027,8 +1119,16 @@ int main(int argc, char* argv[]) {
                     auto cn=g_counts.cum();
                     float ifx=se*(float)(cn.first-cp.first);
                     float ify=se*(float)(cn.second-cp.second);
-                    float ex=px+vx*(float)(age+Lc)-ifx;
-                    float ey=py+vy*(float)(age+Lc)-ify;
+                    // 加速度偏差补偿: ε = â·T·(α/β−½) 修 α-β 速度结构滞后,
+                    //   位置外推加 ½â·W²; 前馈用 v̂+ε — 对匀加速目标, 当前真实
+                    //   速度才是 type-2 零拖尾的精确开环指令
+                    float b=std::max(last_beta,1e-9f);
+                    float eps_x=ax_e*last_dt*(last_alpha/b-0.5f);
+                    float eps_y=ay_e*last_dt*(last_alpha/b-0.5f);
+                    float vffx=vx+eps_x, vffy=vy+eps_y;
+                    float W=(float)age+Lc;
+                    float ex=px+vffx*W+0.5f*ax_e*W*W-ifx;
+                    float ey=py+vffy*W+0.5f*ay_e*W*W-ify;
                     float r=std::hypot(ex,ey);
                     float L=std::max(1.0f,le);
                     float wn=(90.0f-FF_PM_DEG)*3.14159265358979f/180.0f/L;
@@ -1059,8 +1159,8 @@ int main(int argc, char* argv[]) {
                                                     0.0f,1.0f);
                     float ff_gate=gate+(1.0f-gate)*(1.0f-w_state);
                     float ff_eff=FF_GAIN_VAL*ff_gate*gap_scale;
-                    vx_u+=ff_eff*vx;
-                    vy_u+=ff_eff*vy;
+                    vx_u+=ff_eff*vffx;
+                    vy_u+=ff_eff*vffy;
                     float vcx=std::clamp(vx_u,-max_v,max_v);
                     float vcy=std::clamp(vy_u,-max_v,max_v);
                     float s=std::clamp(se,S_MIN,S_MAX);
