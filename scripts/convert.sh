@@ -10,7 +10,7 @@ CACHE_FILE="$ROOT/trt_timing_cache.cache"  # 全局时序缓存
 
 # 自动尝试锁定 Jetson 频率
 if [ "$EUID" -eq 0 ]; then
-    echo "[提示] 检测到 Root 权限，正在自动锁定 Jetson 核心频率以加速编译..."
+    echo "[提示] 检测到 Root 权限，正在自动锁定 Jetson 核心频率以加速转换..."
     jetson_clocks
 else
     echo "=========================================================="
@@ -24,7 +24,7 @@ if [ ! -f "$TRTEXEC_PATH" ]; then
     exit 1
 fi
 
-# ===== 关键修复：彻底清除可能来自其他设备的缓存 =====
+# ===== 时序缓存只在本机有效: 其他设备生成的缓存会让构建报错, 检测到即删除重建 =====
 if [ -f "$CACHE_FILE" ]; then
     echo "[清理] 检测到旧有的时序缓存文件，为避免 '不是本机生成的引擎' 错误，将其删除并重建。"
     rm -f "$CACHE_FILE"
@@ -54,14 +54,14 @@ while IFS= read -r onnx_path; do
         echo "[转换] 正在优化转换: $relative_path ..."
         mkdir -p "$target_engine_dir"
         
-        # ================= TRT 增强编译命令 =================
-        # 核心优化参数说明：
-        #   --fp16                 : 启用 FP16 精度
-        #   --useCudaGraph         : 启用 CUDA Graph 加速推理
+        # ================= TRT 编译参数 =================
+        #   --fp16                 : FP16 精度
+        #   --useCudaGraph         : CUDA Graph 加速推理
         #   --builderOptimizationLevel=3 : 最高构建优化级别
-        #   --timingCacheFile      : 使用本机新缓存，加速后续模型构建
-        #   --skipInference        : 跳过性能测试，只生成引擎（想要精度数据可改为 --iterations=N）
-        # ========================================================
+        #   --timingCacheFile      : 本机时序缓存, 加速后续模型构建
+        #   --memPoolSize          : 构建期 workspace 上限 4GB
+        #   --iterations=100       : 构建期推理计时次数
+        # ================================================
         "$TRTEXEC_PATH" \
             --onnx="$onnx_path" \
             --saveEngine="$engine_path" \

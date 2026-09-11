@@ -1,4 +1,4 @@
-﻿"""arena/integrate.py — 阶段4 统合评测。
+"""arena/integrate.py — 统合评测。
 
 所有 law 在完全相同的多组场景下:
   1. 标准评测组 (arena.eval.test_suite): 标准多组场景 + 失配扫描 + 帧率。
@@ -46,7 +46,7 @@ def _relock_metrics(res, sc):
         if v > band:
             last_out = tt[i]
     relock_settle = last_out - RELOCK_JUMP_T if e[-1] <= band else float("inf")
-    # direction-agnostic rebound (consistent with metrics.step_metrics): max |e| after first reach
+    # 方向无关回弹 (口径同 metrics.step_metrics): 首次到达后的最大 |e|
     first_reach_i = None
     for i, v in enumerate(e):
         if v <= band:

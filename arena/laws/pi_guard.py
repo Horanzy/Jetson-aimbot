@@ -1,6 +1,5 @@
-"""arena/laws/pi_guard.py — 极点配置 PI (Smith 预测, PM 导出带宽) + 方向矛盾
-CUSUM 速度记忆证据重置。无前馈的 pi_pm 结构, 加上 ff_pi 同款的矛盾检测器,
-但重置对象是本律自己的两类速度记忆。
+"""arena/laws/pi_guard.py — 极点配置 PI (Smith 预测, PM 导出带宽, 无前馈)
++ 方向矛盾 CUSUM 速度记忆证据重置 (显式 v̂ 与隐性 I 积分器同清)。
 
 ## 算法原理
 
@@ -10,7 +9,7 @@ CUSUM 速度记忆证据重置。无前馈的 pi_pm 结构, 加上 ff_pi 同款�
     gate = i_gate/(i_gate+|ê|)                              // I 距离门控
     v = Kp·ê + Ki·∫ê·gate·h                                 // PI (无前馈)
 
-速度记忆证据重置 (本律的核心, ff_pi 机制在无 FF 结构上的对应物):
+速度记忆证据重置 (本律的核心):
 
   本律有两类"目标速度记忆":
     a) 显式: α-β 滤波速度 v̂ — 进 Smith 外推项 v̂·(age+L̂·l_comp);
@@ -19,12 +18,12 @@ CUSUM 速度记忆证据重置。无前馈的 pi_pm 结构, 加上 ff_pi 同款�
   目标模型破缺 (急停/折返/蹬墙跳 2V 反向) 时两者同时变幽灵: v̂ 污染 Smith
   外推遮蔽真实误差 (回拉发面), I 继续命令旧速度 (实测 Ki·int_x 停后 600ms
   仍 ≈0.64 px/ms, 几乎不衰减 — 过冲后 58→18px 慢尾 600ms 的主源)。
-  ff_pi 给显式 FF 配了 CUSUM 证据撤回; 本律无 FF, 对应物 = 同一检测器同时
-  重置两类记忆: 告警 → 该轴 v̂=0 (Smith 去遮蔽) 且 ∫=0 (旧速度作废),
+  本律无前馈, 同一检测器同时重置两类记忆: 告警 → 该轴 v̂=0 (Smith 去遮蔽)
+  且 ∫=0 (旧速度作废),
   环路回到阶跃响应的初始条件: P 全程看见真实误差 (回拉 sharp), I 从 0 按
   证据重建。这是"速度记忆归零重拉"原理, 不是新增估计器。
 
-  检测器与 ff_pi 逐字同款 (Page 序贯变化检测, σ 归一, σ 在线自标定):
+  检测器 (Page 序贯变化检测, σ 归一, σ 在线自标定):
     K = 0.5σ  漂移: 零均值噪声的矛盾方向期望 E[max(0,−z)]=0.399σ < K,
               净漂移为负 → 稳态不积累, 不误触发 (type-2 锁定不受扰);
     C = 3σ    单帧增量上限: 拒后坐力式单帧踢脚;
@@ -52,7 +51,7 @@ l_comp = 1.1   [EMPIRICAL: 方向有原理, 数值试出]
 i_gate = 8.0 px   [EMPIRICAL: 划分拉枪/跟踪职责]
     I 距离衰减。继承 pi_pm。注意它同时放大加速目标的结构性滞后
     (稳态 e 解 e·ig(e)·Ki = a), 无 FF 结构下不可消除 (rejected: 加
-    type-2 FF = 变成 ff_pi)。
+    type-2 FF 越出无前馈定位)。
 
 i_frac = 1.0   [原理: 可跟踪最大目标速度 = i_frac×max_v]
     积分限幅 = i_frac×max_v/Ki。
@@ -61,7 +60,7 @@ alpha0 = 0.50 / beta0 = 0.04 / beta_exp = 1.0   [EMPIRICAL: α-β 增益]
     估计器增益, 按 dt 缩放 (帧率无关)。继承 pi_pm。beta0=0.04 保持
     <0.05 (失配自激悬崖)。
 
-CUSUM_K/C/H = 0.5/3.0/9.0 (σ 倍数)   [原理+测试组: 与 ff_pi 逐字相同]
+CUSUM_K/C/H = 0.5/3.0/9.0 (σ 倍数)   [原理+测试组选定]
     无量纲, 随在线 σ̂ 自标定, 跨设备自适应。
 
 ## debug() 字段语义 (px / px/ms / σ)
@@ -73,27 +72,22 @@ CUSUM_K/C/H = 0.5/3.0/9.0 (σ 倍数)   [原理+测试组: 与 ff_pi 逐字相�
   ex, ey        Smith 汇装误差 ê (驱动 P/I)
   age           当前拍距最新检测 ms
 
-## 评测 (arena 实测, 默认种子; 对比对象 pi_pm 基线)
-    matched 199.11→190.65 (maneuver 23.96→20.22, const_vel 0.69→0.67,
-    accel/step/relock 逐位不动); 失配扫描 L30-70 全档改善
-    (97/97/106/101/128 → 86/86/97/90/117, worst 128.02→116.69);
-    宽延迟 L20-80 全档改善零发散 (L80 143.96→139.59); s 失配全档改善
-    (122.80→113.58); relock 483.3ms/3.16px 逐位相同; fps_eval clean
-    RMSE 27.45→24.18, 事件过冲 mean 25.0→23.3, worst 86.3→78.6;
-    OVERALL 164.85→160.21。60/120fps 差 0.6%→3.3% (两个 composite 本身
-    都改善; 告警延迟按帧计, 60fps 时 ms 延迟翻倍 → 120fps 获益更大)。
+## 评测 (arena 实测, 默认种子)
+    matched composite 190.65 (step settle 384.7ms / 过冲 3.48px, const_vel
+    rmse 0.67px, accel 16.14px, maneuver 20.22px); 失配扫描最坏 116.69
+    (L70); 宽延迟 L20-80 全档通过零发散 (L80=139.59); s 失配 0.70-1.30
+    全档通过; relock 483.3ms / 3.16px; fps_eval clean RMSE 24.18px /
+    事件过冲 mean 23.3px worst 78.6px; 60/120fps 差 3.3% (告警延迟按帧计,
+    60fps 时 ms 延迟翻倍); OVERALL 160.21。
     已知代价 (结构性可解释): 软着陆类事件重置后重跑阶跃响应的回弹略升
-    (jump_land_stop over 1.8→4.3px, bhop worst 27.9→33.2, slide over
-    16.4→20.3 — 小绝对量, 换取 stop/friction/reverse 类过冲 −25~40%)。
-    holdout (seeds 4,5,6): matched 191.52→181.05, maneuver 21.60→18.03,
-    失配全档改善 (worst 124.97→116.46), 无发散; OVERALL +0.3% (60fps
-    composite 改善少, fpsΔ 元项膨胀, 两个 composite 本身均改善)。
+    (jump_land_stop over 4.3px, bhop worst 33.2px, slide over 20.3px —
+    小绝对量), 换取 stop/friction/reverse 类过冲大幅下降。
+    holdout (seeds 4,5,6): matched 181.05, maneuver 18.03px, 失配全档
+    通过 (worst 116.46), 无发散。
 
-设计取舍: 保持 pi_pm 的"无前馈、保守带宽、全带不发散"定位, 把它缺的
-模型破缺处理补上 (证据重置而非前馈)。与 ff_pi 的分工: ff_pi 用前馈换
-跟踪/收敛, 用信任度管 FF; 本律零前馈零信任滤波, 结构最简, 事件过冲与
-帧率无关性保持全库第一梯队。加速拖尾 a/(Ki·ig) 是无 FF 结构的原理性
-极限, 本律不掩盖它。
+设计取舍: 无前馈、保守带宽、全带不发散; 模型破缺由证据重置处理而非
+前馈。零前馈零信任滤波, 结构最简, 事件过冲与帧率无关性保持全库第一
+梯队。加速拖尾 a/(Ki·ig) 是无 FF 结构的原理性极限, 本律不掩盖它。
 """
 from __future__ import annotations
 import math
@@ -107,7 +101,7 @@ class PiGuardLaw(Law):
     DT0 = 1000.0 / 120.0
     JUMP_GATE = 100.0
     STALE = 200.0
-    # CUSUM 参数 (均为 σ 倍数, 无量纲, 与 ff_pi 逐字相同):
+    # CUSUM 参数 (均为 σ 倍数, 无量纲):
     # K 漂移 (0.5 > E[max(0,−z)]=0.399 → 零均值噪声净漂移为负, 稳态不误触发)
     # C 单帧增量上限 (拒单帧踢脚) / H 告警门限 (~2-3 帧持续矛盾触发)
     CUSUM_K = 0.5
@@ -171,7 +165,7 @@ class PiGuardLaw(Law):
             r = dt / self.DT0
             alpha = min(0.90, self.alpha0 * r)
             beta = min(0.60, self.beta0 * r ** self.beta_exp)
-            # CUSUM 尺度 σ̂: 原始创新二阶矩 EMA (ff_pi 原语义, 跨 JUMP 持续;
+            # CUSUM 尺度 σ̂: 原始创新二阶矩 EMA (跨 JUMP 持续;
             # 失配伪创新自动撑宽告警门 = 不误重置的有效阻尼)
             self.sig2x += beta * (inx * inx - self.sig2x)
             self.sig2y += beta * (iny * iny - self.sig2y)

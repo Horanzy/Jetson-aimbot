@@ -1,12 +1,11 @@
-"""arena/laws/ff_pi_acc.py — ff_pi + 结构性加速度偏差补偿 (ff_pi 系)。
+"""arena/laws/ff_pi_acc.py — 极点配置 PI + type-2 速度前馈 + 方向矛盾
+CUSUM 速度归零重拉 + 结构性加速度偏差补偿 (ff_pi 系现役律)。
 
-在 ff_pi (极点配置 PI + type-2 速度前馈 + 方向矛盾 CUSUM 速度归零重拉)
-之上增加一个**加速度偏差补偿通道**: 修正 α-β 估计器对匀加速目标的结构性
-滞后, 使 Smith 误差 ê 在加速目标上不再系统性少报。控制律主体 (wn/Kp/Ki/
-FF_GAIN/CUSUM K·C·H/信任度/丢帧衰减) 与 ff_pi 完全一致; CUSUM 的 σ̂ 归一
-化也保持 ff_pi 原语义 (原始创新二阶矩 EMA — 失配伪创新自动撑宽告警门,
-该"失明"在过估延迟档是对回弹的有效阻尼, 实测保留更优)。稳健化只作用于
-新增的加速度传感器。
+控制律主体 (极点配置 PI + type-2 速度前馈 + 方向矛盾 CUSUM 速度归零重拉)
+之外带一个**加速度偏差补偿通道**: 修正 α-β 估计器对匀加速目标的结构性
+滞后, 使 Smith 误差 ê 在加速目标上不再系统性少报。CUSUM 的 σ̂ 归一化保持
+原始创新二阶矩 EMA 语义 (失配伪创新自动撑宽告警门, 该"失明"在过估延迟档
+是对回弹的有效阻尼, 实测保留更优)。稳健化只作用于加速度传感器。
 
 结构 (控制增益全部由标定延迟 L̂ 导出, 无手调参数):
     ê = f + (v̂+ε)·W + ½â·W² − s·Σcounts(in flight)      // Smith 预测误差
@@ -60,17 +59,16 @@ FF_GAIN/CUSUM K·C·H/信任度/丢帧衰减) 与 ff_pi 完全一致; CUSUM 的 
     自然速率向零衰减; 有证据时按门缩放进入。
 
 设计点 (失配带测试选定, 非手感): PM=50 (全延迟带 L20-80 通过的最快点);
-β0=0.03 (带边缘余量) — 与 ff_pi 相同。
+β0=0.03 (带边缘余量)。
 
-评测 (arena 实测, 默认种子; 与 ff_pi 逐位对比):
-    matched 114.7 (ff_pi 151.3): step 两场景 / const_vel / maneuver 逐位
-    相同; accel rmse 7.09→4.37, in_band 15.1%→77.6%。
-    失配扫描 L30-70 与 ff_pi 逐位相同 (worst 125.12); 宽延迟 L20-70 与
-    s {0.7..1.3} 全档逐位相同 (L80 settle-fail 持平); relock 386.0ms/
-    3.16px 逐位相同; fps_eval 事件过冲/恢复逐位相同, RMSE 20.75→20.40;
-    60/120fps 差 9.2%→1.9%; OVERALL 156.67→123.62。
-    holdout (seeds 4,5,6): matched 145.16→111.96, accel 6.61→4.36,
-    fpsΔ 16.8%→10.5%, OVERALL 168.51→139.37, 其余逐位相同。
+评测 (arena 实测, 默认种子):
+    matched 114.7 (step settle 277ms / 过冲 3.11px, const_vel rmse 0.82px,
+    accel rmse 4.37px in_band 77.6%, maneuver rmse 19.41px); 失配扫描
+    L30-70 全过 (worst 125.12); 宽延迟 L20-70 与 s {0.7..1.3} 全档通过
+    (L80 边缘 settle-fail); relock 386.0ms / 3.16px; fps_eval RMSE
+    20.40px, 事件过冲/恢复与门关闭路径一致; 60/120fps 差 1.9%; OVERALL
+    123.62。holdout (seeds 4,5,6): matched 111.96, accel 4.36px, OVERALL
+    139.37。
 
 debug() 字段语义 (px / px/ms / px/ms² / σ):
   ex, ey           Smith 汇装误差 ê (补偿后, 驱动 P/I)

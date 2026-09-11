@@ -1,6 +1,6 @@
 """arena/laws/imm_pi.py — 极点配置 PI + type-2 速度前馈, IMM 机动自适应估计器。
 
-结构 (与 ff_pi 同一控制回路, 估计器换代):
+结构 (与 ff_pi_acc 同一控制回路, 估计器换代):
     ê = f + v̂·(age+L̂·L_COMP) − s·Σcounts(in flight)        // Smith 预测误差
     wn = (90°−PM)·π/180 / L̂,  Kp = 2ζ·wn,  Ki = wn²          // 极点配置 (ζ=1)
     gate = I_GATE/(I_GATE+|ê|)                               // I 项距离门控
@@ -10,8 +10,12 @@
     模型0 低机动 CV (稳态速度增益 β=β0), 模型1 高机动 CV (Γ=√6 天花板)。
     每帧: 输入混合 → 各模型 Kalman 预测/更新 → 卡方门 + 似然 → 贝叶斯模型
     概率更新。模型状态各养各的, 混合值只作输出。
+    注: 模型更新用定常 Riccati 增益 k2 = pp01/S 直加于 v̂, 其量纲是"每样本
+    速度增益"; 按全库 α-β 每帧口径 (v += β_s·ν/dt) 实际 β_s = k2·T ≈ 8.3×
+    反解目标 β0 — 下文"低机动 β=β0"按反解目标理解, 实际动态更快 (该特性
+    与失配带翻车同源, 见文末)。
 
-估计器换代的意义 (对 ff_pi 的 "固定 β + CUSUM 归零重拉"):
+估计器换代的意义 (对 ff_pi_acc 的 "固定 β + CUSUM 归零重拉"):
     固定 β 是一个两难: β 大则机动响应快但噪声直通 FF、失配下估计器污染;
     β 小 (0.03) 则稳但 v̂ 重建 τ ≈ dt/β ≈ 280ms。IMM 把两头分开: 平稳期
     概率聚在低机动模型 (= 原 β0 动态), 机动期似然比几何累积在 2-3 帧内
@@ -27,18 +31,17 @@
          过门 (Smith 外推与 FF 同源); 混合创新 NIS (χ²₁) 超门 → w 立即
          归零 (单帧误伤率 = 99.9% 分位 = 0.1%), 门内向
          exp(−½·max(0, NIS−1)) 以 2 帧 EMA 恢复。v̂_low 是慢速地板
-         (β=β0, ff_pi 出厂动态)。
-      3. 幽灵猎杀 — 方向矛盾 CUSUM (同 ff_pi, σ 归一, 作用于 v̂_out):
+         (β=β0, 慢速出厂动态)。
+      3. 幽灵猎杀 — 方向矛盾 CUSUM (σ 归一, 作用于 v̂_out):
          告警即两模型速度归零 (位置保留), 环路重跑阶跃响应。
 
 实测成绩 (integrate + fps_eval, 匹配 L=50/120fps/噪声0.5):
-    matched composite 104.0 (ff_pi 151.3) — accel rmse 4.25px (ff_pi 7.09),
-    maneuver 13.63px (ff_pi 19.41), 全库最优; step settle 443ms 变慢
-    (低机动模式位置增益 ~0.58 vs α-β 的 0.50, 尾段略糊)。
-    FPS 组全库最优: RMSE 均值 17.1px (ff_pi 20.8), 事件过冲 mean 26.7 /
-    worst 69.7 (ff_pi 28.0 / 77.3), REC 7ms (ff_pi 44ms)。
+    matched composite 104.0 — accel rmse 4.25px, maneuver 13.63px;
+    step settle 443ms 变慢 (低机动模式位置增益 ~0.58 vs α-β 的 0.50,
+    尾段略糊)。
+    FPS 组: RMSE 均值 17.1px, 事件过冲 mean 26.7 / worst 69.7, REC 7ms。
 
-为何落选 — 失配带不存活 (OVERALL = inf):
+已知局限 — 失配带不存活 (OVERALL = inf):
     延迟失配 L30/L40/L70 与宽延迟 L20-40、L70-80、s0.70 全部 inf: L_真
     阶跃出现 ~43px 过冲的持续极限环 (非发散 — 是 settle 永远不进 3px 带)。
     根因链 (实测轨迹): 失配使 Smith 扣除窗口错位 Δc, 自身指令瞬态以
@@ -54,16 +57,16 @@
     限制、幅度不足以压住 ȧ_own·Δc 量级的污染; NIS 授权门拦得住幽灵
     出生, 拦不住吸收突发后自洽存活的幽灵; CUSUM 猎杀依赖 σ̂ 归一,
     σ̂ 膨胀后失明。
-    教训 (与 reseed_pi 的结论汇合): **常开的估计器侧快通道与失配带不相容**;
-    ff_pi 的 β0=0.03 慢速 + CUSUM 归零重拉是失配环境下经过验证的折中,
+    教训: **常开的估计器侧快通道与失配带不相容**;
+    β0=0.03 慢速 + CUSUM 归零重拉是失配环境下经过验证的折中,
     其重建尾代价 (280ms) 只影响事件后的尾迹, 不影响事件峰值 (峰值 =
     v·L 延迟下界 + 告警延迟)。
 
 参数表 (每项都有依据; σ_a 单位 px/ms², R = 测量噪声方差 px²):
     pm_deg=50, zeta=1, ff_gain=1, l_comp=1.1, i_gate=8, i_frac=1
-                 与 ff_pi 完全相同 (控制回路不动, 依据见 ff_pi docstring)。
+                 与 ff_pi_acc 完全相同 (控制回路不动, 依据见其 docstring)。
     SIG_A_LOW    反解自连续性原则: 取 σ_a,low 使 CV Kalman 稳态速度增益 β
-                 恰等于 ff_pi 出厂设计点 β0=0.03 (@120fps)。离散 Riccati
+                 恰等于出厂设计点 β0=0.03 (@120fps)。离散 Riccati
                  不动点数值反解 (模块加载时一次); β 只依赖无量纲群
                  Γ = σ_a·T²/σ_m, 故运行中 σ 变化时低机动模式动态不变。
     SIG_A_HIGH   可辨识性天花板: 三点差分能从检测里无偏看见的加速度上限,
@@ -78,7 +81,7 @@
     MU_FLOOR     0.05   低机动模型概率地板: 高机动模式速度噪声放大
                  ~3.4×, 概率永不全让它吃。
     W_TAU_FRAMES 2.0    FF 授权门上升 EMA 尺度 (帧): 与 CUSUM 告警延迟同级。
-    CUSUM_K/C/H  0.5/3/9 (σ 倍数, 同 ff_pi): 漂移 / 单帧增量上限 / 告警门限。
+    CUSUM_K/C/H  0.5/3/9 (σ 倍数): 漂移 / 单帧增量上限 / 告警门限。
     noise_std=0.5       测量噪声先验 (px/轴): σ̂ EMA 初值锚点, 实机在静止
                  场景实测; 运行中创新方差 EMA 自标定。
 """
@@ -129,22 +132,22 @@ class ImmPILaw(Law):
     JUMP_GATE = 100.0
     STALE = 200.0
     V0_STD = 1.0          # 初始速度先验 std (px/ms); 仅影响暂态
-    SIG2_EMA_BETA = 0.03  # 创新方差 EMA 速率 (@120fps, dt 归一; 同 ff_pi 的 σ 自标定)
+    SIG2_EMA_BETA = 0.03  # 创新方差 EMA 速率 (@120fps, dt 归一; σ 自标定)
     MARKOV_DIAG = 0.95
     CHI2_GATE = 10.8      # 1 自由度 99.9% 分位
     GATE_EPS = 0.01
     MU_FLOOR = 0.05
     W_TAU_FRAMES = 2.0    # FF 授权门上升 EMA 尺度 (帧, @120fps)
-    # CUSUM 参数 (均为 σ 倍数, 同 ff_pi): K 漂移 / C 单帧增量上限 / H 告警
+    # CUSUM 参数 (均为 σ 倍数): K 漂移 / C 单帧增量上限 / H 告警
     CUSUM_K = 0.5
     CUSUM_C = 3.0
     CUSUM_H = 9.0
-    BETA0 = 0.03          # ff_pi 出厂速度增益 — σ_a,low 的连续性锚点
+    BETA0 = 0.03          # 出厂速度增益 — σ_a,low 的连续性锚点
     GAMMA_HI = math.sqrt(6.0)  # 高机动模式跟踪指数 = 三点差分可辨识天花板
 
     def __init__(self, pm_deg=50.0, zeta=1.0, ff_gain=1.0, l_comp=1.1,
                  i_gate=8.0, i_frac=1.0, noise_std=0.5, max_v=1.5):
-        # 设计点与 ff_pi 完全一致 (PM=50 失配带全过最快点; ζ=1 临界阻尼)
+        # 设计点 (PM=50 失配带全过最快点; ζ=1 临界阻尼)
         self.pm_deg = pm_deg
         self.zeta = zeta
         self.ff_gain = ff_gain
@@ -205,7 +208,7 @@ class ImmPILaw(Law):
         pi_d, pi_o = self.MARKOV_DIAG, 1.0 - self.MARKOV_DIAG
 
         # 第一遍: 混合状态 (上一帧输出) 的 Smith 式创新 — σ 自标定与
-        # JUMP_GATE 判跳变均用它 (与 ff_pi 同口径)。
+        # JUMP_GATE 判跳变均用它。
         # b = s·(最近窗口 counts − 相信窗口 counts): 窗口错位 Δc=Lc−L_真 下
         # 自身指令瞬态伪装成创新的幅度, 突发方差的直接观测 (见 docstring)。
         nu = [0.0, 0.0]

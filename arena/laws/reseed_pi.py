@@ -2,13 +2,12 @@
 告警重播种 (模型破缺后 v̂ 从阶跃读数直达, 不从零重建), 种子带**精确窗差
 证据门** — 只有读数自身可信时才播种, 否则按归零重拉回退。
 
-结构 (与 ff_pi_acc — ff_pi 系现役载体 — 逐字节相同的控制回路与估计器, 只改 CUSUM 告警
-动作):
+结构 (控制回路与估计器与 ff_pi_acc 逐字节相同, 只改 CUSUM 告警动作):
     ê = f + v̂·(age+L̂·L_COMP) − s·Σcounts(in flight)        // Smith 预测误差
     wn = (90°−PM)·π/180 / L̂,  Kp = 2ζ·wn,  Ki = wn²          // 极点配置 (ζ=1)
     gate = I_GATE/(I_GATE+|ê|)                               // I 项距离门控
     v = Kp·ê + Ki·∫ê·gate + FF_GAIN_VAL·ff_gate·gap·v̂        // PI + type-2 前馈
-    方向矛盾 CUSUM (σ 归一) 告警 → **重播种** (ff_pi_acc 是归零重拉)。
+    方向矛盾 CUSUM (σ 归一) 告警 → **重播种**: v̂ 不经从零重建, 直接取矛盾 run 读数。
 
 原理: 矛盾 run 期间逐帧创新 νᵢ ≈ (v_真 − v̂ᵢ)·Tᵢ + 噪声, 本身就是速度
 阶跃的直接读数:
@@ -35,47 +34,41 @@
         显著性常数, 同基线); 否则播种 v̂ := v̂_pre + dv。
     平稳自身运动 (纯 FF 跟踪 — 恰是矛盾 run 的典型形态, 伪创新 ∝ a_own·Δc
     最小) 时窗差 J≈0, 门开; 自身剧烈加减速 (伪创新最大) 时 J 大, 门关 —
-    门与伪创新物理精确对齐。未触发告警的一切行为与 ff_pi 系逐字节相同,
+    门与伪创新物理精确对齐。未触发告警的一切行为与归零重拉基线逐字节相同,
     名义工况与失配 fallback 路径按构造继承。
 
-为何曾经的"落选"如今成立:
-    旧版防线用锚点瞬间自身加速度的一阶代理上界 |ȧ_own(锚点)|·δ — 单一瞬
-   间的泰勒近似, 在 counts 量化下"是否恰好为 0"近乎掷硬币, 门近乎随机开
-    合: 失配带 (L60/L70) 放进垃圾种子 (+8.8 最坏失配), holdout (seeds 4,5,6)
-    更在 L30 直接发散 (OVERALL inf)。精确窗差界覆盖整个 run 窗口与真实量
-    化, 实测把整条失配带压回基线之下并在 holdout 修复发散。残余代价: L70
-    125.58 vs 归零重拉 125.12 (+0.46) — L_真 > Lc 时帧外盲区 (最后
-    ~15ms) 中的目标变向与读数噪声不可观测, 是重播种的内在价格; 换来的是
-    maneuver/FPS 尾迹收益与全部失配/灵敏度档对基线的全面改进。
+为何门必须用精确窗差界 (而非锚点瞬间加速度的一阶代理):
+    一阶代理 |ȧ_own(锚点)|·δ 是单一瞬间的泰勒近似, 在 counts 量化下"是否
+    恰好为 0"近乎掷硬币, 门近乎随机开合 — 垃圾种子随门漏进失配档。精确窗
+    差界覆盖整个 run 窗口与真实量化, 把门与伪创新物理对齐。残余代价: L70
+    比归零重拉高 ~0.5 — L_真 > Lc 时帧外盲区 (最后 ~15ms) 中的目标变向与
+    读数噪声不可观测, 是重播种的内在价格; 换来的是 maneuver/FPS 尾迹收益
+    与全部失配/灵敏度档的通过。
 
 实测 (arena 默认种子 1,2,3):
-    matched 146.64 (旧版 148.35, ff_pi_acc 114.66): step 两场景/const_vel/
-    accel 逐位同旧版; maneuver rmse 17.48 (旧版 17.68, ff_pi_acc 19.41),
-    in_band 23.7% (旧版 21.1%)。
-    失配扫描 L30..70 = {83.68, 66.55, 81.09, 83.13, 125.58}, 最坏 125.58
-    (旧版 133.93; 归零重拉 ff_pi_acc 125.12 — 追平); 宽延迟 L20-80 =
-    {91.40, 80.26, 67.60, 78.25, 87.51, 121.90, inf} 全档优于旧版 (L80 仍
-    为基线同款 settle 刀锋); s 失配 0.7-1.3 = {102.75, 77.52, 78.25, 92.49,
-    109.96} 全档优于旧版; relock 386.0ms·3.16px 逐位一致; fps_eval clean
-    RMSE 20.68 (旧版 20.69) / flaky 21.51 (旧版 21.43); OVERALL 161.54
-    (旧版 161.78)。holdout (seeds 4,5,6): 旧版 L30 发散 → 本版 worst
-    123.31 无发散。
-    帧率: 60fps composite 165.29 vs 120fps 146.64 (差 12.7%, 旧版 10.3%) —
-    逐场景看 60fps 退化全部在 maneuver (+0.5px, +2.8%), step/const_vel/
-    accel 逐位一致; 120fps 侧 matched 改善使比值分母变小, 放大了百分数。
+    matched 146.64 (step 两场景/const_vel/accel 为归零重拉同款名义路径;
+    maneuver rmse 17.48, in_band 23.7%)。
+    失配扫描 L30..70 = {83.68, 66.55, 81.09, 83.13, 125.58}; 宽延迟
+    L20-80 = {91.40, 80.26, 67.60, 78.25, 87.51, 121.90, inf} (L80 为
+    settle 刀锋); s 失配 0.7-1.3 = {102.75, 77.52, 78.25, 92.49, 109.96};
+    relock 386.0ms·3.16px; fps_eval clean RMSE 20.68 / flaky 21.51;
+    OVERALL 161.54。holdout (seeds 4,5,6): worst 123.31, 无发散。
+    帧率: 60fps composite 165.29 vs 120fps 146.64 (差 12.7%) — 逐场景看
+    60fps 退化全部在 maneuver (+0.5px, +2.8%), step/const_vel/accel 逐位
+    一致; 120fps 侧 matched 变好使比值分母变小, 放大了百分数。
 
 参数 (全部无量纲设计选择或数值分辨率, 无手感量):
-    RUN_MAX = 5        矛盾 run 记录的创新帧数上限 (同基线; CUSUM 告警延迟
+    RUN_MAX = 5        矛盾 run 记录的创新帧数上限 (CUSUM 告警延迟
                        2-3 帧 + 少量裕量)
     BAND_FRAC = 0.6    延迟先验带半宽 = 0.6·L̂ (宽延迟验证带 L20-80 的相对
-                       半宽; 同旧版, 先验来源 = 标定精度要求)
+                       半宽; 先验来源 = 标定精度要求)
     J_GRID = 0.5       J 界的移位扫描网格 = 0.5·控制拍 (数值分辨率: counts
                        历史按拍分段线性, 半拍保证过所有折点; 非行为参数)
     J_AGG = "max"      run 内 J 聚合取最坏读数 (界语义: max ≥ mean, 不依赖
                        单读数低估的侥幸)
-    3σ_seed            播种显著性 (标准显著性常数, 同旧版/ff_pi 系)
+    3σ_seed            播种显著性 (标准显著性常数)
     CUSUM K/C/H = 0.5/3/9σ, β0=0.03, PM=50, ζ=1, L_COMP=1.1, I_GATE=8 …
-                       全部与 ff_pi 系相同, 依据见 ff_pi_acc docstring。
+                       与 ff_pi_acc 相同, 依据见其 docstring。
 
 debug() 字段语义 (px / px/ms / px/ms² / σ / 0-1):
   ex, ey           Smith 汇装误差 ê
@@ -108,11 +101,11 @@ class ReseedPILaw(Law):
     DT0 = 1000.0 / 120.0
     JUMP_GATE = 100.0
     STALE = 200.0
-    # CUSUM 参数 (均为 σ 倍数, 无量纲): 同 ff_pi 系
+    # CUSUM 参数 (均为 σ 倍数, 无量纲)
     CUSUM_K = 0.5
     CUSUM_C = 3.0
     CUSUM_H = 9.0
-    BETA0 = 0.03                       # 出厂速度增益 (与 ff_pi 系一致)
+    BETA0 = 0.03                       # 出厂速度增益
     RUN_MAX = 5                        # 矛盾 run 记录的创新帧数上限
     BAND_FRAC = 0.6                    # 延迟先验带半宽 = 0.6·L̂ (宽延迟验证带 L20-80)
     J_GRID = 0.5                       # J 界的移位网格 = 0.5·控制拍 (数值分辨率:
@@ -169,7 +162,7 @@ class ReseedPILaw(Law):
         self._dbg = {}
 
     def _w_update(self, cfg: LawConfig, h: float) -> float:
-        """信任度: CUSUM 告警电平 → 非对称滤波 (同 ff_pi 系)。"""
+        """信任度: CUSUM 告警电平 → 非对称滤波。"""
         self._w_inst = min(1.0, max(self.csx, self.csy) / self.CUSUM_H)
         a = 1.0 - math.exp(-h / (2.0 * self.DT0))
         d = 1.0 - math.exp(-h / max(1.0, cfg.L))
@@ -358,7 +351,7 @@ class ReseedPILaw(Law):
                 if not wy:
                     self.int_y = max(-i_lim, min(i_lim, self.int_y + ey * cfg.h * gate))
 
-            # FF 门控 = 信任度插值 (同 ff_pi 系)
+            # FF 门控 = 信任度插值
             frame_dt = cfg.frame_dt if cfg.frame_dt > 0 else self.DT0
             gap_scale = 1.0 - max(0.0, min(1.0, (age - frame_dt) / max(1.0, cfg.L)))
             ff_gate = gate + (1.0 - gate) * (1.0 - w_state)

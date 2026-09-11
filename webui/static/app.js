@@ -436,7 +436,7 @@ function renderParams() {
 function renderParamsMeta() {
   const inst = S.state.instance;
   const p = curProfile();
-  // 漂移提示 (Q2): 保存值与脚本现值不一致 → 提示 + 一键采用脚本值
+  // 漂移提示: 保存值与脚本现值不一致 → 提示 + 一键采用脚本值
   const db = $("#driftBanner");
   const dkey = p ? p.drift.join(",") : "";
   if (S._driftSig !== dkey) {
@@ -506,7 +506,7 @@ async function startInstance() {
   try {
     if (S.dirty) await saveProfile(true);
     if (window.Notification && Notification.permission === "default") {
-      Notification.requestPermission();     // 异常退出桌面通知 (Q5), 用户手势里申请
+      Notification.requestPermission();     // 异常退出桌面通知, 用户手势里申请
     }
     await api("/api/instance/start", { method: "POST", body: { profile: S.selected } });
     toast("启动序列已开始 (jetson_clocks → 鼠标 → aimbot), 看下方步骤与日志", "ok");
@@ -892,11 +892,6 @@ function bindEvents() {
 
   window.addEventListener("beforeunload", e => {
     if (S.dirty) { e.preventDefault(); e.returnValue = ""; }
-  });
-  document.addEventListener("visibilitychange", () => {
-    if (!document.hidden && Notification && Notification.permission === "default") {
-      /* 不主动要权限, 用户点过才用 */
-    }
   });
 }
 

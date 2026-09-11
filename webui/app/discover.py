@@ -2,7 +2,7 @@
 
 只按固定结构发现 (scripts/game/, engine/, onnx/, /dev/v4l/by-id/), 不递归扫全盘。
 game 脚本只读解析 (顶部 VAR=value 块), WebUI 从不改写脚本 —— 唯一的脚本写回
-仍是固件经 -S 的标定回写机制。profile 参数持久化在 webui/data/profiles/<脚本名>.json,
+是固件经 -S 的标定回写机制。profile 参数持久化在 webui/data/profiles/<脚本名>.json,
 首扫时以脚本值播种; 之后保存值与脚本值分叉即"漂移", 由 UI 提示。
 """
 import json

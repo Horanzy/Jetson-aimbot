@@ -32,7 +32,7 @@ def step_metrics(res, scenario):
         if v > band:
             last_out = t[i]
     settle = last_out if e[-1] <= band else float("inf")
-    # direction-agnostic rebound: after first reaching the target, max |e| deviation (any direction)
+    # 方向无关回弹: 首次到达目标后, 任意方向的最大 |e| 偏离
     overshoot = max(e[first_reach_i:]) if first_reach_i is not None else float("inf")
     return {"diverged": False, "settle_ms": settle, "overshoot_px": overshoot,
             "first_reach_ms": first_reach, "final_err_px": e[-1]}
