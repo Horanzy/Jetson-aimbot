@@ -35,8 +35,8 @@ FF 的 ghost-v̂ 防护 (三层, 辖区不相交):
       (d_tol_frac, 设计值), 幻影上界 junk = s·0.5·L̂·|a_own|·fdt (每帧)。
       att = σ̂/(σ̂+junk) (EMA τ=2fdt): 瞬态期 (自身加减速) FF 按信任度撤出 —
       瞬态本就由 P/弹道段主导; 稳态跟踪 (a_own≈0) 满强度。junk 与 fdt 同阶
-      缩放 → 门控帧率对称 (实测 fpsΔ 1%)。a_own 由 counts 历史差分 (真实
-      工厂速度): v_own 基线 2fdt, 差分间隔 4fdt (counts 量化噪声压到
+      缩放 → 门控帧率对称 (实测 fpsΔ 1%)。a_own 由 counts 历史差分 (被控
+      对象即准星的真实速度): v_own 基线 2fdt, 差分间隔 4fdt (counts 量化噪声压到
       0.001 px/ms² 量级, 低于真实目标加速度)。
    2. ff_sur 当拍惊讶门 (只在 att ≥ 0.5 时武装): 单帧创新超 2σ = 模型破缺的
       当拍证据 (急停/落地/折返)。FF 是软撤出 (乘性, 无重置踢脚), 可以当拍
@@ -242,7 +242,7 @@ class BallisticFFLaw(Law):
 
         Smith 窗错位幻影 ∝ (L_true−L̂)·a_own, 标定只保证 |Δ| ≲ 0.5·L̂,
         幻影上界 junk = s·0.5·L̂·|a_own|·fdt (每帧)。a_own 由 counts 历史
-        差分 (真实工厂速度): v_own 基线 2fdt, 差分间隔 4fdt — counts 量化
+        差分 (被控对象（准星）真实速度): v_own 基线 2fdt, 差分间隔 4fdt — counts 量化
         噪声压到低于真实目标加速度的量级。"""
         cfg = self.cfg
         fdt = cfg.frame_dt if cfg.frame_dt > 0 else self.DT0
