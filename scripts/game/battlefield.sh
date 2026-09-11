@@ -1,6 +1,6 @@
-﻿#!/bin/bash
+#!/bin/bash
 # ==============================================================================
-#  战地启动脚本 — AI 视觉自瞄 (ff_pi_acc 控制律)
+#  战地 启动脚本 — AI 视觉自瞄 (ff_pi_acc 控制律)
 #  控制律带宽由标定延迟 L 自动导出, 免手调。路径相对脚本自身解析, 与部署位置无关。
 #  标定: 游戏内对准有细节的静止背景, 双侧键长按 5 秒 (画正方形→点头/摇头),
 #        成功后自动回写下方 S_EST / L_EST。
@@ -19,6 +19,7 @@ CAM_DEV="Asus"      # 采集卡: Hagibis / Asus (或 /dev/videoN)
 CAM_FPS=120         # 采集帧率: 120 / 60
 MAX_SPEED=1500      # 速度上限 px/s
 AIM_KEY=both        # 触发键: fire / ads / both
+FOV_R=150          # FOV 半径 px (目标选取门, webui 可热调; 若 Jetson 旧脚本有别的值请改回)
 PREVIEW="n"         # 预览窗口: y / n
 
 # ---- 训练数据采集 (开关) ----
@@ -56,5 +57,6 @@ sudo "$APP" \
   -l "$L_EST" \
   -S "$SCRIPT_PATH" \
   -k "$AIM_KEY" \
+  -r "$FOV_R" \
   -v "$PREVIEW" \
   $CAPTURE_ARGS
