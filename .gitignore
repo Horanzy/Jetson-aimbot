@@ -1,9 +1,10 @@
-# Python
+# ---- Python ----
 .venv/
+venv/
 __pycache__/
-*.pyc
+*.py[cod]
 
-# 编译产物 / 大文件 (模型权重不进仓库)
+# ---- 编译产物 / 模型 (bin/engine/onnx/dataset 只留在部署机, 不进仓库) ----
 bin/
 engine/
 onnx/
@@ -12,8 +13,13 @@ dataset/
 *.onnx
 trt_timing_cache.cache
 
-# WebUI 运行时状态 (config/token/profile 参数/历史), 只留在设备上
+# ---- WebUI 运行时状态 (config/profile/历史, 只留在设备上) ----
 webui/data/
 
-# arena trace 过程可视化输出 (CSV/PNG/基线留档, 只留在本地)
+# ---- arena 诊断输出 (trace CSV/PNG, 可再生) ----
 arena/trace_out/
+
+# ---- OS 杂物 ----
+.DS_Store
+Thumbs.db
+desktop.ini
