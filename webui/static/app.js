@@ -1,6 +1,8 @@
 /* aimbot WebUI 前端 (无构建, 原生 JS)。
-   数据面: 启动时 GET /api/state 全量, 之后单条 WebSocket 增量 (日志按 seq, 遥测 2s)。
-   编辑面: profile 参数的工作副本 + dirty 跟踪; 保存 = PUT, 启动 = 保存 + 清场 + 拉起。 */
+   数据面: 启动时 GET /api/state 全量, 之后单条 WebSocket 增量 (日志按 seq, FPS/扫描按游标, 遥测 2s)。
+   认证面: 日常密码登录 (首次凭 token 设密码), 登录换回 token 后与旧管道完全一致。
+   参数面: 脚本 = 唯一事实源 —— 表单从脚本解析值播种, 【保存】写回脚本后回读刷新;
+   SSH 改脚本经 WS 的 scan 推送自动跟随 (编辑中的表单不被覆盖)。 */
 "use strict";
 
 /* ================= 工具 ================= */
@@ -52,10 +54,12 @@ const S = {
   token: localStorage.getItem("wb_token") || "",
   state: null,
   selected: localStorage.getItem("wb_profile") || "",
-  params: null, savedParams: null, displayName: "",
+  params: null, savedParams: null,
   dirty: false,
   ws: null, wsSeq: 0, wsBackoff: 1000,
   logBuf: [], follow: true,
+  fpsHist: [],                        // 本次运行 [AI FPS] 读数 [[ts, fps]] (会话级, 重启清空)
+  capFolder: null, capFolderName: "", capDir: "",
   theme: localStorage.getItem("wb_theme") || "dark",
   taskLogs: {}, taskOpen: {},
   openInfo: new Set(),                // 已展开 ⓘ 的参数 key (跨重渲染保持)
@@ -71,7 +75,10 @@ async function api(path, opts) {
     opts.headers["Content-Type"] = "application/json";
   }
   const r = await fetch(path, opts);
-  if (r.status === 401) { showTokenModal(); throw new Error("需要 token"); }
+  if (r.status === 401) {
+    if ($("#tokenModal").classList.contains("hidden")) initAuth();
+    throw new Error("需要登录");
+  }
   if (!r.ok) {
     let msg = "HTTP " + r.status;
     try { msg = (await r.json()).detail || msg; } catch (e) { /* keep */ }
@@ -130,24 +137,78 @@ function toggleTheme() {
   applyTheme();
 }
 
-/* ================= token ================= */
-function showTokenModal() {
+/* ================= 认证 (密码为主, token 万能兜底) ================= */
+const Auth = { mode: "password" };   // password | token | setup
+
+function showAuthModal(mode) {
+  Auth.mode = mode || "password";
   $("#tokenModal").classList.remove("hidden");
-  $("#tokenEntry").focus();
+  $("#tokenErr").classList.add("hidden");
+  const conf = {
+    setup: { title: "首次设置", btn: "设置并登录",
+      hint: "输入 token 验证身份, 并为这台 WebUI 设置登录密码 (至少 4 位)。token 打印在服务日志: journalctl -u aimbot-webui",
+      tok: true, pass: true, pass2: true, sw: "" },
+    password: { title: "登录", btn: "登录",
+      hint: "输入密码登录 WebUI。",
+      tok: false, pass: true, pass2: false, sw: "改用 token 登录" },
+    token: { title: "登录", btn: "登录",
+      hint: "输入 token 登录 (万能凭证; URL ?token=… 直达等效)。登录后可在设置页改密码。",
+      tok: true, pass: false, pass2: false, sw: "改用密码登录" },
+  }[Auth.mode];
+  $("#authTitle").textContent = conf.title;
+  $("#authHint").textContent = conf.hint;
+  $("#authTokenRow").classList.toggle("hidden", !conf.tok);
+  $("#authPassRow").classList.toggle("hidden", !conf.pass);
+  $("#authPass2Row").classList.toggle("hidden", !conf.pass2);
+  $("#btnAuthSwitch").classList.toggle("hidden", !conf.sw);
+  $("#btnAuthSwitch").textContent = conf.sw;
+  $("#btnTokenOk").textContent = conf.btn;
+  $(Auth.mode === "password" ? "#authPass" : "#authToken").focus();
 }
-async function submitToken() {
-  const t = $("#tokenEntry").value.trim();
-  if (!t) return;
-  const r = await fetch("/api/auth/check", { headers: { "X-WebUI-Token": t } });
-  if (r.ok) {
-    S.token = t;
-    localStorage.setItem("wb_token", t);
-    $("#tokenModal").classList.add("hidden");
-    $("#tokenErr").classList.add("hidden");
-    boot();
-  } else {
-    $("#tokenErr").classList.remove("hidden");
+
+function authFail(msg) {
+  $("#tokenErr").textContent = msg;
+  $("#tokenErr").classList.remove("hidden");
+}
+
+async function submitAuth() {
+  let r;
+  try {
+    if (Auth.mode === "setup") {
+      const pw = $("#authPass").value;
+      if (pw.length < 4) return authFail("密码至少 4 位");
+      if (pw !== $("#authPass2").value) return authFail("两次输入的密码不一致");
+      r = await fetch("/api/auth/setup", { method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token: $("#authToken").value.trim(), password: pw }) });
+    } else if (Auth.mode === "password") {
+      r = await fetch("/api/auth/login", { method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ password: $("#authPass").value }) });
+    } else {
+      r = await fetch("/api/auth/login", { method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token: $("#authToken").value.trim() }) });
+    }
+  } catch (err) { return authFail("网络错误: " + err.message); }
+  if (!r.ok) {
+    let msg = "登录失败 (HTTP " + r.status + ")";
+    try { msg = (await r.json()).detail || msg; } catch (e) { /* keep */ }
+    return authFail(msg);
   }
+  const doc = await r.json();
+  S.token = doc.token;
+  localStorage.setItem("wb_token", doc.token);
+  $("#tokenModal").classList.add("hidden");
+  boot();
+}
+
+async function initAuth() {
+  let hasPw = true;
+  try {
+    hasPw = (await (await fetch("/api/auth/mode")).json()).has_password;
+  } catch (e) { /* 探测失败回退密码模式 */ }
+  showAuthModal(hasPw ? "password" : "setup");
 }
 
 /* ================= 状态获取 ================= */
@@ -158,8 +219,11 @@ async function fetchState() {
   const fresh = logs.filter(l => l[0] > S.wsSeq);
   if (fresh.length) { appendLogs(fresh); S.wsSeq = fresh[fresh.length - 1][0]; }
   else if (!S.logBuf.length) { appendLogs(logs); S.wsSeq = logs.length ? logs[logs.length - 1][0] : 0; }
+  S.fpsHist = st.fps_hist || [];
   if (!S.params) selectProfile(pickDefaultProfile(), { force: true });
   renderAll();
+  renderFpsPanel();
+  pollCapFolder();
 }
 
 function pickDefaultProfile() {
@@ -182,13 +246,12 @@ function selectProfile(stem, opts) {
   S.selected = stem || "";
   localStorage.setItem("wb_profile", S.selected);
   const p = curProfile();
-  const saved = p && p.has_saved && Object.keys(p.saved).length ? p.saved : (p ? p.script_params : {});
-  S.params = Object.assign({}, blankParams(), saved);
+  S.params = Object.assign({}, blankParams(), p ? p.script_params : {});
   S.savedParams = Object.assign({}, S.params);
-  S.displayName = p ? p.display_name : "";
   S.dirty = false;
   renderParams();
   renderAll();
+  pollCapFolder();
 }
 function blankParams() {
   const o = {};
@@ -219,7 +282,6 @@ function renderTopbar() {
     sel.value = S.selected;
   }
   $("#profileTitle").textContent = "游戏 profile — " + (curProfile() ? curProfile().display_name : "（无）");
-  $("#displayName").value = S.displayName;
 
   const inst = st.instance, tel = st.telemetry;
   const chips = [];
@@ -290,9 +352,18 @@ function renderRunTab() {
   const model = S.params && S.params.model ? String(S.params.model).split("/").pop() : "（未选）";
   const calib = inst.calib_live || (p ? p.calib : null);
   const soc = tel && tel.soc_temp != null ? tel.soc_temp : null;
+  const cap = inst.capture;
+  const capTotal = cap ? cap.fire + cap.det + cap.auto : null;
+  const capSmall = cap ? "fire " + cap.fire + " · det " + cap.det + " · auto " + cap.auto
+                       : (inst.adopted ? "认领实例无日志" : "");
+  const mi = inst.model_info;
   const cards = [
     { k: "模型 (选中)", v: esc(model) },
-    { k: "帧率 (日志)", v: inst.fps != null ? inst.fps : "—", small: "fps", cls: inst.fps >= 100 ? "ok" : (inst.fps != null ? "warn" : "") },
+    { k: "模型架构", v: mi ? esc(mi.arch) : "—", small: mi && mi.classes != null ? mi.classes + " 类" : "", t: "每次启动从固件控制台输出抓取; v8 与 v11 在输出层不可区分, 固件打印 YOLOv8/11" },
+    { k: "输入尺寸", v: mi ? mi.size : "—", small: mi ? "px" : "", t: "模型输入分辨率, 每次启动从固件控制台输出抓取" },
+    { k: "帧率 (自动识别)", v: inst.fps != null ? inst.fps : "—", small: "fps", cls: inst.fps >= 100 ? "ok" : (inst.fps != null ? "warn" : "") },
+    { k: "截图 本次", v: capTotal != null ? capTotal : "—", small: capSmall, t: "本次运行固件累计截图; 重新【启动】归零" },
+    { k: "截图 文件夹", v: S.capFolder != null ? S.capFolder : "—", small: S.capFolderName || "输出目录", t: S.capDir || "输出目录内全部截图 (10s 刷新)" },
     { k: "CPU", v: tel && tel.cpu != null ? tel.cpu : "—", small: "%" },
     { k: "GPU", v: tel && tel.gpu != null ? tel.gpu : "—", small: "%" },
     { k: "内存", v: tel && tel.mem ? tel.mem.percent : "—", small: tel && tel.mem ? "· " + tel.mem.used_mb + "MB" : "" },
@@ -301,7 +372,7 @@ function renderRunTab() {
     { k: "热参数通道", v: inst.state === "running" ? (inst.hot_capable ? "已启用" : "不可用") : (S.state.scan.binary && S.state.scan.binary.hot_capable ? "固件支持" : "固件不支持"), small: inst.hot_port ? ":" + inst.hot_port : "", cls: (inst.state === "running" && !inst.hot_capable) ? "warn" : (inst.hot_capable ? "ok" : "") },
   ];
   $("#statusCards").innerHTML = cards.map(c =>
-    `<div class="stat ${c.cls || ""}"><div class="k">${c.k}</div><div class="v">${c.v}<small>${c.small || ""}</small></div></div>`).join("");
+    `<div class="stat ${c.cls || ""}"${c.t ? ` title="${esc(c.t)}"` : ""}><div class="k">${c.k}</div><div class="v">${c.v}<small>${c.small || ""}</small></div></div>`).join("");
 
   // 运行横幅
   const rb = $("#runBanner");
@@ -370,6 +441,47 @@ function rerenderLog() {
   box.scrollTop = box.scrollHeight;
 }
 
+/* ================= AI FPS 历史 (会话级: 重新启动即清空) ================= */
+function renderFpsPanel() {
+  const card = $("#fpsHistCard");
+  if (!card || card.classList.contains("hidden")) return;
+  const h = S.fpsHist || [];
+  const sum = $("#fpsHistSummary"), spark = $("#fpsSpark"), tbl = $("#fpsHistTable");
+  $("#fpsHistBody").classList.toggle("hidden", !card.open);
+  if (!card.open) return;
+  if (!h.length) {
+    sum.textContent = "本次运行还没有 [AI FPS] 读数 (固件每 60 秒记一次; 认领实例无日志)。";
+    spark.innerHTML = ""; tbl.innerHTML = "";
+    return;
+  }
+  const vals = h.map(x => x[1]);
+  const avg = vals.reduce((a, b) => a + b, 0) / vals.length;
+  sum.innerHTML = `样本 <b>${h.length}</b> · 最新 <b>${vals[vals.length - 1]}</b> fps · ` +
+    `最低 <b>${Math.min(...vals)}</b> · 最高 <b>${Math.max(...vals)}</b> · 均值 <b>${avg.toFixed(1)}</b>`;
+  const recent = vals.slice(-120);
+  const vmax = Math.max(...recent, 1);
+  spark.innerHTML = recent.map(v =>
+    `<i style="height:${Math.max(4, Math.round(v / vmax * 100))}%" title="${v} fps"></i>`).join("");
+  tbl.innerHTML = `<table class="tbl"><tr><th>时间</th><th>AI FPS</th></tr>` +
+    h.slice(-15).reverse().map(([ts, v]) =>
+      `<tr><td>${fmtClock(ts)}</td><td>${v}</td></tr>`).join("") + `</table>`;
+}
+
+/* ================= 截图文件夹计数 (10s 轮询) ================= */
+async function pollCapFolder() {
+  const inst = S.state && S.state.instance;
+  // 运行中优先看正在写的那份 profile 的输出目录; 其余时候看当前选中的
+  const stem = (inst && RUNNING.includes(inst.state) && inst.profile && !inst.adopted)
+    ? inst.profile : S.selected;
+  if (!stem) { S.capFolder = null; S.capFolderName = ""; S.capDir = ""; return; }
+  try {
+    const r = await api("/api/capture/count?profile=" + encodeURIComponent(stem));
+    S.capFolder = r.total;
+    S.capFolderName = r.exists ? r.dir_name : r.dir_name + " (不存在)";
+    S.capDir = r.dir;
+  } catch (e) { /* profile 切换瞬间可能 404, 下轮再取 */ }
+}
+
 /* ================= 渲染: 参数页 ================= */
 function paramRow(d) {
   if (d.showIf && !S.params[d.showIf]) return "";
@@ -400,7 +512,7 @@ function paramRow(d) {
     ctl = dynSelect(d.key, v, cams, "未发现采集卡");
   } else if (d.type === "dataset") {
     const dirs = (S.state.scan.dataset_dirs || []).map(n => ({ v: "dataset/" + n, t: "dataset/" + n }));
-    dirs.unshift({ v: "dataset/" + (S.displayName || S.selected || "game"), t: "dataset/" + (S.displayName || S.selected || "game") + " (建议)" });
+    dirs.unshift({ v: "dataset/" + (S.selected || "game"), t: "dataset/" + (S.selected || "game") + " (建议)" });
     ctl = dynSelect(d.key, v, dirs, "未设置");
   }
   const changed = !sameVal(v, S.savedParams[d.key]);
@@ -435,29 +547,12 @@ function renderParams() {
 
 function renderParamsMeta() {
   const inst = S.state.instance;
-  const p = curProfile();
-  // 漂移提示: 保存值与脚本现值不一致 → 提示 + 一键采用脚本值
-  const db = $("#driftBanner");
-  const dkey = p ? p.drift.join(",") : "";
-  if (S._driftSig !== dkey) {
-    S._driftSig = dkey;
-    if (p && p.has_saved && p.drift && p.drift.length) {
-      const names = p.drift.map(k => {
-        const d = PARAM_DEFS.find(x => x.key === k);
-        return d ? d.label : k;
-      }).join("、");
-      db.innerHTML = `⚠ 脚本在 SSH 侧被改过: <b>${esc(names)}</b> 与已保存设置不一致。` +
-        `<button class="btn small" id="btnAdoptScript">采用脚本值</button>` +
-        `<span class="hint"> 或保留当前保存值 (启动时以保存值为准)</span>`;
-      db.className = "banner";
-    } else { db.className = "banner hidden"; db.innerHTML = ""; }
-  }
   const hb = $("#hotBanner");
   if (inst.state === "running") {
     hb.textContent = inst.adopted
       ? "运行中的是认领实例: 不盲发热参数; 按【启动】以当前设置接管后, 热参数才可即时下发"
       : inst.hot_capable
-        ? "实例运行中 — 🔥 热参数保存后即时下发 (回执看日志 [热参] 行), ❄ 冷参数下次启动生效"
+        ? "实例运行中 — 🔥 热参数保存后即时写回脚本并下发 (回执看日志 [热参] 行), ❄ 冷参数下次启动生效"
         : "运行中的固件是旧版 (无热参数通道): 热参数保存后要等下次【启动】才生效 — 重编译固件可启用";
     hb.className = "banner info";
   } else hb.className = "banner info hidden";
@@ -480,20 +575,22 @@ function markDirty() {
 
 /* ================= 保存 / 启动 / 停止 ================= */
 async function saveProfile(silent) {
-  const body = { display_name: $("#displayName").value.trim() || S.selected, params: S.params };
-  const r = await api("/api/profiles/" + encodeURIComponent(S.selected), { method: "PUT", body });
+  const r = await api("/api/profiles/" + encodeURIComponent(S.selected),
+                      { method: "PUT", body: { params: S.params } });
   S.savedParams = Object.assign({}, S.params);
   S.dirty = false;
+  // 脚本是唯一事实源: 保存 = 服务端已写回脚本; 拉回最新扫描并回读刷新表单 (显示规范值)
+  try { S.state.scan = await api("/api/scan", { method: "POST" }); } catch (e) { /* 下次对齐 */ }
   if (!silent) {
     if (r.hot_applied && Object.keys(r.hot_applied).length) {
-      toast("已保存; 热参数已下发: " + Object.entries(r.hot_applied).map(([k, v]) => k + "=" + v).join("  ") + " — 生效回执看日志", "ok");
+      toast("已保存并写回脚本; 热参数已下发: " + Object.entries(r.hot_applied).map(([k, v]) => k + "=" + v).join("  ") + " — 生效回执看日志", "ok");
     } else if (r.hot_reason) {
-      toast("已保存; " + r.hot_reason, "warn");
+      toast("已保存并写回脚本; " + r.hot_reason, "warn");
     } else {
-      toast("已保存", "ok");
+      toast("已保存并写回脚本", "ok");
     }
   }
-  renderParamsMeta();
+  selectProfile(S.selected, { force: true });
   return r;
 }
 
@@ -511,6 +608,7 @@ async function startInstance() {
     await api("/api/instance/start", { method: "POST", body: { profile: S.selected } });
     toast("启动序列已开始 (jetson_clocks → 鼠标 → aimbot), 看下方步骤与日志", "ok");
     showTab("run");
+    pollCapFolder();
   } catch (e) { toast("启动失败: " + e.message, "err"); }
 }
 
@@ -630,6 +728,9 @@ function renderSettings() {
   $("#bindSel").value = cfg.bind;
   if (document.activeElement !== $("#portInput")) $("#portInput").value = cfg.port;
   if (document.activeElement !== $("#tokenInput")) $("#tokenInput").value = cfg.token;
+  $("#pwState").textContent = cfg.has_password
+    ? "已设置密码 (其它浏览器忘记密码时, 仍可用上面的 token 登录)"
+    : "未设置 — 首次打开页面时会要求凭 token 设置密码";
   $("#svcHint").textContent = (cfg.is_root ? "服务以 root 运行 ✓ " : "服务不是 root — jetson_clocks/USB 初始化/启动会失败, 见 webui/README.md ") +
     "· 热参数端口 127.0.0.1:" + cfg.hot_port + " · 修改监听/端口后需重启服务 (sudo systemctl restart aimbot-webui)";
   const lines = [];
@@ -655,6 +756,16 @@ function connectWS() {
     const m = JSON.parse(ev.data);
     if (m.type !== "tick") return;
     if (m.log && m.log.length) { appendLogs(m.log); S.wsSeq = m.log[m.log.length - 1][0]; }
+    if (m.fps_new) {
+      if (m.fps_new.from === 0) S.fpsHist = m.fps_new.items;   // 重连后整表替换
+      else S.fpsHist.push(...m.fps_new.items);
+      renderFpsPanel();
+    }
+    if (m.scan) {
+      S.state.scan = m.scan;                 // 服务端 ~5s 重扫: 脚本被 SSH 改动能到达页面
+      if (!S.dirty) selectProfile(S.selected, { force: true });   // 表单干净 → 自动跟随脚本现值
+      else renderParamsMeta();               // 有未保存改动 → 不覆盖正在编辑的表单
+    }
     S.state.instance = m.instance;
     S.state.tasks = m.tasks;
     if (m.telemetry) S.state.telemetry = m.telemetry;
@@ -692,21 +803,20 @@ function showTab(name) {
 function openCopyModal() {
   const p = curProfile();
   if (!p) return;
-  $("#copyDisplay").value = p.display_name + " 副本";
   $("#copyFile").value = p.file + "_copy";
   $("#copyErr").classList.add("hidden");
   $("#copyModal").classList.remove("hidden");
-  $("#copyDisplay").focus();
+  $("#copyFile").focus();
 }
 async function doCopyProfile() {
   const p = curProfile();
   try {
     const r = await api(`/api/profiles/${encodeURIComponent(p.file)}/copy`, {
       method: "POST",
-      body: { display_name: $("#copyDisplay").value.trim(), file_name: $("#copyFile").value.trim() },
+      body: { file_name: $("#copyFile").value.trim() },
     });
     $("#copyModal").classList.add("hidden");
-    toast("已创建副本: " + r.display_name + " (" + r.file + ".sh)", "ok");
+    toast("已创建副本: " + r.file + ".sh (参数随源)", "ok");
     if (S.dirty && !confirm("当前有未保存改动, 切到新副本将丢弃。继续?")) { fetchState(); return; }
     S.dirty = false;
     S.selected = r.file;
@@ -739,16 +849,6 @@ function bindEvents() {
   $("#btnCopyProfile").addEventListener("click", openCopyModal);
   $("#btnCopyCancel").addEventListener("click", () => $("#copyModal").classList.add("hidden"));
   $("#btnCopyOk").addEventListener("click", doCopyProfile);
-  // 漂移: 一键采用脚本值
-  $("#driftBanner").addEventListener("click", async e => {
-    if (!e.target.closest("#btnAdoptScript")) return;
-    const p = curProfile();
-    if (!p) return;
-    S.params = Object.assign(blankParams(), p.script_params);
-    await saveProfile().catch(e2 => toast("保存失败: " + e2.message, "err"));
-    renderParams();
-    toast("已采用脚本值并保存", "ok");
-  });
 
   // 参数编辑 (事件委托)
   $("#paramGroups").addEventListener("input", e => {
@@ -842,23 +942,36 @@ function bindEvents() {
   });
   $("#btnTokenReset").addEventListener("click", async () => {
     if (!confirm("重置 token? 当前这台浏览器的连接也会失效 (本页会自动换新 token)。" +
-        "其它已打开的页面将要求重新输入。")) return;
+        "其它已打开的页面将要求重新登录 (密码或新 token)。")) return;
     try {
       const r = await api("/api/token/reset", { method: "POST" });
       S.token = r.token;
       localStorage.setItem("wb_token", r.token);
       $("#tokenInput").value = r.token;
-      toast("token 已重置", "ok");
+      toast("token 已重置 (密码不受影响)", "ok");
       connectWS();
     } catch (e) { toast("重置失败: " + e.message, "err"); }
   });
 
-  // 参数导出 / 导入 (纯前端; 导入只进表单, 保存后才落盘)
+  // 密码 (登录态内修改; token 持有者也可改, 与重置 token 同级)
+  $("#btnPwSave").addEventListener("click", async () => {
+    const pw = $("#pwNew").value;
+    if (pw.length < 4) { toast("密码至少 4 位", "err"); return; }
+    try {
+      await api("/api/auth/password", { method: "POST", body: { password: pw } });
+      $("#pwNew").value = "";
+      S.state.config.has_password = true;
+      $("#pwState").textContent = "已设置密码 (其它浏览器忘记密码时, 仍可用上面的 token 登录)";
+      toast("密码已更新", "ok");
+    } catch (e) { toast("设置失败: " + e.message, "err"); }
+  });
+
+  // AI FPS 历史面板
+  $("#fpsHistCard").addEventListener("toggle", renderFpsPanel);
+
+  // 参数导出 / 导入 (纯前端; 导入只进表单, 保存后才写回脚本)
   $("#btnExportParams").addEventListener("click", () => {
-    const data = JSON.stringify({
-      display_name: $("#displayName").value.trim() || S.selected,
-      params: S.params,
-    }, null, 2);
+    const data = JSON.stringify({ params: S.params }, null, 2);
     const a = document.createElement("a");
     a.href = URL.createObjectURL(new Blob([data], { type: "application/json" }));
     a.download = (S.selected || "profile") + ".params.json";
@@ -876,19 +989,18 @@ function bindEvents() {
       const clean = {};
       PARAM_DEFS.forEach(d => { if (d.key in src) clean[d.key] = src[d.key]; });
       S.params = Object.assign(blankParams(), clean);
-      if (typeof doc.display_name === "string" && doc.display_name.trim()) {
-        S.displayName = doc.display_name.trim();
-        $("#displayName").value = S.displayName;
-      }
       renderParams();
       markDirty();
-      toast("已导入参数到表单 — 检查后点【保存】生效", "ok");
+      toast("已导入参数到表单 — 检查后点【保存】写回脚本", "ok");
     } catch (err) { toast("导入失败: " + err.message, "err"); }
   });
 
-  // token 弹层
-  $("#btnTokenOk").addEventListener("click", submitToken);
-  $("#tokenEntry").addEventListener("keydown", e => { if (e.key === "Enter") submitToken(); });
+  // 登录浮层
+  $("#btnTokenOk").addEventListener("click", submitAuth);
+  $("#btnAuthSwitch").addEventListener("click", () =>
+    showAuthModal(Auth.mode === "token" ? "password" : "token"));
+  $$("#tokenModal input").forEach(i =>
+    i.addEventListener("keydown", e => { if (e.key === "Enter") submitAuth(); }));
 
   window.addEventListener("beforeunload", e => {
     if (S.dirty) { e.preventDefault(); e.returnValue = ""; }
@@ -901,7 +1013,7 @@ async function boot() {
     await fetchState();
     connectWS();
   } catch (e) {
-    if (e.message !== "需要 token") toast("加载失败: " + e.message, "err");
+    if (e.message !== "需要登录") toast("加载失败: " + e.message, "err");
   }
 }
 // URL 直达: http://<ip>/?token=xxx → 存 localStorage 并清掉地址栏里的 token
@@ -913,4 +1025,5 @@ if (urlTok) {
 }
 bindEvents();
 applyTheme();
-if (S.token) boot(); else showTokenModal();
+if (S.token) boot(); else initAuth();
+setInterval(pollCapFolder, 10000);

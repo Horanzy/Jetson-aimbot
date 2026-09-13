@@ -24,6 +24,15 @@ from . import discover
 HANDSHAKE_RE = re.compile(r"热参数通道: 127\.0\.0\.1:(\d+)")
 FPS_RE = re.compile(r"\[AI FPS\] (\d+) fps")
 CALIB_RE = re.compile(r"\[标定\] s=([0-9.eE+-]+) px/count, L=([0-9.eE+-]+) ms")
+# [SAVE] fire  (fire=12 det=3 auto=1 drop=0) — 每张截图一行, 计数是固件的累计值
+SAVE_RE = re.compile(r"\[SAVE\]\s*\S+\s*\(fire=(\d+) det=(\d+) auto=(\d+)")
+STATS_RE = re.compile(r"采集统计: fire=(\d+) det=(\d+) auto=(\d+)")
+# 模型: YOLOv8/11 416x416 1类 — 启动时从固件控制台抓取, 不落存储
+MODEL_RE = re.compile(r"模型:\s*(\S+)\s+(\d+)x(\d+)(?:\s+(\d+)类)?")
+# 这两类高频/低信息行不推进页面日志流 (原始环里照存, /api/logs/current 下载仍是全量);
+# [SAVE] 的信息改由截图卡片承载, [AI FPS] 由帧率卡片 + AI FPS 历史面板承载
+HIDDEN_IN_STREAM = ("[SAVE]", "[AI FPS]")
+FPS_HIST_MAX = 720                     # 60s 一读 → 12h 会话覆盖
 
 RUNNING_STATES = ("starting", "running", "stopping")
 
@@ -127,6 +136,9 @@ class InstanceManager:
         self.hot_capable = False
         self.hot_port = None
         self.fps = None
+        self.fps_hist = []                  # 本次运行 [(ts, fps)]; 重新启动即清空 (会话历史)
+        self.cap_counts = None              # 本次运行截图累计 {"fire","det","auto"}; 来自 [SAVE]
+        self.model_info = None              # 本次运行模型信息 {"arch","size","classes"}; 来自 "模型:" 行
         self.calib_live = None              # 运行中标定回执 {"s","l"}
         self.history = self._load_history()
 
@@ -139,7 +151,13 @@ class InstanceManager:
 
     def log_since(self, seq: int) -> list:
         with self._lock:
-            return [(s, t) for (s, t) in self._log if s > seq]
+            return [(s, t) for (s, t) in self._log if s > seq
+                    and not any(tag in t for tag in HIDDEN_IN_STREAM)]
+
+    def fps_hist_since(self, idx: int) -> list:
+        """第 idx 条之后的 FPS 读数 [[ts, fps], …], 供 WS 增量推送。"""
+        with self._lock:
+            return [[ts, v] for (ts, v) in self.fps_hist[idx:]]
 
     def log_all(self) -> str:
         with self._lock:
@@ -177,6 +195,9 @@ class InstanceManager:
                 "error": self.error, "steps": [dict(s) for s in self.steps],
                 "hot_capable": self.hot_capable, "hot_port": self.hot_port,
                 "fps": self.fps, "calib_live": self.calib_live,
+                "capture": dict(self.cap_counts) if self.cap_counts else None,
+                "model_info": dict(self.model_info) if self.model_info else None,
+                "fps_hist_len": len(self.fps_hist),
                 "log_seq": self._seq,
             }
 
@@ -209,6 +230,9 @@ class InstanceManager:
             self.ended_at = None
             self.started_at = None
             self.fps = None
+            self.fps_hist = []              # 会话历史: 新的一次运行从空开始
+            self.cap_counts = {"fire": 0, "det": 0, "auto": 0}
+            self.model_info = None
             self.calib_live = None
             self.steps = [{"name": n, "status": "pending", "detail": "", "ms": 0}
                           for n in STEP_NAMES]
@@ -299,7 +323,7 @@ class InstanceManager:
             self._append_log("✗ " + msg)
 
     def _pump(self, proc: subprocess.Popen) -> None:
-        """读子进程 stdout/stderr 合并流 → 日志环 + 状态解析 (握手/FPS/标定)。"""
+        """读子进程 stdout/stderr 合并流 → 日志环 + 状态解析 (握手/FPS/标定/截图计数)。"""
         for raw in iter(proc.stdout.readline, b""):
             line = raw.decode("utf-8", "replace").rstrip("\r\n")
             m = HANDSHAKE_RE.search(line)
@@ -309,6 +333,19 @@ class InstanceManager:
             m = FPS_RE.search(line)
             if m:
                 self.fps = int(m.group(1))
+                with self._lock:
+                    self.fps_hist.append((time.time(), self.fps))
+                    if len(self.fps_hist) > FPS_HIST_MAX:
+                        del self.fps_hist[:len(self.fps_hist) - FPS_HIST_MAX]
+            for m in (SAVE_RE.search(line), STATS_RE.search(line)):
+                if m:
+                    self.cap_counts = {"fire": int(m.group(1)),
+                                       "det": int(m.group(2)), "auto": int(m.group(3))}
+            m = MODEL_RE.search(line)
+            if m:
+                self.model_info = {"arch": m.group(1),
+                                   "size": "%sx%s" % (m.group(2), m.group(3)),
+                                   "classes": int(m.group(4)) if m.group(4) else None}
             m = CALIB_RE.search(line)
             if m:
                 try:
@@ -398,6 +435,10 @@ class InstanceManager:
             self.pid = pids[0]
             self.started_at = None
             self.error = None
+            self.fps = None
+            self.fps_hist = []              # 认领实例无日志: 上一会话的历史不再展示
+            self.cap_counts = None
+            self.model_info = None
             self.hot_capable = bool(info.get("hot_capable"))
             self.hot_port = hot_port_default if self.hot_capable else None
             self.steps = [{"name": "孤儿认领", "status": "ok",

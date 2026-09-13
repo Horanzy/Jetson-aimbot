@@ -3,6 +3,8 @@
 遵循库约定: 所有路径从本文件自身位置解析, 与调用 cwd 无关。
 data/ 是 WebUI 私有状态 (config / profile 参数 / 历史), 不入 git。
 """
+import hashlib
+import hmac
 import json
 import secrets
 import threading
@@ -17,10 +19,32 @@ HISTORY_PATH = DATA_DIR / "history.json"
 DEFAULTS = {
     "deploy_root": str(WEBUI_DIR.parent),   # 默认 = webui/ 上一层 (含 scripts/ 的那层)
     "token": "",
+    "password_hash": "",                    # 空 = 未设置; 首次登录用 token 设置
     "bind": "0.0.0.0",                      # 局域网管理; 收紧可改 127.0.0.1
     "port": 80,                             # root 服务直接绑 80, 免端口访问
     "hot_port": 47700,                      # 固件热参通道端口 (头部常量 HOT_CTL_PORT)
 }
+
+_PBKDF2_ITER = 200_000
+
+
+def hash_password(pw: str) -> str:
+    """PBKDF2-SHA256, 只存哈希不存明文 (纯标准库, 与 webui 零依赖口径一致)。"""
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", pw.encode("utf-8"), salt, _PBKDF2_ITER)
+    return "pbkdf2$%d$%s$%s" % (_PBKDF2_ITER, salt.hex(), digest.hex())
+
+
+def verify_password(pw: str, stored: str) -> bool:
+    try:
+        scheme, iters, salt_hex, digest_hex = stored.split("$")
+        if scheme != "pbkdf2":
+            return False
+        digest = hashlib.pbkdf2_hmac("sha256", pw.encode("utf-8"),
+                                     bytes.fromhex(salt_hex), int(iters))
+        return hmac.compare_digest(digest, bytes.fromhex(digest_hex))
+    except (ValueError, AttributeError):
+        return False
 
 _lock = threading.Lock()
 _cache = None

@@ -57,6 +57,15 @@
         <pre id="logBox" class="logbox" aria-live="polite"></pre>
       </div>
 
+      <details class="card fps-hist" id="fpsHistCard">
+        <summary>AI FPS 历史 <span class="hint">(本次运行的读数; 每分钟一记, 重新启动即清空)</span></summary>
+        <div id="fpsHistBody" class="hidden">
+          <div id="fpsHistSummary" class="hint"></div>
+          <div id="fpsSpark" class="spark"></div>
+          <div id="fpsHistTable" class="tablewrap"></div>
+        </div>
+      </details>
+
       <details class="card cmd-preview" id="cmdDetails">
         <summary>启动命令预览 <span class="hint">(WebUI 将执行的确切命令, 可复制到 SSH 复现)</span></summary>
         <pre id="cmdPreview" class="cmdbox"></pre>
@@ -66,13 +75,11 @@
 
     <!-- ======== 参数 ======== -->
     <section id="tab-params" class="hidden">
-      <div id="driftBanner" class="banner hidden"></div>
       <div id="hotBanner" class="banner info hidden"></div>
       <div class="card">
         <div class="card-hd">
           <h3 id="profileTitle">游戏 profile</h3>
           <div class="card-tools">
-            <label class="inline-label">显示名 <input id="displayName" type="text" spellcheck="false"></label>
             <button id="btnCopyProfile" class="btn small">复制此 profile</button>
             <button id="btnExportParams" class="btn small" title="把当前 (含未保存) 参数导出为 JSON 文件">导出</button>
             <button id="btnImportParams" class="btn small" title="从 JSON 文件导入参数到表单 (导入后需保存)">导入</button>
@@ -149,7 +156,14 @@
           <button id="btnSvcSave" class="btn">保存 (重启服务后生效)</button>
         </div>
         <div class="form-row">
-          <label class="inline-label">token
+          <label class="inline-label">密码
+            <input id="pwNew" type="password" autocomplete="new-password" style="width:11em" placeholder="至少 4 位">
+          </label>
+          <button id="btnPwSave" class="btn small">设置 / 修改密码</button>
+          <span class="hint" id="pwState"></span>
+        </div>
+        <div class="form-row">
+          <label class="inline-label">token (万能凭证: URL 直达 / 忘记密码时登录)
             <input id="tokenInput" type="password" readonly spellcheck="false" style="width:18em">
           </label>
           <button id="btnTokenShow" class="btn small">显示</button>
@@ -180,14 +194,26 @@
   </footer>
 </div>
 
-<!-- token 登录浮层 -->
+<!-- 登录浮层: 密码 / token / 首次凭 token 设密码 -->
 <div id="tokenModal" class="modal hidden">
   <div class="modal-box">
-    <h3>访问令牌</h3>
-    <p class="hint">输入 WebUI 的 token (首次启动时打印在服务端控制台, 或 URL 里的 ?token=…)</p>
-    <input id="tokenEntry" type="text" spellcheck="false" placeholder="token" autocomplete="off">
-    <div id="tokenErr" class="err-text hidden">token 不对, 再试试</div>
-    <div class="row-end"><button id="btnTokenOk" class="btn primary">连接</button></div>
+    <h3 id="authTitle">登录</h3>
+    <p class="hint" id="authHint"></p>
+    <div id="authTokenRow" class="form-col hidden">Token
+      <input id="authToken" type="password" spellcheck="false" autocomplete="off"
+             placeholder="在服务日志里: journalctl -u aimbot-webui">
+    </div>
+    <div id="authPassRow" class="form-col hidden">密码
+      <input id="authPass" type="password" autocomplete="current-password">
+    </div>
+    <div id="authPass2Row" class="form-col hidden">确认密码
+      <input id="authPass2" type="password" autocomplete="new-password">
+    </div>
+    <div id="tokenErr" class="err-text hidden"></div>
+    <div class="row-end">
+      <button id="btnAuthSwitch" class="btn small">改用 token 登录</button>
+      <button id="btnTokenOk" class="btn primary">登录</button>
+    </div>
   </div>
 </div>
 
@@ -195,10 +221,7 @@
 <div id="copyModal" class="modal hidden">
   <div class="modal-box">
     <h3>复制游戏 profile</h3>
-    <p class="hint">完整复制脚本文件与参数; 脚本本身一字不改, 手动 SSH 跑它照常工作。</p>
-    <label class="form-col">显示名 (UI 里展示)
-      <input id="copyDisplay" type="text" spellcheck="false">
-    </label>
+    <p class="hint">完整复制脚本文件 (参数随源, 脚本本身就是全部参数); 手动 SSH 跑它照常工作。</p>
     <label class="form-col">脚本文件名 (scripts/game/ 下, 自动加 .sh)
       <input id="copyFile" type="text" spellcheck="false">
     </label>

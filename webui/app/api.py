@@ -1,11 +1,13 @@
 """HTTP API + WebSocket 推送。
 
-鉴权: 除首页/静态资源外全部要求 token (X-WebUI-Token 头或 ?token=), WS 走 ?token=。
-推送: 单条 WS 轮询合流 —— 实例快照+任务摘要每 0.4s、日志按序号增量、遥测每 2s;
+鉴权: 日常用密码登录 (首次设置密码需验证 token), token 保留为万能凭证
+(URL ?token= 直达 / 忘记密码兜底); 登录成功换得 token, 之后所有请求带
+X-WebUI-Token 头, WS 走 ?token=。
+推送: 单条 WS 轮询合流 —— 实例快照+任务摘要每 0.4s、日志按序号增量
+([SAVE]/[AI FPS] 行不推进页面流, 见 proc.HIDDEN_IN_STREAM)、FPS 读数增量、遥测每 2s;
 客户端断线重连后用 /api/state 全量重建, 再以 log_seq 续传。
 """
 import asyncio
-import json
 import os
 import secrets
 import time
@@ -55,15 +57,25 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"],
                    allow_headers=["*"])
 
 
+PUBLIC_PATHS = ("/", "/favicon.ico", "/static",
+                "/api/auth/mode", "/api/auth/login", "/api/auth/setup")
+
+
 @app.middleware("http")
 async def _auth_mw(request, call_next):
     path = request.url.path
-    if path == "/" or path.startswith("/static") or path == "/favicon.ico":
-        return await call_next(request)
-    token = request.headers.get("x-webui-token") or request.query_params.get("token")
-    if token != S.cfg.get("token"):
-        return PlainTextResponse("unauthorized", status_code=401)
-    return await call_next(request)
+    if any(path == p or path.startswith(p + "/") for p in PUBLIC_PATHS):
+        response = await call_next(request)
+    else:
+        token = request.headers.get("x-webui-token") or request.query_params.get("token")
+        if token != S.cfg.get("token"):
+            return PlainTextResponse("unauthorized", status_code=401)
+        response = await call_next(request)
+    if path == "/" or path.startswith("/static"):
+        # 页面/静态资源强制回源验证 (etag 304, 局域网开销可忽略):
+        # 不然更新代码后浏览器还在吃旧缓存, 新界面出不来
+        response.headers["Cache-Control"] = "no-cache"
+    return response
 
 
 # ---------- 基础 ----------
@@ -76,21 +88,18 @@ def index():
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
-@app.get("/api/auth/check")
-def api_auth_check():
-    return {"ok": True, "root": S.cfg["deploy_root"]}
-
-
 @app.get("/api/state")
 def api_state():
     inst = S.inst.snapshot()
     return {
         "config": {"deploy_root": S.cfg["deploy_root"], "bind": S.cfg["bind"],
                    "port": S.cfg["port"], "hot_port": S.cfg["hot_port"],
-                   "token": S.cfg["token"], "is_root": _is_root()},
+                   "token": S.cfg["token"], "is_root": _is_root(),
+                   "has_password": bool(S.cfg.get("password_hash"))},
         "scan": S.scan(),
         "instance": inst,
         "logs": S.inst.log_since(0),
+        "fps_hist": S.inst.fps_hist_since(0),
         "tasks": S.op.summaries(),
         "history": S.inst.history,
         "telemetry": telemetry.snapshot(),
@@ -127,12 +136,72 @@ def api_config(inp: ConfigIn):
     S.rescan()
     return {"ok": True, "needs_restart": ("bind" in kw or "port" in kw),
             "config": {"deploy_root": S.cfg["deploy_root"], "bind": S.cfg["bind"],
-                       "port": S.cfg["port"], "token": S.cfg["token"]}}
+                       "port": S.cfg["port"], "token": S.cfg["token"],
+                       "has_password": bool(S.cfg.get("password_hash"))}}
 
 
 @app.post("/api/scan")
 def api_scan():
     return S.rescan()
+
+
+# ---------- 认证 ----------
+
+def _token_ok(tok: str) -> bool:
+    return secrets.compare_digest(str(tok).encode("utf-8"),
+                                  str(S.cfg.get("token", "")).encode("utf-8"))
+
+
+@app.get("/api/auth/mode")
+def api_auth_mode():
+    # 公开: 登录浮层要据此决定弹"首次设置密码"还是"输密码"; 是否设过密码不算敏感
+    return {"has_password": bool(S.cfg.get("password_hash"))}
+
+
+class LoginIn(BaseModel):
+    password: Optional[str] = None
+    token: Optional[str] = None
+
+
+@app.post("/api/auth/setup")
+def api_auth_setup(inp: LoginIn):
+    """首次设置密码 (或忘记密码后凭 token 重设): 必须先验证 token。"""
+    if not inp.token or not _token_ok(inp.token):
+        time.sleep(1.0)
+        raise HTTPException(401, "token 不对")
+    if not inp.password or len(inp.password) < 4:
+        raise HTTPException(400, "密码至少 4 位")
+    S.cfg = config.update(password_hash=config.hash_password(inp.password))
+    return {"ok": True, "token": S.cfg["token"]}
+
+
+@app.post("/api/auth/login")
+def api_auth_login(inp: LoginIn):
+    """密码或 token 登录, 成功换回 token —— 之后所有请求仍走 X-WebUI-Token,
+    鉴权管道不变。失败加固定小延迟 (单用户局域网工具, 不上重型防爆破)。"""
+    ok = False
+    if inp.token and _token_ok(inp.token):
+        ok = True
+    elif (inp.password and S.cfg.get("password_hash")
+          and config.verify_password(inp.password, S.cfg["password_hash"])):
+        ok = True
+    if not ok:
+        time.sleep(1.0)
+        raise HTTPException(401, "密码或 token 不对")
+    return {"ok": True, "token": S.cfg["token"]}
+
+
+class PasswordIn(BaseModel):
+    password: str
+
+
+@app.post("/api/auth/password")
+def api_auth_password(inp: PasswordIn):
+    """修改密码 (登录态内操作, 与重置 token 同一信任级)。"""
+    if len(inp.password) < 4:
+        raise HTTPException(400, "密码至少 4 位")
+    S.cfg = config.update(password_hash=config.hash_password(inp.password))
+    return {"ok": True}
 
 
 @app.post("/api/token/reset")
@@ -159,7 +228,6 @@ def api_profile(stem: str):
 
 
 class ProfileIn(BaseModel):
-    display_name: Optional[str] = None
     params: Optional[dict] = None
 
 
@@ -169,17 +237,18 @@ def _wire_value(pk: str, v):
 
 @app.put("/api/profiles/{stem}")
 def api_profile_put(stem: str, inp: ProfileIn):
+    """保存 = 原子写回脚本 (脚本 = 唯一事实源), 然后与脚本现值做热参差量下发。"""
     p = _find_profile(stem)
     if p is None:
         raise HTTPException(404, "未知的游戏 profile: %s" % stem)
-    saved_doc = discover.load_profile(stem) or {}
-    old_params = saved_doc.get("params") or {}
+    script_path = S.root() / "scripts" / "game" / (stem + ".sh")
+    old_params, _ = discover.parse_script(script_path, S.root())
     new_params = discover.validate_params(inp.params if inp.params is not None
                                           else old_params, S.root())
-    disp = (inp.display_name if inp.display_name is not None
-            else saved_doc.get("display_name") or stem).strip() or stem
-    discover.save_profile(stem, {"display_name": disp, "params": new_params,
-                                 "updated_at": time.time()})
+    try:
+        discover.write_script_params(script_path, new_params, S.root())
+    except OSError as e:
+        raise HTTPException(500, "写回脚本失败: %s" % e)
     # 热参数: 本次保存中变化的热项 → 直接下发运行中实例 (即时生效, 不重启)
     applied, reason = {}, None
     inst = S.inst.snapshot()
@@ -190,8 +259,7 @@ def api_profile_put(stem: str, inp: ProfileIn):
             reason = "运行中的二进制不支持热参数通道 (旧版固件, 重编译后启动即可)"
         elif inst["profile"] == stem:
             for pk, wk in discover.HOT_WIRE_KEYS.items():
-                if pk in (inp.params or {}) and not discover._same(
-                        old_params.get(pk), new_params.get(pk)):
+                if not discover._same(old_params.get(pk), new_params.get(pk)):
                     applied[wk] = _wire_value(pk, new_params[pk])
             if applied:
                 try:
@@ -205,7 +273,6 @@ def api_profile_put(stem: str, inp: ProfileIn):
 
 
 class CopyIn(BaseModel):
-    display_name: Optional[str] = None
     file_name: Optional[str] = None
 
 
@@ -223,15 +290,9 @@ def api_profile_copy(stem: str, inp: CopyIn):
     dst = S.root() / "scripts" / "game" / (fname + ".sh")
     if dst.exists():
         raise HTTPException(400, "目标脚本已存在: %s.sh" % fname)
-    # 完整复制脚本 (不改一字节) + 新 profile JSON (显示名按弹窗输入, 参数随源)
-    dst.write_bytes(src.read_bytes())
-    disp = (inp.display_name or (src_prof["display_name"] + " 副本")).strip()
-    params = src_prof["saved"] if src_prof["has_saved"] else src_prof["script_params"]
-    discover.save_profile(fname, {"display_name": disp,
-                                  "params": discover.validate_params(params, S.root()),
-                                  "updated_at": time.time()})
+    dst.write_bytes(src.read_bytes())     # 参数随源 —— 脚本本身就是全部参数
     S.rescan()
-    return {"ok": True, "file": fname, "display_name": disp}
+    return {"ok": True, "file": fname, "display_name": fname}
 
 
 # ---------- 实例 ----------
@@ -241,8 +302,7 @@ def api_instance_cmd(profile: str):
     p = _find_profile(profile)
     if p is None:
         raise HTTPException(404, "未知的游戏 profile: %s" % profile)
-    params = p["saved"] if p["has_saved"] and p["saved"] else p["script_params"]
-    argv = proc.build_argv(S.root(), params, p["calib"],
+    argv = proc.build_argv(S.root(), p["script_params"], p["calib"],
                            S.root() / "scripts" / "game" / (profile + ".sh"))
     return {"cmd": proc.cmd_string(argv)}
 
@@ -253,9 +313,8 @@ def api_instance_start(body: dict):
     p = _find_profile(stem)
     if p is None:
         raise HTTPException(404, "未知的游戏 profile: %s" % stem)
-    params = p["saved"] if p["has_saved"] and p["saved"] else p["script_params"]
-    ok, err = S.inst.start(S.root(), p["file"], p["display_name"], params, p["calib"],
-                           S.root() / "scripts" / "game" / (stem + ".sh"))
+    ok, err = S.inst.start(S.root(), p["file"], p["display_name"], p["script_params"],
+                           p["calib"], S.root() / "scripts" / "game" / (stem + ".sh"))
     if not ok:
         raise HTTPException(409, err)
     return {"ok": True}
@@ -275,6 +334,43 @@ def api_logs_current():
         S.inst.log_all(),
         media_type="text/plain; charset=utf-8",
         headers={"Content-Disposition": 'attachment; filename="aimbot-webui.log"'})
+
+
+# ---------- 采集统计 ----------
+
+_JPG_SUFFIX = (".jpg", ".jpeg")
+
+
+def _count_jpgs(d: Path) -> int:
+    try:
+        return sum(1 for e in os.scandir(d)
+                   if e.name.lower().endswith(_JPG_SUFFIX) and e.is_file())
+    except OSError:
+        return 0
+
+
+@app.get("/api/capture/count")
+def api_capture_count(profile: str = ""):
+    """输出目录里的截图总数: fire/det/auto 三个子目录 + 目录根部散图 (非递归,
+    与固件 make_filepath 的落盘布局一致)。目录按 profile 参数动态解析
+    (相对部署根或绝对路径), 不绑定 dataset/。"""
+    stem = profile.strip()
+    params = {}
+    if stem:
+        p = _find_profile(stem)
+        if p is None:
+            raise HTTPException(404, "未知的游戏 profile: %s" % stem)
+        params = p["script_params"] or {}
+    od = str(params.get("capture_dir") or "dataset")
+    d = Path(od) if os.path.isabs(od) else S.root() / od
+    out = {"dir": str(d), "dir_name": d.name or str(d), "exists": d.is_dir(),
+           "total": 0, "fire": 0, "det": 0, "auto": 0}
+    if out["exists"]:
+        out["fire"] = _count_jpgs(d / "fire")
+        out["det"] = _count_jpgs(d / "det")
+        out["auto"] = _count_jpgs(d / "auto")
+        out["total"] = out["fire"] + out["det"] + out["auto"] + _count_jpgs(d)
+    return out
 
 
 # ---------- 运维任务 ----------
@@ -315,11 +411,18 @@ async def ws_endpoint(ws: WebSocket, token: str = Query(""), since: int = 0):
         return
     await ws.accept()
     inst_seq = since
+    fps_i = 0                            # 每连接独立的 FPS 读数游标 (from=0 → 前端整表替换)
     task_seqs = {}
     last_tel = 0.0
+    last_scan = None
+    tick = 0
     try:
         while True:
             await asyncio.sleep(0.4)
+            tick += 1
+            if tick % 12 == 0:
+                # ~5s 重扫: 脚本是唯一事实源, SSH 侧改动自动到达所有打开的页面
+                S.rescan()
             inst = S.inst.snapshot()
             lines = S.inst.log_since(inst_seq)
             if lines:
@@ -327,6 +430,14 @@ async def ws_endpoint(ws: WebSocket, token: str = Query(""), since: int = 0):
             msg = {"type": "tick", "instance": inst, "tasks": S.op.summaries()}
             if lines:
                 msg["log"] = lines
+            scan = S.scan()
+            if scan != last_scan:
+                last_scan = scan
+                msg["scan"] = scan
+            fh = S.inst.fps_hist_since(fps_i)
+            if fh:
+                msg["fps_new"] = {"from": fps_i, "items": fh}
+                fps_i += len(fh)
             now = time.time()
             if now - last_tel >= 2.0:
                 last_tel = now

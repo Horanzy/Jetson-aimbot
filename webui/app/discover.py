@@ -1,11 +1,12 @@
 """结构化发现: 从部署根按约定目录派生 游戏 profile / 模型 / 转换源 / 采集设备。
 
 只按固定结构发现 (scripts/game/, engine/, onnx/, /dev/v4l/by-id/), 不递归扫全盘。
-game 脚本只读解析 (顶部 VAR=value 块), WebUI 从不改写脚本 —— 唯一的脚本写回
-是固件经 -S 的标定回写机制。profile 参数持久化在 webui/data/profiles/<脚本名>.json,
-首扫时以脚本值播种; 之后保存值与脚本值分叉即"漂移", 由 UI 提示。
+**脚本 = 唯一事实源**: profile 参数就是 game 脚本头部的 VAR=value 块, 每次扫描现场解析,
+没有独立存储; WebUI 的【保存】通过 write_script_params 原子写回脚本 (只改目标变量的值,
+注释/引号风格/其余行逐字保留)。唯一的另一处脚本写回是固件经 -S 的标定回写机制。
 """
 import json
+import os
 import re
 import time
 from pathlib import Path
@@ -43,6 +44,7 @@ SCRIPT_VARS = {
     "AIM_KEY": "aim_key", "PREVIEW": "preview", "CAPTURE": "capture_enabled",
     "OUT_DIR": "capture_dir", "FIRE_MS": "fire_ms", "AUTO_S": "auto_s",
     "COOLDOWN_MS": "cooldown_ms", "JPEG_Q": "jpeg_q", "MODEL_PATH": "model",
+    "FOV_R": "fov",
 }
 
 
@@ -154,27 +156,84 @@ def validate_params(user: dict, root: Path) -> dict:
     return out
 
 
-# ---------- profile JSON 持久化 (data/profiles/<脚本名>.json) ----------
+# ---------- 脚本写回 (脚本 = 唯一事实源) ----------
 
-def _profile_path(stem: str) -> Path:
-    return config.PROFILE_DIR / (stem + ".json")
-
-
-def load_profile(stem: str):
-    p = _profile_path(stem)
-    if not p.is_file():
-        return None
-    try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
+_ASSIGN_RE = re.compile(r"^(\s*)([A-Z_][A-Z0-9_]*)(\s*=\s*)(.*)$")
+VAR_OF = {v: k for k, v in SCRIPT_VARS.items()}
 
 
-def save_profile(stem: str, data: dict) -> None:
-    config.PROFILE_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = _profile_path(stem).with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    tmp.replace(_profile_path(stem))        # 原子替换
+def _fmt_value(key: str, val, root: Path) -> str:
+    """参数值 → 脚本里的字面量 (整数不带小数点; bool 用 y/n; 路径相对时挂 $ROOT 前缀)。"""
+    d = PARAM_DEFS[key]
+    if d["kind"] == "int":
+        return str(int(val))
+    if d["kind"] == "float":
+        f = float(val)
+        return str(int(f)) if f.is_integer() else repr(f)
+    if d["kind"] == "bool":
+        return "y" if val else "n"
+    if d["kind"] in ("path", "dsdir"):
+        s = str(val or "")
+        # 脚本尾部以 $OUT_DIR 直接展开传参, 相对路径会随 cwd 漂 —— 统一挂 $ROOT 成绝对
+        return ("$ROOT/" + s) if s and not Path(s).is_absolute() else s
+    return str(val)
+
+
+def write_script_params(path: Path, params: dict, root: Path) -> None:
+    """把 params 原子写回脚本头部的 VAR=value 块。
+
+    只改目标变量的值: 行内注释、引号风格、其余每一行逐字保留;
+    脚本里缺失的变量追加到最后一个已知变量行之后; 执行位不变。"""
+    st_mode = path.stat().st_mode
+    raw = path.read_bytes()
+    has_bom = raw.startswith(b"\xef\xbb\xbf")
+    text = raw.decode("utf-8-sig", errors="replace")
+    trailing_nl = text.endswith("\n")
+    body = text[:-1].split("\n") if trailing_nl else text.split("\n")
+
+    seen = {}                            # VAR → 行号
+    last_var_idx = -1
+    for i, line in enumerate(body):
+        m = _ASSIGN_RE.match(line)
+        if m and m.group(2) in SCRIPT_VARS:   # SCRIPT_VARS 的键就是 VAR 名
+            seen[m.group(2)] = i
+            last_var_idx = i
+
+    def render(key: str, quote: str) -> str:
+        s = _fmt_value(key, params[key], root)
+        return quote + s + quote if quote else s
+
+    missing = []
+    for key in params:
+        var = VAR_OF.get(key)              # 参数名 → VAR 名 (SCRIPT_VARS 的逆映射)
+        if var is None:
+            continue
+        if var not in seen:
+            missing.append(key)
+            continue
+        i = seen[var]
+        m = _ASSIGN_RE.match(body[i])
+        rhs = m.group(4)
+        cm = re.search(r"\s+#", rhs)     # 脚本约定: 值后空白 + # 才是行内注释 (\s+ 保住对齐空格)
+        comment = rhs[cm.start():] if cm else ""
+        vs = (rhs if not cm else rhs[:cm.start()]).strip()
+        quote = vs[0] if len(vs) >= 2 and vs[0] == vs[-1] and vs[0] in "\"'" else ""
+        body[i] = m.group(1) + m.group(2) + m.group(3) + render(key, quote) + comment
+
+    if missing:
+        ins = ['%s="%s"' % (VAR_OF[k], _fmt_value(k, params[k], root))
+               for k in missing]
+        if last_var_idx >= 0:
+            body[last_var_idx + 1:last_var_idx + 1] = ins
+        else:
+            body.extend(ins)
+
+    out = "\n".join(body) + ("\n" if trailing_nl else "")
+    data = (b"\xef\xbb\xbf" if has_bom else b"") + out.encode("utf-8")
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_bytes(data)
+    os.replace(tmp, path)
+    os.chmod(path, st_mode)              # tmp 是新文件, 执行位要显式带回来
 
 
 def _same(a, b) -> bool:
@@ -184,30 +243,18 @@ def _same(a, b) -> bool:
 
 
 def scan_profiles(root: Path) -> list:
+    """每次扫描现场解析脚本 —— 没有独立参数存储, SSH 侧改动天然可见。"""
     out = []
     game_dir = root / "scripts" / "game"
     for p in sorted(game_dir.glob("*.sh")):
         if not SCRIPT_STEM_RE.match(p.stem):
             continue
         script_params, calib = parse_script(p, root)
-        saved_doc = load_profile(p.stem)
-        saved = (saved_doc or {}).get("params") or {}
-        drift = []
-        if saved_doc:
-            # 只有保存过才有"漂移"概念; 首次见到脚本时 saved 尚未播种
-            for k, d in PARAM_DEFS.items():
-                sv = saved.get(k, d["default"])
-                pv = script_params.get(k, d["default"])
-                if not _same(sv, pv):
-                    drift.append(k)
         out.append({
             "file": p.stem,
-            "display_name": ((saved_doc or {}).get("display_name") or p.stem),
+            "display_name": p.stem,
             "script_params": script_params,
             "calib": calib,                 # 标定值永远以脚本为权威 (固件 -S 回写目标)
-            "saved": saved,
-            "has_saved": saved_doc is not None,
-            "drift": drift,
         })
     return out
 
@@ -280,11 +327,23 @@ def list_dataset_dirs(root: Path) -> list:
         return []
 
 
+_bin_info_cache = {}                     # (path, mtime_ns, size) → info; 重编译才失效
+
+
 def binary_info(root: Path) -> dict:
-    """bin/aimbot 存在性 + 热参能力探测 (二进制内查握手串, 用于认领实例的兜底)。"""
+    """bin/aimbot 存在性 + 热参能力探测 (二进制内查握手串, 用于认领实例的兜底)。
+    结果按 (mtime, size) 缓存 —— WS 周期重扫时避免反复读大二进制。"""
     p = root / "bin" / "aimbot"
     if not p.is_file():
         return {"exists": False, "hot_capable": False}
+    try:
+        st = p.stat()
+    except OSError:
+        return {"exists": True, "hot_capable": False}
+    key = (str(p), st.st_mtime_ns, st.st_size)
+    hit = _bin_info_cache.get(key)
+    if hit is not None:
+        return hit
     hot = False
     needle = "热参数通道".encode("utf-8")
     try:
@@ -296,10 +355,12 @@ def binary_info(root: Path) -> dict:
                 if needle in chunk:
                     hot = True
                     break
-        st = p.stat()
     except OSError:
         return {"exists": True, "hot_capable": hot}
-    return {"exists": True, "hot_capable": hot, "size": st.st_size, "mtime": st.st_mtime}
+    info = {"exists": True, "hot_capable": hot, "size": st.st_size, "mtime": st.st_mtime}
+    _bin_info_cache.clear()
+    _bin_info_cache[key] = info
+    return info
 
 
 def scan(root: Path) -> dict:

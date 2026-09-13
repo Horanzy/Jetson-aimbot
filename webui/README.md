@@ -7,7 +7,7 @@
 
 ```
 浏览器 (PC / 手机, 局域网)
-   │ http://<jetson-ip>/?token=…
+   │ http://<jetson-ip>/  (密码登录; token 直达/兜底)
    ▼
 webui/server.py (FastAPI, systemd root 服务)
    ├─ 结构化发现: scripts/game/*.sh · engine/ · onnx/ · /dev/v4l/by-id/
@@ -27,14 +27,21 @@ sudo python3 -m pip install -r requirements.txt
 sudo bash deploy/install.sh
 
 # 3. 打开
-#    token 打印在服务日志里:
+#    token 打印在服务日志里 (首次设置密码要用):
 sudo journalctl -u aimbot-webui -n 20 --no-pager
-#    浏览器访问  http://<jetson-ip>/?token=<token>
+#    浏览器访问  http://<jetson-ip>/  → 首次凭 token 设置登录密码, 之后密码登录
 ```
 
 手动试跑（不装服务）：`cd webui && sudo python3 server.py`。
 
 要求：JetPack 自带的 python3 (≥3.8) 即可，无需 venv（这是服务端，不是 arena）。
+
+### 更新（已装服务的机器）
+
+覆盖 `webui/` 下的代码（`app/` `static/` `server.py`；**保留 `webui/data/`** —— token、密码、
+profile 参数、历史都在里面），然后 `sudo systemctl restart aimbot-webui` 即可。
+页面与静态资源带 `Cache-Control: no-cache`，浏览器普通刷新就是最新界面，不用清缓存。
+依赖没变（requirements.txt 未改）时不用重装。
 
 ### 离线安装
 
@@ -60,14 +67,19 @@ WebUI 要 1:1 复刻该环境，只有两条路：
    代价：换部署根要同步改 sudoers；aimbot 直接 exec 时若 `/dev/hidg0` 权限不足仍会失败
    （setup_mouse.sh 每次 launch 都会 `chmod 666`，通常没问题）。
 
-暴露面 = 局域网 + token 门槛。不需要暴露时，在设置页把监听改成 `127.0.0.1`。
+暴露面 = 局域网 + 密码门槛（token 兜底）。不需要暴露时，在设置页把监听改成 `127.0.0.1`。
 
 ## 安全（极简）
 
-- 首次启动自动生成 token（`webui/data/config.json`），打印在启动横幅；页面存 localStorage。
-- 除首页/静态资源外所有 API 要求 `X-WebUI-Token` 头（WS 走 `?token=`）；设置页可一键重置。
+- **密码登录为主**：首次打开页面要求凭 token 设置密码（证明你有权配置这台 Jetson），
+  之后日常输密码即可。密码只存 PBKDF2-SHA256 哈希（`webui/data/config.json`，纯标准库）。
+- **token 保留为万能凭证**：登录成功后服务端把 token 发给浏览器存 localStorage，
+  之后所有 API 仍走 `X-WebUI-Token` 头（WS 走 `?token=`），鉴权管道只有一条。token 的用途：
+  ① URL `?token=xxx` 直达；② 忘记密码时登录（登录后在设置页改密码）；③ 首次设密码。
+  token 首次启动自动生成，打印在启动横幅；设置页可显示/复制/一键重置（重置不影响密码）。
+- 除首页/静态资源/登录端点外所有 API 要求 token；登录/设密失败有固定 1s 延迟。
 - 热参数通道只绑 `127.0.0.1`，局域网摸不到。
-- 没有更多了 —— 这是单用户局域网工具，不打算上重型认证。
+- 没有更多了 —— 这是单用户局域网工具，不上重型认证（明文 HTTP 传输与 token 时代一致）。
 
 ## 配置发现模型
 
@@ -80,10 +92,11 @@ WebUI 要 1:1 复刻该环境，只有两条路：
 - **所有路径/设备输入都是下拉**，没有手输路径的入口（部署根本身除外）。
 - 标定值 `S_EST`/`L_EST` **永远以脚本为权威**：每次启动现场解析；`-S` 指向 profile 脚本本身，
   固件标定回写照旧落进脚本 —— SSH 侧与 UI 侧看到同一份标定。
-- **profile 参数**持久化在 `webui/data/profiles/<脚本名>.json`（含 `display_name`），首次扫描以
-  脚本值播种；此后 UI 保存值与脚本值分叉即“漂移”，页面提示并可一键“采用脚本值”。
-  脚本脱离 UI 手动 SSH 跑永远照常工作 —— WebUI 从不改写脚本。
-- **复制 profile** = 完整复制脚本文件 + 新建 profile JSON（显示名/文件名按弹窗输入，都有默认值）。
+- **脚本 = 唯一事实源**: profile 参数就是 game 脚本头部的 `VAR=value` 块, 每次扫描现场解析,
+  没有独立参数存储。网页【保存】= 原子写回脚本 —— 只改目标变量的值, 行内注释/引号风格/其余行
+  逐字保留, 执行位不变; `S_EST`/`L_EST` 归固件标定回写管, WebUI 不碰。SSH 改脚本 → 打开的
+  页面 ~5 秒自动跟随（表单有未保存改动时不覆盖 —— 后保存者胜）。
+- **复制 profile** = 完整复制脚本文件（文件名按弹窗输入, 参数随源）。
 
 ## 实例管理与启动语义
 
@@ -125,7 +138,7 @@ webui/
 ├── static/              index.html + app.js + style.css (自托管, 零外链, 双主题, 手机可用)
 ├── deploy/install.sh    生成 systemd unit 并启用 (路径从脚本自身解析)
 ├── requirements.txt     fastapi / uvicorn / websockets (纯 Python 轮子)
-└── data/                运行时状态: config.json · profiles/*.json · history.json (gitignore)
+└── data/                运行时状态: config.json · history.json (gitignore)
 ```
 
 注意：服务必须单进程运行（systemd unit 就是单 worker），实例/任务管理是进程内单例。
@@ -133,16 +146,25 @@ webui/
 ## 验收清单（Jetson 上）
 
 1. `sudo bash webui/deploy/install.sh` → `systemctl status aimbot-webui` 正常；
-2. `journalctl -u aimbot-webui` 里拿到 token，PC 浏览器打开并登录；
+2. `journalctl -u aimbot-webui` 里拿到 token，浏览器打开 → 首次凭 token 设置密码 →
+   退出重进用密码登录；「改用 token 登录」也能进；错误密码会被拒；
 3. 设置页确认部署根正确、扫描摘要数量符合（profile/engine/onnx/采集卡）；
 4. 参数页改动置信度 → 【保存】→【启动】：步骤条三步全绿，日志出现
-   `✅ 热参数通道: …` 与 `[AI FPS]`；
+   `✅ 热参数通道: …`（`[AI FPS]` 与 `[SAVE]` 不再出现在页面日志流,
+   FPS 显示在卡片、读数进「AI FPS 历史」面板、截图计数进「截图 本次」卡片;
+   「模型架构」「输入尺寸」两卡片从启动日志的 `模型:` 行抓取, 每次启动刷新）;
 5. 运行中再改置信度 →【保存】：toast 显示已下发，日志出现 `[热参] t=…`；
-6. 【停止】→ 状态“已退出”；SSH 手动跑 game 脚本 → WebUI 显示“认领”而非“已停止”；
+6. 【停止】→ 状态“已退出”；SSH 手动跑 game 脚本 → WebUI 显示“认领”而非“已停止”
+   （认领实例「截图 本次」显示 —，「截图 文件夹」照常计数）；
 7. 按【启动】清掉 SSH 实例并以 UI 设置接管；
 8. convert / compile 任务能跑完且有日志/退出码；compile 在实例运行中时被拒绝并说明原因；
 9. 手机浏览器（同局域网）打开：布局单列、按钮可点、日志可滚；
-10. 复制 profile → 新脚本出现在 `scripts/game/`（内容与源一致 + JSON 元数据），SSH 直接跑它照常工作。
+10. 复制 profile → 新脚本出现在 `scripts/game/`（内容与源一致），SSH 直接跑它照常工作；
+11. 「截图 文件夹」与输出目录联动: 改 profile 的输出目录 (含绝对路径) → ~10s 后卡片路径跟随变化;
+    重新【启动】→「截图 本次」归零、「AI FPS 历史」清空;
+12. 保存写回脚本: 网页改 Y_OFFSET/采集开关 →【保存】→ `cat` 脚本对应行已变且注释原样;
+    SSH 改脚本 Y_OFFSET → ~5s 后网页表单跟随（无未保存改动时）;
+    启动实例运行中改置信度 →【保存】→ 日志出现 `[热参] t=…`（差量自动下发）。
 
 ## 已知边界
 

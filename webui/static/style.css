@@ -173,6 +173,21 @@ main section { display: flex; flex-direction: column; gap: var(--sp); }
 .cmd-preview .cmdbox { margin-top: 10px; max-height: 130px; }
 .row-end { display: flex; justify-content: flex-end; gap: 8px; margin-top: 10px; align-items: center; }
 
+/* ---------- AI FPS 历史面板 ---------- */
+.fps-hist summary { cursor: pointer; font-weight: 600; font-size: 14px; }
+.fps-hist #fpsHistSummary { margin-top: 12px; }
+.fps-hist #fpsHistSummary b { color: var(--text); font-variant-numeric: tabular-nums; }
+.spark {
+  display: flex; align-items: flex-end; gap: 1px;
+  height: 64px; margin: 10px 0 12px; padding: 4px;
+  background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-s);
+}
+.spark i {
+  flex: 1; min-width: 1px; background: var(--accent); opacity: .75;
+  border-radius: 1px 1px 0 0;
+}
+.spark i:hover { opacity: 1; }
+
 /* ---------- 参数页 ---------- */
 .pgroup { margin-bottom: 6px; }
 .pgroup > h4 {
