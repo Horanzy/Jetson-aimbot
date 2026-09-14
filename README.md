@@ -22,7 +22,7 @@ The single binary `bin/aimbot` runs **ff_pi**: pole-placement PI + type-2 veloci
 
 ```
 src/       CUDA/C++ source (aimbot.cu — the ff_pi law)
-scripts/   compile.sh / convert.sh (ONNX→engine) / setup_mouse.sh (USB gadget) / game/*.sh
+scripts/   compile.sh / convert.sh (ONNX→engine) / setup_mouse.sh (USB gadget) / game/template.sh.example
 arena/     pure-Python control-law simulator + benchmark suite
 engine/    TensorRT engines (not committed)
 onnx/      ONNX models (not committed)
@@ -34,7 +34,9 @@ onnx/      ONNX models (not committed)
 scripts/compile.sh            # → bin/
 scripts/convert.sh            # onnx/*.onnx → engine/*.engine (TensorRT 10)
 scripts/setup_mouse.sh        # create the /dev/hidg0 USB gadget mouse
-scripts/game/battlefield.sh   # per-game launcher (calibration write-back included)
+cp scripts/game/template.sh.example scripts/game/<game>.sh   # one launcher per game
+chmod +x scripts/game/<game>.sh
+scripts/game/<game>.sh        # calibrate once; S_EST/L_EST are written back into it
 ```
 
 Requires JetPack with TensorRT 10, CUDA, OpenCV 4, GStreamer, and a UVC capture card supporting 1080p NV12 @ 120 Hz.

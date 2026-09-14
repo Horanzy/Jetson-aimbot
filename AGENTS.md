@@ -23,7 +23,7 @@ No hand-tuned gains: a bilateral side-key trigger runs auto-calibration, estimat
 /mnt/TF/aimbot/
 ├── src/         aimbot.cu (ff_pi_acc + optional collection)
 ├── scripts/     compile.sh / convert.sh / setup_mouse.sh
-│   └── game/    per-game launch scripts (battlefield.sh)
+│   └── game/    launcher template (template.sh.example → 复制成 <game>.sh 使用)
 ├── bin/         build output (aimbot)
 ├── engine/      *.engine model library
 ├── onnx/        *.onnx
@@ -42,7 +42,7 @@ No hand-tuned gains: a bilateral side-key trigger runs auto-calibration, estimat
 | `scripts/compile.sh` | nvcc build of aimbot → `bin/` (run on the Jetson) |
 | `scripts/convert.sh` | Batch ONNX → TensorRT engine conversion |
 | `scripts/setup_mouse.sh` | USB Gadget config, creates `/dev/hidg0` |
-| `scripts/game/*.sh` | Per-game launch scripts (relative paths; screenshot-collection switch `CAPTURE`; auto write-back of calibration values `S_EST`/`L_EST`) |
+| `scripts/game/template.sh.example` | Per-game launcher template — copy to `<game>.sh` (`.example` keeps the webui from listing it as a launchable profile). Relative paths; screenshot-collection switch `CAPTURE`; auto write-back of calibration values `S_EST`/`L_EST`; the `MAX_SPEED` rule and its derivation live in the file |
 | `arena/` | Pure-Python control-law simulation evaluator (neutral simulator + 10 laws + standard + FPS test suites); see dedicated section |
 
 Linking note: `aimbot` needs `-lopencv_video` (calibration uses `phaseCorrelate`) and `-lopencv_imgcodecs` (collection `imwrite`).
@@ -299,7 +299,7 @@ Same status, **the FF+CUSUM pack does not transfer onto a Kalman estimator** —
 
 - arena's default 0.5px noise is optimistic; on a noisier real device ff_pi_acc converges slower — lower `PRED_BETA0` first (see Tuning); in extreme cases fall back to a more conservative design point (raise `FF_PM_DEG`), or port the sliding_obs law from arena (most robust, slowest).
 - The constant-velocity (CV) predictor cannot predict acceleration: constant-accel targets have an a/Ki steady-state lag, removed slowly by the I term (maneuver RMSE ~20px is mostly the delay lower bound, not a law flaw).
-- The speed cap binds before the law does at short range, and it is the first constraint on every fast-transient scenario: `arena.diag` puts only 3% of `fps_approach`'s error — the suite's largest, 45.85 px with a 184 px peak — on the velocity estimate, and `fps_dash` (4×0.4 = 1.6 px/ms) and the parts of `fps_jump_3m` where |v_z| > 1.5 px/ms are saturated the same way. Check `est_share` before attributing such errors to the control law. The cap is a physical requirement rather than a preference: the crosshair must be able to move at least as fast as the target's screen motion (960·v_world/d px/s, f≈960px@1080p), or the error grows without bound. Below that speed the error is a cliff and above it nothing changes — `arena.diag ff_pi_acc fps_approach --max-v 1.7` already moves it 45.85 → 18.88 px — so the useful setting is the smallest one clearing the fastest screen motion the system must face, and 2000 px/s clears the whole behaviour library (10 m dash 1.6, near jump 1.83, approach 1.99 px/ms). Raising it also loosens the integrator clamp and the â channel's limits, which moves the 60/120 fps composite split (60 fps improves in absolute terms; the ratio widens) and the worst-mismatch composite by about a percent — measure with the suites' `max_v` parameter, and see `-x` in the launch scripts.
+- The speed cap binds before the law does at short range, and it is the first constraint on every fast-transient scenario: `arena.diag` puts only 3% of `fps_approach`'s error — the suite's largest, 45.85 px with a 184 px peak — on the velocity estimate, and `fps_dash` (4×0.4 = 1.6 px/ms) and the parts of `fps_jump_3m` where |v_z| > 1.5 px/ms are saturated the same way. Check `est_share` before attributing such errors to the control law. The cap is a physical requirement rather than a preference: the crosshair must be able to move at least as fast as the target's screen motion (960·v_world/d px/s, f≈960px@1080p), or the error grows without bound. Below that speed the error is a cliff and above it nothing changes — `arena.diag ff_pi_acc fps_approach --max-v 1.7` already moves it 45.85 → 18.88 px — so the useful setting is the smallest one clearing the fastest screen motion the system must face, and 2000 px/s clears the whole behaviour library (10 m dash 1.6, near jump 1.83, approach 1.99 px/ms). Raising it also loosens the integrator clamp and the â channel's limits, which moves the 60/120 fps composite split (60 fps improves in absolute terms; the ratio widens) and the worst-mismatch composite by about a percent — measure with the suites' `max_v` parameter, and see `-x` together with its derivation in the launcher template.
 - mpc_osc solves a QP per tick; 500Hz embedded compute is unverified (feasible in arena); shipping it would need explicit MPC or a lower solve rate.
 - Every law degrades under extreme mismatch (|L_true−L̂|>~30ms or s error >~40%) — beyond what calibration should ever produce; ff_pi_acc holds L20–70 + s0.7–1.3 fully, and at the L80 (+30ms) corner its step settle rides the 3px knife edge (final ≈3–4px, no divergence). Rely on calibration, not on the law toughing it out.
 

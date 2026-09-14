@@ -24,6 +24,6 @@ arena/trace_out/
 Thumbs.db
 desktop.ini
 
-# ---- 个人游戏脚本 (含私有标定值, 不进仓库; battlefield.sh 仅为示例模板) ----
+# ---- 个人游戏脚本 (含私有标定值, 不进仓库; 仓库只留一份模板) ----
 scripts/game/*
-!scripts/game/battlefield.sh
+!scripts/game/template.sh.example

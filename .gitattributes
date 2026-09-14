@@ -1,5 +1,7 @@
 * text=auto
 *.sh text eol=lf
+# 启动脚本模板同样按脚本强制 LF (Jetson bash 不认 CRLF/BOM)
+*.sh.example text eol=lf
 *.py text eol=lf
 *.cu text eol=lf
 *.md text eol=lf
