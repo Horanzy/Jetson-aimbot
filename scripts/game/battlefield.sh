@@ -17,7 +17,11 @@ CONF_THRESH=0.5     # 置信度阈值
 Y_OFFSET=65         # 瞄准高度 (0=脚 50=中心 65=胸颈 100=头)
 CAM_DEV="Asus"      # 采集卡: Hagibis / Asus (或 /dev/videoN)
 CAM_FPS=120         # 采集帧率: 120 / 60
-MAX_SPEED=1500      # 速度上限 px/s
+MAX_SPEED=2000      # 准星速度上限 px/s (= 屏幕速度上限 px/ms × 1000)
+                    # 取值依据: 屏幕速度 = 960·v_world/d_min (f≈960px@1080p/90°hFOV),
+                    # 准星必须至少赶上目标的屏幕速度, 否则饱和追赶、误差无界增长。
+                    # 2000 覆盖本库行为模型里最快的屏幕运动 (10m 冲刺 1.6 / 近距
+                    # 大跳 1.83 / 逼近 1.99 px/ms); 再高不再改变精度 (饱和于目标速度)。
 AIM_KEY=both        # 触发键: fire / ads / both
 FOV_R=150          # FOV 半径 px (目标选取门, webui 可热调; 若 Jetson 旧脚本有别的值请改回)
 PREVIEW="n"         # 预览窗口: y / n
