@@ -14,6 +14,70 @@ No hand-tuned gains: a bilateral side-key trigger runs auto-calibration, estimat
 
 **Control law**: the single program `src/aimbot.cu` uses **ff_pi_acc** (pole-placement PI + type-2 velocity feedforward with direction-contradiction CUSUM velocity reset and detection-gap FF decay, plus an innovation-mean â channel that removes the α-β structural lag on accelerating targets) — the convergence bandwidth `wn` is derived from the calibrated delay `L` via phase margin (`wn=(90°−PM)π/180/L`, PM=50°), **no hand-tuned magic numbers**, good generalization. The same binary has **optional training-data collection** (enabled with `-o`, otherwise pure aimbot). All control-law exploration/comparison/tuning happens in the pure-Python `arena/` simulation (this machine cannot compile .cu).
 
+## Author's requirements (binding)
+
+The author's standing requirements for this repository. They are not style preferences: a
+change that violates one is rejected even when its measured benefit is real. Read this
+section before editing anything.
+
+**1. The library reads as if it had been written in one go.** No patch-style narration, no
+version comparison, no timeline or provenance voice — not in this file, not in docstrings,
+not in code comments. Forbidden: "patch 1 …", "this version improves on the previous one",
+"recently added", "the old implementation was …", "a debugging round on <date> found …".
+Required instead: design rationale and measured numbers stated as standing facts ("the cap
+is a physical requirement because …"), and rejected paths recorded as conclusions ("a
+persistently faster gain is forbidden: …") — never as a history of who changed what when.
+
+> 作者原话: "让整个库看起来'像是一次性写出来的'，意思就是不要有什么补丁1：xxxx patch2：
+> xxxx 这个版本相比上个版本提升了xxxx之类的话……总之库要是干净的整洁的。"
+
+**2. No magic numbers.** Every constant traces to one of three things: an explicit physical
+quantity, a reproducible derivation, or a written-down selection rule. Forbidden: thresholds
+produced by tuning with no criterion and no provenance, and compromises found on a single
+scenario. The accepted form is already used throughout — `PRED_BETA0=0.03` is labelled
+"band-edge margin", `ACC_SNR=10` "the smallest whole value holding the whole delay and s
+band bit-exact", `PM=50` "chosen by the mismatch-band test suite", `FF_PM_DEG`/`FF_ZETA`
+dimensionless design choices with the reason stated. Corollary, and the reason this matters:
+a number no command can reproduce — typically one that came from an experimental file since
+deleted — must either gain a reproduction path or be removed, or be rewritten as a
+qualitative statement without it.
+
+> 作者原话: "不能有'魔法数字'。……没有什么经过无数次微调得到的那种魔法数字。"
+
+**3. The result is what counts, and method-level change is welcome.** Anything that measures
+better is acceptable, including structural change — replacing the estimator or the law, or
+adding a mechanism of the CUSUM kind. A rewrite is not required; but knob-tuning alone is the
+weakest available option, not the target. What is *not* acceptable is an unsourced constant
+added for feel (requirement 2).
+
+> 作者原话: "我不管你怎么做，我只要最后结果好。"
+
+**4. The evaluation groups are the contract.** A change ships only after passing all of:
+`arena.eval` (matched composite, worst mismatch over L30–70, and the 60/120 fps delta must
+not rise), `arena.integrate` (no divergence anywhere in the wide delay band L20–80 or s
+0.7–1.3 — divergence loses outright, however fast the scheme), `arena.fps_eval` (neither the
+clean nor the flaky `drop_p=0.12` variant may get worse; the per-phase air / dash / slide
+tables are the focus), and `arena.selftest`. Experiment in `arena/laws/_wip_*.py`; a shared
+evaluation group or the shipped law is never edited to accommodate an experiment.
+
+**5. Mismatch and flakiness are tested for anything claiming to be faster.** Any "faster /
+more aggressive" mechanism reports its behaviour across the mismatch band *and* under flaky
+detection. A scheme that wins at matched and breaks in either place is not a candidate.
+
+**6. Reproduce before believing; report numbers, not intentions.** Re-derive the baseline of
+whatever is about to change before touching it, and do not accept a number in this file as
+fact without re-running its command — the figures here are measurements with reproduction
+paths, not axioms. After a change, re-run the full set above and list the files touched.
+Keep what was measured, what is inferred from documentation, and what is still unverified
+clearly apart; "should be better" is not a result — give a number or write "unverified".
+
+**7. Documentation and code move together.** A changed constant, default, CLI flag or module
+list updates its prose, its tables and its docstring defaults in the same edit.
+
+**8. `src/aimbot.cu` is edited here, verified on the Jetson.** This machine cannot compile or
+run it; every `.cu` change needs a rebuild and on-device validation on the Jetson and is
+never reported as verified from here.
+
 ## Environment
 
 - This folder is a **Windows development mirror**; code editing only.
@@ -242,7 +306,7 @@ Constraints for any future estimator work (each measured, each a constraint rath
 - **Only an evidence-gated one-shot correction can be both fast and safe.** A σ̂-normalized one-sided agreement CUSUM with a one-shot velocity catch-up holds the mismatch band with no divergence — the σ̂ self-widening that makes the reset robust also blinds any σ-normalized gate under mismatch — but as tuned it loses on the composite, because detection dropouts and ordinary maneuvers produce the same sustained same-sign innovation signature as a takeoff. Its amplitude must be the alarm-window mean; taking the last frame's innovation alone is markedly worse on both the matched composite and accel tracking. The residual difficulty is structural rather than a matter of sizing: the window-mean innovation also carries the α-β *position* transient, so a catch-up dimensioned by it over-shoots and costs the airborne on-body fraction.
 - **An attention/arming test cannot share the alarm's scale.** A deadband suppressing contradiction accumulation below a σ̂ multiple removes ~91% of all alarms and improves matched and framerate consistency, but it also removes the reset that flushes v̂ at real reversals (a clearly worse strafe-switch event overshoot at a 2σ̂ multiple), and it **self-blinds at the largest maneuvers**: at a 2V wall-bounce the discarded velocity is 0.45 px/ms — unambiguously real — yet classified as noise, because the bounce inflates σ̂ to ≈ 4.4 px so 2σ̂ ≈ 8.8 exceeds |v̂|·dt ≈ 3.8. Magnitude alone cannot be the discriminant either: over a full pass of the standard + FPS suites (baseline law, CUSUM resets that zero a velocity) the discarded velocity is a continuum running from the estimate's own velocity noise floor σ_v up to full target speed, so a magnitude threshold either keeps most false alarms or loses most real ones.
 - **The â channel's rebuild suppression is not the airborne bottleneck.** A noise-level v̂ (≈0.008 px/ms) does arm the CUSUM and can hold the rebuild suppression for ~417 ms, but forcing that suppression off changes the 10 m airborne RMSE by 0.02 px (18.90 → 18.88) — the estimate itself is what trails, not the gate that hides it.
-- **Velocity-estimate bandwidth is the airborne ceiling, and it is exactly the mismatch margin.** `arena.diag` attributes 42–64% of the airborne RMSE to the velocity state (causal bound 6.99–39.4 px against the law's 18.90–68.26 px), and the entire gap is estimator bandwidth: `FFPiAccLaw(beta0=0.04)` — the first value that breaks the L20 corner, where the step response hunts and never settles (0.035 still passes), so 0.03 is the band edge itself rather than a conservative pick — buys 5.6% (10 m airborne 18.90 → 17.85), `beta0=0.06` buys 17% (15.67) and hunts at L_true = 30, and `imm_pi`, the library's own fast estimator, reaches 10.92 px on the same scenario while failing the same band. Splitting the two places v̂ is consumed (the Smith assembly and the feedforward) does not separate the gain from the instability — a fast channel diverges through either path. The estimator a challenger must supply is therefore not a faster one but one whose error is *uncorrelated with the loop's own motion*: error that correlates with it closes a positive feedback whose gain rises with the mismatch, which is why every bandwidth increase is paid for in margin rather than being free tracking speed.
+- **Velocity-estimate bandwidth is the airborne ceiling, and it is exactly the mismatch margin.** `arena.diag` attributes 42–64% of the airborne RMSE to the velocity state (causal bound 6.99–39.4 px against the law's 18.90–68.26 px), and the entire gap is estimator bandwidth: `FFPiAccLaw(beta0=0.04)` — the first value that breaks the L20 corner, where the step response hunts and never settles (0.035 still passes, with a worse composite) — buys 5.6% (10 m airborne 18.90 → 17.85), `beta0=0.06` buys 17% (15.67) and hunts at L_true = 30, and `imm_pi`, the library's own fast estimator, reaches 10.92 px on the same scenario while failing the same band. Splitting the two places v̂ is consumed (the Smith assembly and the feedforward) does not separate the gain from the instability — a fast channel diverges through either path. The estimator a challenger must supply is therefore not a faster one but one whose error is *uncorrelated with the loop's own motion*: error that correlates with it closes a positive feedback whose gain rises with the mismatch, which is why every bandwidth increase is paid for in margin rather than being free tracking speed.
 - **The â channel's gates are not where its headroom lies; its sensor is its own ceiling.** The significance floor forms the noise scale as the second moment of the clipped cleaned innovation minus ȳ², so the signal's own variance is booked as noise — during a 10 m jump the implied noise reads ≈1.3 px against a 0.5 px detection noise — and the floor therefore rises with the very maneuver it is meant to detect. Each gate lifted alone is worth under a pixel; lifting the floor, the rebuild suppression and the CUSUM contradiction gate together still leaves most of the oracle gap, because ȳ is an EMA of a transient-dominated clipped innovation and carries only a fraction of the true acceleration. The contradiction gate is self-blocking by construction — the CUSUM declares a contradiction precisely because the α-β velocity lags, which is what the channel exists to correct — but it is load-bearing elsewhere: removing it trades airborne RMSE for FPS event overshoot and recovery. A challenger has to replace the sensor formulation, not the gates around it.
 
 ### Leaderboard results (`arena.integrate`, all laws tuned from principles; lower is better)
