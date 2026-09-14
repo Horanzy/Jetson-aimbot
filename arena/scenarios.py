@@ -99,6 +99,14 @@ class Scenario:
     step_dir: tuple = (1.0, 0.0) # step 场景的阶跃方向 (供过冲投影)
     settle_band: float = 3.0     # 稳定判据 px
     steady_from: float = 0.0     # 跟踪场景从何时起算稳态指标
+    # 阶段标注: ((t0_ms, t1_ms, kind), ...) — 控制学上"持续的另一种工况"的时间段
+    # (滞空/冲刺/滑铲…), 供 metrics.phase_metrics 单独统计。与 events (瞬时冲击)
+    # 互补: 阶段指标衡量持续段质量, 不受事件前拖尾的"相对口径"影响。
+    phases: tuple = ()
+    # 交战距离 m: 该场景的轨迹幅值按此距离标定 (屏幕速度与屏幕重力都 ∝ 1/d,
+    # 见 fps.py 的量纲换算)。命中带 metrics.body_px(dist_m) 随距离缩放,
+    # 不写死绝对值 —— 固定 10m 的带宽会在近距离系统性少算命中率。
+    dist_m: float = 10.0
 
 
 def _step(rng, dist=80.0, ang=0.0):

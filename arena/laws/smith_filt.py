@@ -146,7 +146,7 @@ vext = 1 = 全量物理外推 (非调参增益 — 就是"把观测到的扰动�
                   目标零位置滞后可跟踪。
   jump_gate=120.0 残差创新跳变门 (px): 切场景/切目标时重置残差滤波器
                   而非追它。结构性, 非性能旋钮 (~FOV 尺度)。
-  max_v = 1.5     指令速度饱和 (px/ms); 硬件速度上限 (正常经 cfg.max_v 注入)。
+  max_v = 0       指令速度饱和 (px/ms); 取 cfg.max_v, 即硬件速度上限 (通常 1.5)。
 
 ================================================================================
 已知局限
@@ -213,7 +213,7 @@ class SmithFiltLaw(Law):
     def __init__(self, pm_deg=60.0, zeta=1.0, lam_frac=1.0, L_inflate=1.0,
                  vext=1.0, rho=0.0, rv_tau_frames=1.0, ki_mult=1.0,
                  beta_frac=0.3, rv_max=2.0, i_gate=8.0, i_frac=1.0,
-                 jump_gate=120.0, max_v=1.5):
+                 jump_gate=120.0, max_v=0.0):
         self.pm_deg = pm_deg          # 对完整延迟留的 PM, 用于定 wn
         self.zeta = zeta              # 无延迟阻尼 (临界 = 1)
         self.lam_frac = lam_frac      # λ = lam_frac·L̂ (滤波截止在 1/L̂)
@@ -227,7 +227,7 @@ class SmithFiltLaw(Law):
         self.i_gate = i_gate          # 经验: 积分距离门 (px)
         self.i_frac = i_frac          # 积分限幅 = i_frac·max_v/Ki
         self.jump_gate = jump_gate    # 结构: 残差创新重置门 (px)
-        self._max_v = max_v           # 硬件速度上限 (px/ms)
+        self._max_v = max_v           # 0 = 取 cfg.max_v; 硬件速度上限 (px/ms)
 
     def reset(self, cfg: LawConfig):
         self.cfg = cfg

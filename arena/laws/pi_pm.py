@@ -69,7 +69,7 @@ beta0 = 0.04   [EMPIRICAL: alpha-beta 估计器增益]
 beta_exp = 1.0   [设计: 每机动事件 fvx 适配量恒定 → 帧率无关]
     β 按 dt^beta_exp 缩放。1 = 60/120fps 机动跟踪一致。
 
-max_v = 1.5 px/ms   [由 cfg.max_v 注入]
+max_v = 0 -> cfg.max_v   指令速度饱和 (硬件速度上限, 通常 1.5 px/ms)
     速度上限, 同时决定积分限幅。
 
 ## 实机调参
@@ -99,11 +99,11 @@ class PiPmLaw(Law):
     JUMP_GATE = 100.0
     STALE = 200.0
 
-    def __init__(self, zeta=1.0, pm_deg=60.0, max_v=1.5, i_gate=8.0, i_frac=1.0,
+    def __init__(self, zeta=1.0, pm_deg=60.0, max_v=0.0, i_gate=8.0, i_frac=1.0,
                  alpha0=0.50, beta0=0.04, l_comp=1.1, beta_exp=1.0):
         self.zeta = zeta            # 阻尼比 (无量纲设计选择, 临界阻尼=1)
         self.pm_deg = pm_deg        # 相位裕度 (无量纲设计选择), 决定导出带宽
-        self._max_v = max_v
+        self._max_v = max_v      # 0 = 取 cfg.max_v (硬件速度上限)
         self.i_gate = i_gate        # I 距离衰减 (EMPIRICAL: 划分拉枪/跟踪)
         self.i_frac = i_frac        # 积分限幅 = i_frac×max_v/Ki (可跟踪最大速度)
         self.alpha0 = alpha0        # @DT0 位置修正; 按 dt 缩放 (k1=α/dt 恒定)

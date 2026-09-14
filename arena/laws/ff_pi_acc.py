@@ -88,6 +88,7 @@ debug() 字段语义 (px / px/ms / px/ms² / σ):
   accx, accy       本帧 CUSUM 增量 (σ 单位, 截断前)
   aown_x, aown_y   自身加速度 (px/ms², counts 历史精确差分)
   reb_x, reb_y     重建抑制旗标 (1 = v̂ 重建期)
+  inx, iny         最近一帧原始创新 (px)
 """
 from __future__ import annotations
 import math
@@ -139,7 +140,7 @@ class FFPiAccLaw(Law):
         self.i_frac = kw.pop("i_frac", 1.0)
         self.pm_deg = kw.pop("pm_deg")
         self.beta0 = kw.pop("beta0")
-        self._max_v = kw.pop("max_v", 1.5)
+        self._max_v = kw.pop("max_v", 0.0)   # 0 = 取 cfg.max_v (硬件速度上限)
         self._dbg = {}
 
     def reset(self, cfg: LawConfig):
@@ -165,6 +166,8 @@ class FFPiAccLaw(Law):
         self.ax_e = self.ay_e = 0.0      # 加速度估计 (px/ms²)
         self.reb_x = self.reb_y = True   # 重建抑制旗标 (v̂ 自 0 重建期)
         self.reb_until_x = self.reb_until_y = -1e9  # 旗标最短保持期 (det 轴)
+        self._last_inx = self._last_iny = 0.0   # 最近一帧原始创新 (px)
+        self._last_clx = self._last_cly = 0.0   # 最近一帧清洗创新 (px)
         self._last_T = self.DT0          # 最近一帧的更新周期/增益 (供 â 反演)
         self._last_alpha = self.alpha0
         self._last_beta = self.beta0
@@ -214,6 +217,8 @@ class FFPiAccLaw(Law):
             self.sig2rx = self.sig2ry = 1.0
             self.ybar_x = self.ybar_y = 0.0
             self.ax_e = self.ay_e = 0.0
+            self._last_inx = self._last_iny = 0.0
+            self._last_clx = self._last_cly = 0.0
             self.reb_x = self.reb_y = True
             rb_hold = self.RB_HOLD_N * dt / max(
                 1e-6, min(0.60, self.beta0 * dt / self.DT0))
@@ -243,6 +248,8 @@ class FFPiAccLaw(Law):
                       self.SIG_CLIP_K * sry)
             self.sig2rx += beta_s * (clx * clx - self.sig2rx)
             self.sig2ry += beta_s * (cly * cly - self.sig2ry)
+            self._last_inx, self._last_iny = inx, iny
+            self._last_clx, self._last_cly = clx, cly
             # 自身加速度活动门 (伪创新 ∝ a_own·Δ; 门与伪迹物理对齐)
             w_own = max(1.0, cfg.L)
             st0 = self.ch.at(det.t)
@@ -282,8 +289,11 @@ class FFPiAccLaw(Law):
                 g_y = ga_own_y * (1.0 - min(1.0, self.csy / self.CUSUM_H))
                 self.ybar_y += rho * (g_y * cly - self.ybar_y)
             # 双向 CUSUM, 只累计与 v̂ 矛盾方向的创新 (σ 归一, ff_pi 原语义):
-            #   矛盾 = 创新方向与 v̂ 相反 — 急停/变向的签名。
-            #   v̂≈0 时不累计 (无可矛盾); 单帧封顶 C 拒单帧踢脚。
+            #   矛盾 = 创新方向与 v̂ 相反 — 急停/变向的签名。方向取自 v̂ 的符号,
+            #   因此只有 v̂ 精确为 0 (复位后的重建帧) 才退化为纯漂移衰减。
+            #   σ̂ 取原始创新二阶矩: 失配伪创新把告警门一并撑宽 (自失明), 该特性
+            #   在过估延迟档是对回弹的有效阻尼 (见模块 docstring)。单帧封顶 C
+            #   拒单帧踢脚。
             if self.fvx > 0:
                 accx = -inx / sx
             elif self.fvx < 0:
@@ -427,6 +437,7 @@ class FFPiAccLaw(Law):
             "aown_x": self._aown_x, "aown_y": self._aown_y,
             "reb_x": 1.0 if self.reb_x else 0.0,
             "reb_y": 1.0 if self.reb_y else 0.0,
+            "inx": self._last_inx, "iny": self._last_iny,
         }
         return cx, cy
 

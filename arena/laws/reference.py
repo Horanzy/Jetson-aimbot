@@ -21,10 +21,10 @@ class ReferenceLaw(Law):
     TI_TAU_RATIO = 0.5
     I_GATE_DIST = 30.0
 
-    def __init__(self, tau=80.0, tau_i=60.0, max_v=1.5):
+    def __init__(self, tau=80.0, tau_i=60.0, max_v=0.0):
         self.tau = tau
         self.tau_i = tau_i
-        self._max_v = max_v
+        self._max_v = max_v      # 0 = 取 cfg.max_v (硬件速度上限)
 
     def reset(self, cfg: LawConfig):
         self.cfg = cfg

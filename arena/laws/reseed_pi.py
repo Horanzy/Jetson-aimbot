@@ -124,7 +124,7 @@ class ReseedPILaw(Law):
         self.i_frac = kw.pop("i_frac", 1.0)
         self.pm_deg = kw.pop("pm_deg")
         self.beta0 = kw.pop("beta0")
-        self._max_v = kw.pop("max_v", 1.5)
+        self._max_v = kw.pop("max_v", 0.0)   # 0 = 取 cfg.max_v
         self._dbg = {}
 
     def reset(self, cfg: LawConfig):

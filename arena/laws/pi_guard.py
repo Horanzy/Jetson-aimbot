@@ -108,11 +108,11 @@ class PiGuardLaw(Law):
     CUSUM_C = 3.0
     CUSUM_H = 9.0
 
-    def __init__(self, zeta=1.0, pm_deg=60.0, max_v=1.5, i_gate=8.0, i_frac=1.0,
+    def __init__(self, zeta=1.0, pm_deg=60.0, max_v=0.0, i_gate=8.0, i_frac=1.0,
                  alpha0=0.50, beta0=0.04, l_comp=1.1, beta_exp=1.0):
         self.zeta = zeta            # 阻尼比 (无量纲设计选择, 临界阻尼=1)
         self.pm_deg = pm_deg        # 相位裕度 (无量纲设计选择), 决定导出带宽
-        self._max_v = max_v
+        self._max_v = max_v      # 0 = 取 cfg.max_v (硬件速度上限)
         self.i_gate = i_gate        # I 距离衰减 (EMPIRICAL: 划分拉枪/跟踪)
         self.i_frac = i_frac        # 积分限幅 = i_frac×max_v/Ki
         self.alpha0 = alpha0        # @DT0 位置修正; 按 dt 缩放

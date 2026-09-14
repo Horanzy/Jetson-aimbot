@@ -16,6 +16,9 @@
     跳跃: 起跳 ≈5.7m/s → 屏幕竖直速度 ≈ 0.55 px/ms @10m; 重力 15.24m/s²
     (Source 800u/s²) → 屏幕重力 ≈ 0.0015 px/ms²; 滞空 ≈ 0.73s, 弧顶 ≈ 100px。
     (蹬墙跳/滑铲/冲刺速度取 Apex/Titanfall 量级, 同一换算。)
+    换算的推论 (套件按距离取档的依据): 屏幕速度与屏幕重力都 ∝ 1/d, 因此同一
+    世界运动在距离 d 处的屏幕运动学 = 10m 标定值 × (10/d); 滞空时长 2·vz0/g
+    与距离无关 (k 自消), 弧顶 ∝ 1/d。NEAR_JUMP_DIST 档由此而来。
 
 关键投影事实 (决定各类的实现方式):
     - 平移 strafe 的屏幕方向 heading 是任意的 (取决于玩家朝向与几何), 因此
@@ -38,7 +41,8 @@ from arena.scenarios import Scenario, Target
 
 @dataclass
 class FpsScenario(Scenario):
-    """带事件标注的场景。events: ((t_ms, kind), ...), kind 为自由文本。"""
+    """带事件标注的场景。events: ((t_ms, kind), ...), kind 为自由文本。
+    phases 见 Scenario (持续段口径: 滞空 air / 冲刺 dash / 滑铲 slide)。"""
     events: tuple = ()
 
 
@@ -275,6 +279,11 @@ class BhopTarget(_FpsBase):
         return [self.t0 + i * self.period + self.t_air
                 for i in range(self.n)]
 
+    def air_windows(self):
+        """每次起跳的滞空窗口 (起跳, 落地) — 供阶段指标 (metrics.phase_metrics)。"""
+        return [(self.t0 + i * self.period, self.t0 + i * self.period + self.t_air)
+                for i in range(self.n)]
+
     def _speed(self):
         return self.v
 
@@ -391,9 +400,30 @@ class DashTarget(_FpsBase):
         return self.v
 
 
+# 近距大跳档 (m): 套件默认按 10m 标定, 弧顶只有 101px; 实机投诉的"突然大跳、
+# 速度很高、滞空很短"是近距离工况 —— 同一跳跃按 1/d 缩放后, 5m 弧顶 202px,
+# 3m 弧顶 336px 且起跳竖直速度 1.83px/ms 超过速度帽 1.5px/ms (滞空时长与距离
+# 无关: 2·vz0/g 中 k 自消)。这一维原先在套件里没有代表。
+NEAR_JUMP_DIST = (5.0, 3.0)
+
+
+def _jump_target(dist_m, **kw):
+    """按距离缩放的跳跃目标: 屏幕速度与屏幕重力都 ∝ 1/d (模块 docstring 的
+    换算), 所以把 10m 标定的 vz0/g 同乘 10/d 即得该距离的运动学。"""
+    k = 10.0 / dist_m
+    return JumpLandTarget(40.0, 0.5, 800.0, vz0=VZ_JUMP * k,
+                          g=G_SCREEN * k, **kw)
+
+
+def _air_phase(t_jump, t_land):
+    """滞空段 [(起跳, 落地, "air")] — 时刻由与场景同一套运动学算出。"""
+    return ((t_jump, t_land, "air"),)
+
+
 def fps_suite():
-    """标准 FPS 行为套件。速度取 10m 交战距离的屏幕换算 (见模块 docstring):
-    strafe 0.45-0.7 px/ms, 跳跃 vz0≈0.55 / g≈0.0015, 蹬墙跳折返幅度 2V。"""
+    """标准 FPS 行为套件。未标注距离的条目取 10m 交战距离的屏幕换算 (见模块
+    docstring): strafe 0.45-0.7 px/ms, 跳跃 vz0≈0.55 / g≈0.0015, 蹬墙跳折返
+    幅度 2V; NEAR_JUMP_DIST 档按 1/d 缩放到近距大跳。"""
     suite = []
     add = suite.append
 
@@ -412,26 +442,41 @@ def fps_suite():
         lambda rng: JumpLandTarget(40.0, 0.5, 800.0, land_mode="stop",
                                    land_tau=120.0),
         (0.0, 0.0), "track", steady_from=0.0,
-        events=((JumpLandTarget.land_time(800.0), "land"),)))
+        events=((JumpLandTarget.land_time(800.0), "land"),),
+        phases=_air_phase(800.0, JumpLandTarget.land_time(800.0))))
     add(FpsScenario(
         "fps_jump_land_keep", 2600.0,
         lambda rng: JumpLandTarget(40.0, 0.5, 800.0, land_mode="keep"),
         (0.0, 0.0), "track", steady_from=0.0,
-        events=((JumpLandTarget.land_time(800.0), "land"),)))
+        events=((JumpLandTarget.land_time(800.0), "land"),),
+        phases=_air_phase(800.0, JumpLandTarget.land_time(800.0))))
     add(FpsScenario(
         "fps_jump_airaccel", 2600.0,
         lambda rng: JumpLandTarget(40.0, 0.5, 800.0, land_mode="keep",
                                    air_vx_delta=0.06),
         (0.0, 0.0), "track", steady_from=0.0,
         events=((800.0 + 0.55 / 0.0015, "air-accel"),
-                (JumpLandTarget.land_time(800.0), "land"))))
+                (JumpLandTarget.land_time(800.0), "land")),
+        phases=_air_phase(800.0, JumpLandTarget.land_time(800.0))))
     add(FpsScenario(
         "fps_wall_bounce", 2800.0,
         lambda rng: WallBounceTarget(40.0, 0.6, 600.0, t_bounce=950.0),
         (0.0, 0.0), "track", steady_from=0.0,
         events=((950.0, "bounce-2V"),
                 (WallBounceTarget(
-                    0.0, 0.6, 600.0, t_bounce=950.0).t_land, "land"))))
+                    0.0, 0.6, 600.0, t_bounce=950.0).t_land, "land")),
+        phases=_air_phase(600.0, WallBounceTarget(
+                    0.0, 0.6, 600.0, t_bounce=950.0).t_land)))
+    # 近距大跳: 与 10m 档同一套时刻 —— 滞空时长 2·vz0/g 在 1/d 缩放下不变, 所以
+    # 只有幅值与速度不同, 两个档可以直接和上面对照。
+    for _d in NEAR_JUMP_DIST:
+        add(FpsScenario(
+            f"fps_jump_{_d:g}m", 2600.0,
+            lambda rng, d=_d: _jump_target(d, land_mode="stop", land_tau=120.0),
+            (0.0, 0.0), "track", steady_from=0.0,
+            events=((JumpLandTarget.land_time(800.0), "land"),),
+            phases=_air_phase(800.0, JumpLandTarget.land_time(800.0)),
+            dist_m=_d))
     add(FpsScenario(
         "fps_strafe_switch", 3000.0,
         lambda rng: StrafeSwitchTarget(40.0, 0.5, period=900.0, n_switches=3),
@@ -450,12 +495,16 @@ def fps_suite():
         (0.0, 0.0), "track", steady_from=0.0,
         events=tuple((t, "land") for t in
                      BhopTarget(0.0, 0.0, 600.0, period=750.0,
-                                n_jumps=3).land_times())))
+                                n_jumps=3).land_times()),
+        phases=tuple((a, b, "air") for a, b in
+                     BhopTarget(0.0, 0.0, 600.0, period=750.0,
+                                n_jumps=3).air_windows())))
     add(FpsScenario(
         "fps_slide", 2500.0,
         lambda rng: SlideTarget(40.0, 0.5, 700.0),
         (0.0, 0.0), "track", steady_from=0.0,
-        events=((700.0, "slide"), (1400.0, "rise"))))
+        events=((700.0, "slide"), (1400.0, "rise")),
+        phases=((700.0, 1400.0, "slide"),)))
     add(FpsScenario(
         "fps_turn_90", 2200.0,
         lambda rng: TurnTarget(40.0, 0.35, phi_deg=90.0, turn_ms=120.0,
@@ -471,5 +520,6 @@ def fps_suite():
         lambda rng: DashTarget(40.0, 0.4, 800.0, burst=4.0, dash_ms=120.0,
                                end="stop"),
         (0.0, 0.0), "track", steady_from=0.0,
-        events=((920.0, "stop"),)))
+        events=((920.0, "stop"),),
+        phases=((800.0, 920.0, "dash"),)))
     return suite

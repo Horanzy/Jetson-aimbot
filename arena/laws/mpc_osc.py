@@ -153,11 +153,11 @@ class MpcOscLaw(Law):
     IN_SIGMA = 3.0            # 显著创新门限 (σ̂ 倍数, 无量纲)
     FLIP_N = 2.0              # 升级所需翻转数 (无量纲: 一次振荡 ≥2 次方向反转)
 
-    def __init__(self, PM=60.0, qf=None, max_v=1.5, L_inflate=1.1, vff=1.0,
+    def __init__(self, PM=60.0, qf=None, max_v=0.0, L_inflate=1.1, vff=1.0,
                  alpha0=0.30, beta0=0.08, beta_exp=1.0):
         self._PM = PM                # 相位裕度 (deg): 唯一设计旋钮, 定带宽/权重 ([1])
         self._qf = qf                # None=自动 DARE 终端权重 ([3])
-        self._max_v = max_v          # 速率硬约束 Vmax (px/ms)
+        self._max_v = max_v          # 0 = 取 cfg.max_v; 速率硬约束 Vmax (px/ms)
         self._L_inflate = L_inflate  # Smith 过补偿系数 ([4])
         self._vff = vff              # 速度前馈系数 (=1 匀速零拖尾)
         self._alpha0 = alpha0        # 估计器约定 (@DT0 位置增益, 按 dt 归一)

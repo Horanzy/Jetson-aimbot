@@ -95,14 +95,14 @@ class KalmanPILaw(Law):
     V0_STD = 1.0          # 初始速度先验 std (px/ms); 仅影响暂态
 
     def __init__(self, pm_deg=60.0, zeta=1.0, sep=5.0, noise_std=0.5,
-                 i_gate=8.0, l_comp=1.1, max_v=1.5):
+                 i_gate=8.0, l_comp=1.1, max_v=0.0):
         self.pm_deg = pm_deg
         self.zeta = zeta
         self.sep = sep
         self.noise_std = noise_std
         self.i_gate = i_gate
         self.l_comp = l_comp
-        self._max_v = max_v
+        self._max_v = max_v      # 0 = 取 cfg.max_v (硬件速度上限)
 
     def reset(self, cfg: LawConfig):
         self.cfg = cfg

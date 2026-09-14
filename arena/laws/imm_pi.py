@@ -146,7 +146,7 @@ class ImmPILaw(Law):
     GAMMA_HI = math.sqrt(6.0)  # 高机动模式跟踪指数 = 三点差分可辨识天花板
 
     def __init__(self, pm_deg=50.0, zeta=1.0, ff_gain=1.0, l_comp=1.1,
-                 i_gate=8.0, i_frac=1.0, noise_std=0.5, max_v=1.5):
+                 i_gate=8.0, i_frac=1.0, noise_std=0.5, max_v=0.0):
         # 设计点 (PM=50 失配带全过最快点; ζ=1 临界阻尼)
         self.pm_deg = pm_deg
         self.zeta = zeta
@@ -155,7 +155,7 @@ class ImmPILaw(Law):
         self.i_gate = i_gate
         self.i_frac = i_frac
         self.noise_std = noise_std
-        self._max_v = max_v
+        self._max_v = max_v      # 0 = 取 cfg.max_v (硬件速度上限)
         self.sigma_a_low = _sigma_a_for_beta(self.BETA0, self.DT0, 1.0)
 
     def reset(self, cfg: LawConfig):
