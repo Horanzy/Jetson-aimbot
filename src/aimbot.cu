@@ -13,9 +13,13 @@
 //
 //  采集 (可选): 传 -o 输出目录即开启, 按三源触发自动截图 (开火 / 检测 / 定时),
 //    截图 = 模型输入同款中心裁剪, 按来源分子目录, 异步写盘不阻塞推理。不传 -o 则纯自瞄。
+//    三源各有独立开关 (-e, 热参 cap_fire/cap_det/cap_auto), 间隔参数见 -F/-A/-C。
 //
-//  热参数: UDP 127.0.0.1 上的极小本地控制通道 (白名单 t/y/x/fov/k, 固件侧强制钳制),
-//    webui 保存后即时生效不重启; 结构常量仍为编译期, 与"无手调魔法数字"哲学一致。
+//  鼠标接管: -a n (或热参 aim=0) 时固件纯透传真实鼠标 — 不注入任何移动, 检测/采集照常。
+//    模型未完善但需要采集数据的运行形态; aim=1 即恢复控制输出。
+//
+//  热参数: UDP 127.0.0.1 上的极小本地控制通道 (白名单 t/y/x/fov/k/aim/cap_*, 固件侧强制
+//    钳制), webui 保存后即时生效不重启; 结构常量仍为编译期, 与"无手调魔法数字"哲学一致。
 //
 //  标定: 双侧键长按 5 秒, 程序自动生成激励轨迹 (画正方形), 块相位相关测背景位移,
 //    最小二乘估计灵敏度 s (px/count) + 环路延迟 L (ms); 经 -S 传入脚本路径时自动回写。
@@ -149,6 +153,10 @@ std::atomic<float> g_y_off_pct{65.0f};               // 瞄准高度偏移 % (-y
 std::atomic<float> g_max_v{1.5f};                    // 速度上限 px/ms (= -x / 1000)
 std::atomic<int>   g_aim_mode{0};                    // 触发键模式 (-k): 0=fire 1=ads 2=both
 std::atomic<float> g_fov_radius{FOV_RADIUS};         // FOV 半径 px (-r / 热参 fov)
+std::atomic<bool>  g_aim_enabled{true};              // 鼠标接管 (-a / 热参 aim): false=纯透传不注入
+std::atomic<bool>  g_cap_fire{true};                 // 采集源开关 (-e / 热参): 开火截图
+std::atomic<bool>  g_cap_det{true};                  //   检测截图
+std::atomic<bool>  g_cap_auto{true};                 //   定时截图
 
 // ---- 时间辅助 ----
 static inline std::chrono::steady_clock::time_point shift_ms(
@@ -771,11 +779,11 @@ void ai_thread(std::string model_path, int target_cls,
             std::string mode;
 
             if (g_left_down.load()) {
-                if (elapsed_ms(now,last_fire) >= fire_ms) { mode="fire"; last_fire=now; }
-                if (now>=next_auto) next_auto=now+roll_auto();
+                if (g_cap_fire.load() && elapsed_ms(now,last_fire) >= fire_ms) { mode="fire"; last_fire=now; }
+                if (g_cap_auto.load() && now>=next_auto) next_auto=now+roll_auto();
             } else {
-                if (found && cd_ok) mode="det";
-                if (mode.empty() && now>=next_auto && cd_ok) mode="auto";
+                if (g_cap_det.load() && found && cd_ok) mode="det";
+                if (mode.empty() && g_cap_auto.load() && now>=next_auto && cd_ok) mode="auto";
             }
 
             if (!mode.empty()) {
@@ -897,7 +905,7 @@ void hotctl_thread() {
     if (bind(fd,(sockaddr*)&addr,sizeof(addr))<0) {
         std::cerr<<"⚠ 热参数通道绑定失败 (端口 "<<HOT_CTL_PORT<<" 被占), 热参不可用\n";
         close(fd); return; }
-    std::cout<<"✅ 热参数通道: 127.0.0.1:"<<HOT_CTL_PORT<<" (t/y/x/fov/k)\n";
+    std::cout<<"✅ 热参数通道: 127.0.0.1:"<<HOT_CTL_PORT<<" (t/y/x/fov/k/aim/cap_*)\n";
     struct pollfd pfd{}; pfd.fd=fd; pfd.events=POLLIN;
     char buf[256];
     while (global_running) {
@@ -924,6 +932,16 @@ void hotctl_thread() {
                 int m=!strcmp(val,"fire")?0:!strcmp(val,"ads")?1:!strcmp(val,"both")?2:-1;
                 if (m>=0) { g_aim_mode.store(m); std::cout<<"[热参] k="<<val<<"\n"; }
                 else std::cout<<"[热参] 忽略 k="<<val<<" (须 fire/ads/both)\n";
+            } else if (!strcmp(key,"aim")||!strcmp(key,"cap_fire")
+                       ||!strcmp(key,"cap_det")||!strcmp(key,"cap_auto")) {
+                if (!strcmp(val,"0")||!strcmp(val,"1")) {
+                    bool on=(val[0]=='1');
+                    if      (!strcmp(key,"aim"))      g_aim_enabled.store(on);
+                    else if (!strcmp(key,"cap_fire")) g_cap_fire.store(on);
+                    else if (!strcmp(key,"cap_det"))  g_cap_det.store(on);
+                    else                              g_cap_auto.store(on);
+                    std::cout<<"[热参] "<<key<<"="<<val<<"\n";
+                } else std::cout<<"[热参] 忽略 "<<key<<"="<<val<<" (须 0/1)\n";
             } else {
                 std::cout<<"[热参] 忽略未知 key: "<<key<<"\n";
             }
@@ -939,7 +957,8 @@ int main(int argc, char* argv[]) {
              <<"========================================\n";
 
     std::string a_m,a_c,a_t,a_y,a_d,a_f,a_x,a_s,a_l,a_S,a_k,a_v,a_r;
-    std::string a_o; int fire_ms=300; double auto_s=10;
+    std::string a_o,a_a,a_e; bool have_e=false;
+    int fire_ms=300; double auto_s=10;
     int cooldown_ms=500; int jpeg_q=95;
 
     for (int i=1;i<argc;++i) {
@@ -957,6 +976,8 @@ int main(int argc, char* argv[]) {
         else if (arg=="-k"&&i+1<argc) a_k=argv[++i];
         else if (arg=="-v"&&i+1<argc) a_v=argv[++i];
         else if (arg=="-o"&&i+1<argc) a_o=argv[++i];
+        else if (arg=="-a"&&i+1<argc) a_a=argv[++i];
+        else if (arg=="-e"&&i+1<argc) { a_e=argv[++i]; have_e=true; }
         else if (arg=="-F"&&i+1<argc) fire_ms=std::stoi(argv[++i]);
         else if (arg=="-A"&&i+1<argc) auto_s=std::stod(argv[++i]);
         else if (arg=="-C"&&i+1<argc) cooldown_ms=std::stoi(argv[++i]);
@@ -971,8 +992,10 @@ int main(int argc, char* argv[]) {
                 "  -s <s>     初始灵敏度 -l <L>    初始延迟\n"
                 "  -S <脚本>  回写路径   -k <键>   fire/ads/both  -v <y/n> 预览\n"
                 "  -r <半径>  FOV 半径 px (默认 150, 10–1000)\n"
+                "  -a <y/n>   鼠标接管 (默认 y; n=纯透传: 不动鼠标, 检测/采集照常)\n"
                 "\n采集选项 (不传 -o 则纯自瞄不截图):\n"
                 "  -o <目录>  输出目录 (自动建 fire/ det/ auto/ 子目录)\n"
+                "  -e <列表>  启用的截图源 fire/det/auto 逗号分隔 (默认全部; 也可运行中热切)\n"
                 "  -F <ms>    开火截图间隔 (默认 300)\n"
                 "  -A <秒>    定时截图间隔 (默认 10, 随机 0.5x~1.5x)\n"
                 "  -C <ms>    检测/定时截图冷却 (默认 500, 开火不受限)\n"
@@ -1008,9 +1031,29 @@ int main(int argc, char* argv[]) {
     jpeg_q=std::clamp(jpeg_q,1,100);
     float fov_r=std::clamp(std::stof(a_r.empty()?"150":a_r),10.0f,1000.0f);
 
+    // 鼠标接管 (默认开) 与截图源 (默认全开; -e 给出时以该列表为准, 可为空 = 全关)
+    bool aim_on=!(a_a=="n"||a_a=="N");
+    bool fire_on=true, det_on=true, auto_on=true;
+    if (have_e) {
+        fire_on=det_on=auto_on=false;
+        std::string e=a_e;
+        e.erase(std::remove(e.begin(),e.end(),' '),e.end());
+        for (size_t p=0; p<e.size(); ) {
+            size_t q=e.find(',',p); if (q==std::string::npos) q=e.size();
+            std::string tok=e.substr(p,q-p);
+            if      (tok=="fire") fire_on=true;
+            else if (tok=="det")  det_on=true;
+            else if (tok=="auto") auto_on=true;
+            else std::cerr<<"未知截图源 \""<<tok<<"\" (可用: fire det auto)\n";
+            p=q+1;
+        }
+    }
+
     // 热参数原子初始化 = CLI 值 (未收热参时运行行为与旧版完全一致)
     g_conf_thr.store(conf); g_y_off_pct.store(y_off); g_max_v.store(max_v);
     g_aim_mode.store(aim_mode); g_fov_radius.store(fov_r);
+    g_aim_enabled.store(aim_on);
+    g_cap_fire.store(fire_on); g_cap_det.store(det_on); g_cap_auto.store(auto_on);
 
     const bool do_collect=!a_o.empty();
     if (do_collect) { ensure_dir(a_o); ensure_dir(a_o+"/fire");
@@ -1033,10 +1076,14 @@ int main(int argc, char* argv[]) {
       g_target.s_est=init_s; g_target.l_est_ms=init_l; }
 
     std::cout<<"初始: s="<<init_s<<" L="<<init_l<<" fov="<<fov_r<<"\n";
-    if (do_collect)
-        std::cout<<"采集: "<<a_o<<"  开火="<<fire_ms<<"ms  定时="<<auto_s
-                 <<"s  冷却="<<cooldown_ms<<"ms\n";
-    else
+    std::cout<<"鼠标接管: "<<(aim_on?"开":"关 (纯透传: 不注入移动, 检测/采集照常)")<<"\n";
+    if (do_collect) {
+        std::string srcs;
+        auto add_src=[&](bool on,const char* n){ if(on){ if(!srcs.empty()) srcs+=","; srcs+=n; } };
+        add_src(fire_on,"fire"); add_src(det_on,"det"); add_src(auto_on,"auto");
+        std::cout<<"采集: "<<a_o<<"  源="<<(srcs.empty()?"(无)":srcs)
+                 <<"  开火="<<fire_ms<<"ms  定时="<<auto_s<<"s  冷却="<<cooldown_ms<<"ms\n";
+    } else
         std::cout<<"采集: 关闭 (未传 -o)\n";
 
     MouseState state;
@@ -1072,7 +1119,13 @@ int main(int argc, char* argv[]) {
 
         int32_t fx=real_x, fy=real_y;
 
-        if (cal==3) {
+        if (!g_aim_enabled.load()) {
+            // 接管关闭: 纯透传 — 不注入任何 counts; 标定/瞄准状态机复位
+            // (标定激励是程序注入的移动, 与透传互斥), 重新开启后从干净状态起步
+            if (cal!=0) { cal=0; g_calib_collect=false;
+                          seq=nullptr; slen=si=st=wt=0; }
+            hold=0; rem_x=rem_y=0; int_x=int_y=0;
+        } else if (cal==3) {
             fx=fy=0;
             int done=g_calib_done.load();
             if (done!=0||++wt>CALIB_WAIT_TIMEOUT) {

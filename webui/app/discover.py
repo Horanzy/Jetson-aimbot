@@ -26,9 +26,13 @@ PARAM_DEFS = {
     "cam_fps":         dict(kind="int",   lo=1, hi=240, default=120),
     "max_speed":       dict(kind="float", lo=100.0, hi=20000.0, default=1500.0),
     "aim_key":         dict(kind="enum",  choices=("fire", "ads", "both"), default="both"),
+    "aim_enabled":     dict(kind="bool",  default=True),
     "fov":             dict(kind="float", lo=10.0, hi=1000.0, default=150.0),
     "preview":         dict(kind="bool",  default=False),
     "capture_enabled": dict(kind="bool",  default=False),
+    "cap_fire":        dict(kind="bool",  default=True),
+    "cap_det":         dict(kind="bool",  default=True),
+    "cap_auto":        dict(kind="bool",  default=True),
     "capture_dir":     dict(kind="dsdir", default=None),
     "fire_ms":         dict(kind="int",   lo=50, hi=60000, default=800),
     "auto_s":          dict(kind="float", lo=1.0, hi=3600.0, default=10.0),
@@ -36,15 +40,18 @@ PARAM_DEFS = {
     "jpeg_q":          dict(kind="int",   lo=1, hi=100, default=95),
 }
 # 热参数白名单: param key → 固件通道 key (对应 src/aimbot.cu hotctl_thread)
-HOT_WIRE_KEYS = {"conf": "t", "y_offset": "y", "max_speed": "x", "fov": "fov", "aim_key": "k"}
+HOT_WIRE_KEYS = {"conf": "t", "y_offset": "y", "max_speed": "x", "fov": "fov", "aim_key": "k",
+                 "aim_enabled": "aim", "cap_fire": "cap_fire", "cap_det": "cap_det",
+                 "cap_auto": "cap_auto"}
 
 SCRIPT_VARS = {
     "CLASS_ID": "class_id", "CONF_THRESH": "conf", "Y_OFFSET": "y_offset",
     "CAM_DEV": "cam_dev", "CAM_FPS": "cam_fps", "MAX_SPEED": "max_speed",
-    "AIM_KEY": "aim_key", "PREVIEW": "preview", "CAPTURE": "capture_enabled",
-    "OUT_DIR": "capture_dir", "FIRE_MS": "fire_ms", "AUTO_S": "auto_s",
-    "COOLDOWN_MS": "cooldown_ms", "JPEG_Q": "jpeg_q", "MODEL_PATH": "model",
-    "FOV_R": "fov",
+    "AIM_KEY": "aim_key", "AIM_ENABLED": "aim_enabled", "PREVIEW": "preview",
+    "CAPTURE": "capture_enabled", "CAP_FIRE": "cap_fire", "CAP_DET": "cap_det",
+    "CAP_AUTO": "cap_auto", "OUT_DIR": "capture_dir", "FIRE_MS": "fire_ms",
+    "AUTO_S": "auto_s", "COOLDOWN_MS": "cooldown_ms", "JPEG_Q": "jpeg_q",
+    "MODEL_PATH": "model", "FOV_R": "fov",
 }
 
 

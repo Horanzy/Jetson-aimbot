@@ -232,7 +232,12 @@ class ProfileIn(BaseModel):
 
 
 def _wire_value(pk: str, v):
-    return str(v) if pk == "aim_key" else proc.fmt_num(v)
+    """参数值 → 固件热参通道字面量 (bool=0/1, 触发键=枚举串, 其余=数字)。"""
+    if pk == "aim_key":
+        return str(v)
+    if isinstance(v, bool):
+        return "1" if v else "0"
+    return proc.fmt_num(v)
 
 
 @app.put("/api/profiles/{stem}")

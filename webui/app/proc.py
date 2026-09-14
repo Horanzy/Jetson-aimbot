@@ -63,6 +63,7 @@ def build_argv(root: Path, params: dict, calib: dict, script_path: Path) -> list
             "-x", fmt_num(params.get("max_speed", 1500.0)),
             "-S", str(script_path),
             "-k", str(params.get("aim_key", "both")),
+            "-a", "y" if params.get("aim_enabled", True) else "n",
             "-r", fmt_num(params.get("fov", 150.0)),
             "-v", "y" if params.get("preview") else "n"]
     if calib.get("s") is not None:
@@ -72,11 +73,15 @@ def build_argv(root: Path, params: dict, calib: dict, script_path: Path) -> list
     if params.get("capture_enabled"):
         od = str(params.get("capture_dir") or "dataset")
         od_abs = od if os.path.isabs(od) else str(root / od)
+        srcs = [name for name, key in (("fire", "cap_fire"), ("det", "cap_det"),
+                                       ("auto", "cap_auto"))
+                if params.get(key, True)]
         argv += ["-o", od_abs,
                  "-F", fmt_num(params.get("fire_ms", 800)),
                  "-A", fmt_num(params.get("auto_s", 10.0)),
                  "-C", fmt_num(params.get("cooldown_ms", 800)),
-                 "-q", fmt_num(params.get("jpeg_q", 95))]
+                 "-q", fmt_num(params.get("jpeg_q", 95)),
+                 "-e", ",".join(srcs)]
     return argv
 
 

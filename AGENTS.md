@@ -106,7 +106,7 @@ never reported as verified from here.
 | `scripts/compile.sh` | nvcc build of aimbot → `bin/` (run on the Jetson) |
 | `scripts/convert.sh` | Batch ONNX → TensorRT engine conversion |
 | `scripts/setup_mouse.sh` | USB Gadget config, creates `/dev/hidg0` |
-| `scripts/game/template.sh.example` | Per-game launcher template — copy to `<game>.sh` (`.example` keeps the webui from listing it as a launchable profile). Relative paths; screenshot-collection switch `CAPTURE`; auto write-back of calibration values `S_EST`/`L_EST`; the `MAX_SPEED` rule and its derivation live in the file |
+| `scripts/game/template.sh.example` | Per-game launcher template — copy to `<game>.sh` (`.example` keeps the webui from listing it as a launchable profile). Relative paths; mouse-takeover switch `AIM_ENABLED` and screenshot-collection switches (`CAPTURE` master + per-source `CAP_FIRE`/`CAP_DET`/`CAP_AUTO`); auto write-back of calibration values `S_EST`/`L_EST`; the `MAX_SPEED` rule and its derivation live in the file |
 | `arena/` | Pure-Python control-law simulation evaluator (neutral simulator + 10 laws + standard + FPS test suites); see dedicated section |
 
 Linking note: `aimbot` needs `-lopencv_video` (calibration uses `phaseCorrelate`) and `-lopencv_imgcodecs` (collection `imwrite`).
@@ -118,17 +118,18 @@ Linking note: `aimbot` needs `-lopencv_video` (calibration uses `phaseCorrelate`
 ```
 -m model  -c class  -t confidence  -y height offset  -d capture card (Hagibis/Asus or /dev/videoN)
 -f framerate (120/60)  -x speed cap px/s  -s initial s  -l initial L  -r FOV radius px (default 150)
+-a mouse takeover (default y; n = pure pass-through: no injected motion, detection/collection keep running)
 -S write-back script path  -k trigger key (fire/ads/both)  -v preview
 ```
 
-Hot params: the binary opens a localhost-only UDP control channel (127.0.0.1:47700, `key=value;...`); the webui pushes whitelisted params (`t`/`y`/`x`/`fov`/`k`, clamped firmware-side) into the running process without restart — protocol in `webui/README.md`. Structural constants stay compile-time.
+Hot params: the binary opens a localhost-only UDP control channel (127.0.0.1:47700, `key=value;...`); the webui pushes whitelisted params (`t`/`y`/`x`/`fov`/`k`/`aim`/`cap_fire`/`cap_det`/`cap_auto`, clamped firmware-side) into the running process without restart — protocol in `webui/README.md`. Structural constants stay compile-time.
 
 Note: the ff_pi_acc bandwidth is derived automatically from the calibrated `L`; **there are no hand-tuning parameters**. Structural parameters (PM/ζ/FF_GAIN_VAL/FF_I_GATE/over-compensation and the â-channel constants) are header constants in `src/aimbot.cu`, see "Tuning".
 
-**Collection options** (enabled with `-o`, otherwise pure aimbot):
+**Collection options** (enabled with `-o`, otherwise pure aimbot; the three sources are the `-e` list, each also a hot switch):
 
 ```
--o output dir (auto-creates fire/ det/ auto/)  -F fire interval ms  -A timed interval s  -C cooldown ms  -q JPEG quality
+-o output dir (auto-creates fire/ det/ auto/)  -e enabled sources fire,det,auto (default all)  -F fire interval ms  -A timed interval s  -C cooldown ms  -q JPEG quality
 ```
 
 **Calibration**: aim at a static background with texture, hold both side keys for 5 s. Start = draw a square; success = nod; failure = shake. With `-S`, `S_EST=`/`L_EST=` are written back into the script automatically (atomic rename).

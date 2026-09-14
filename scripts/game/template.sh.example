@@ -31,12 +31,16 @@ MAX_SPEED=2000      # 准星速度上限 px/s (= 屏幕速度上限 px/ms × 100
                     # 大跳 1.83 / 逼近 1.99 px/ms); 再高不再改变精度 (饱和于目标速度)。
                     # 移动速度系统更快的游戏 (蹬墙/滑铲/突进爆发) 按同一公式往上加。
 AIM_KEY=both        # 触发键: fire / ads / both
+AIM_ENABLED=y       # 鼠标接管: n=纯透传 (不动鼠标, 检测/采集照常), webui 可运行中热切
 FOV_R=150           # FOV 半径 px (目标选取门兼积分器边界, webui 可热调)
 PREVIEW="n"         # 预览窗口: y / n
 
 # ---- 训练数据采集 (开关) ----
 CAPTURE="n"                 # y=开启截图采集  n=纯自瞄
 OUT_DIR="$ROOT/dataset"     # 输出目录 (自动建 fire/ det/ auto/ 子目录)
+CAP_FIRE=y                  # 源 fire: 开火瞬间截图 (按住左键期间按 FIRE_MS 间隔连拍)
+CAP_DET=y                   # 源 det: 检测到目标即拍 (YOLO 命中进 FOV, 受 COOLDOWN_MS 限制)
+CAP_AUTO=y                  # 源 auto: 定时截图 (无目标也拍, 背景负样本; 受 COOLDOWN_MS 限制)
 FIRE_MS=800                 # 开火截图间隔 ms
 AUTO_S=10                   # 定时截图间隔 s (随机 0.5x~1.5x)
 COOLDOWN_MS=800             # 检测/定时截图冷却 ms (开火不受限)
@@ -54,9 +58,14 @@ sudo bash "$ROOT/scripts/setup_mouse.sh"
 
 SCRIPT_PATH="$(realpath "$0")"
 
-CAPTURE_ARGS=""
+CAPTURE_ARGS=()
 if [ "$CAPTURE" = "y" ]; then
-  CAPTURE_ARGS="-o $OUT_DIR -F $FIRE_MS -A $AUTO_S -C $COOLDOWN_MS -q $JPEG_Q"
+  CAP_SRC=""
+  [ "$CAP_FIRE" = "y" ] && CAP_SRC="${CAP_SRC:+$CAP_SRC,}fire"
+  [ "$CAP_DET"  = "y" ] && CAP_SRC="${CAP_SRC:+$CAP_SRC,}det"
+  [ "$CAP_AUTO" = "y" ] && CAP_SRC="${CAP_SRC:+$CAP_SRC,}auto"
+  CAPTURE_ARGS=(-o "$OUT_DIR" -F "$FIRE_MS" -A "$AUTO_S" -C "$COOLDOWN_MS" \
+                -q "$JPEG_Q" -e "$CAP_SRC")
 fi
 
 sudo "$APP" \
@@ -71,6 +80,7 @@ sudo "$APP" \
   -l "$L_EST" \
   -S "$SCRIPT_PATH" \
   -k "$AIM_KEY" \
+  -a "$AIM_ENABLED" \
   -r "$FOV_R" \
   -v "$PREVIEW" \
-  $CAPTURE_ARGS
+  "${CAPTURE_ARGS[@]}"
