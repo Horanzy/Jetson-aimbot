@@ -105,7 +105,7 @@ const PARAM_DEFS = [
   { group: "瞄准", key: "fov", label: "FOV 半径", type: "num", min: 10, max: 1000, step: 5, unit: "px", hot: true,
     info: "FOV 同时是目标筛选圈与积分器启动边界 (一值两用)。几何关系: 模型输入是 1080p 画面中心裁剪出的 640×640, 模型像素与屏幕像素 1:1, 检测范围为以准星为中心 ±320px (对角约 452px), 因此调到 452 以上没有额外效果。调大: 更远/更偏的目标进入筛选圈, 多目标抢锁风险上升; 调小: 只锁准星附近。🔥 热参数, 保存即生效。" },
   { group: "瞄准", key: "class_id", label: "目标类别 ID", type: "num", min: 0, max: 255, step: 1, hot: false,
-    info: "锁定哪个检测类别 (依模型标签; 战地模型: 0=头, 1=身)。❄ 冷参数, 下次启动生效。" },
+    info: "锁定哪个检测类别 (依模型标签, 如 0=头, 1=身)。❄ 冷参数, 下次启动生效。" },
   { group: "瞄准", key: "cam_fps", label: "采集帧率", type: "select", options: [120, 60], hot: false,
     info: "采集卡帧率。控制律增益按实测帧周期归一, 手感不随帧率变化; 60fps 省带宽但延迟滤波更钝。❄ 冷参数, 下次启动生效。" },
   { group: "瞄准", key: "cam_dev", label: "采集卡", type: "camera", hot: false,

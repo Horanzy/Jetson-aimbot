@@ -81,10 +81,10 @@ never reported as verified from here.
 ## Environment
 
 - This folder is a **Windows development mirror**; code editing only.
-- Compile and run happen on the Jetson. Deployment directory e.g. `/mnt/TF/aimbot/`; layout (dev mirror matches deployment):
+- Compile and run happen on the Jetson. Deployment directory e.g. `<deploy-root>/`; layout (dev mirror matches deployment):
 
 ```
-/mnt/TF/aimbot/
+<deploy-root>/
 ├── src/         aimbot.cu (ff_pi_acc + optional collection)
 ├── scripts/     compile.sh / convert.sh / setup_mouse.sh
 │   └── game/    launcher template (template.sh.example → 复制成 <game>.sh 使用)

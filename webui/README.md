@@ -20,7 +20,7 @@ webui/server.py (FastAPI, systemd root 服务)
 
 ```bash
 # 1. 依赖 (需要网络; 离线见下节)
-cd /mnt/TF/aimbot/webui
+cd <deploy-root>/webui
 sudo python3 -m pip install -r requirements.txt
 
 # 2. 安装并启动 systemd 服务 (生成 unit、开机自启)
