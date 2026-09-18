@@ -102,7 +102,15 @@ never reported as verified from here.
 
 | File | Role |
 |---|---|
-| `src/aimbot.cu` | **The program**: full aimbot + optional training-data collection. Control law ff_pi_acc (pole-placement PI + type-2 velocity feedforward with direction-contradiction CUSUM velocity reset and detection-gap FF decay; gated â acceleration-bias compensation; wn derived from L, no hand tuning). Without `-o` it is pure aimbot |
+| `src/main.cu` | **The program entry**: argument parsing, device open, thread spawn, the 500Hz timerfd loop. Full aimbot + optional training-data collection (`-o`); without `-o` it is pure aimbot |
+| `src/core/control.cu/.h` | ff_pi_acc header constants (PRED_*/FF_*/CUSUM_*/ACC_* — pole-placement PI + type-2 velocity feedforward with direction-contradiction CUSUM velocity reset, detection-gap FF decay, gated â acceleration-bias compensation; wn derived from L, no hand tuning) + the 500Hz control-law tick + calibration state machine |
+| `src/core/estimator.cu/.h` | α-β filter + direction-contradiction CUSUM + innovation-mean â sensor (`estimator_step`, driven per frame by the capture thread; publishes `g_target`) |
+| `src/core/calib.cu/.h` | `run_calibration` / `persist_calibration` / `resolve_cam_device` + CalibSeg excitation trajectory tables |
+| `src/core/trt.cu/.h` | TensorRT Logger / `CHECK_CUDA` / BGR→RGB CHW preprocess kernels (kernel and its launch wrapper share one TU — no `-rdc`) / output-tensor parsing + NMS |
+| `src/core/state.cu/.h` | shared globals: system constants, TargetState/CountsHistory/MouseState, hot-param & calibration atomics, time helpers, async save queue, signal |
+| `src/io/capture.cu/.h` | GStreamer pipeline + `ai_thread` (capture → inference → publish; three-source collection and preview) |
+| `src/io/hid_mouse.cu/.h` | evdev mouse read (EVIOCGRAB) + `/dev/hidg0` HID report write (control counts merged via the overlay callback) |
+| `src/io/hotctl.cu/.h` | UDP hot-parameter channel 127.0.0.1:47700 |
 | `scripts/compile.sh` | nvcc build of aimbot → `bin/` (run on the Jetson) |
 | `scripts/convert.sh` | Batch ONNX → TensorRT engine conversion |
 | `scripts/setup_mouse.sh` | USB Gadget config, creates `/dev/hidg0` |

@@ -5,6 +5,7 @@ __pycache__/
 *.py[cod]
 
 # ---- 编译产物 / 模型 (bin/engine/onnx/dataset 只留在部署机, 不进仓库) ----
+build/
 bin/
 engine/
 onnx/
