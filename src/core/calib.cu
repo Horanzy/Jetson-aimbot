@@ -48,9 +48,23 @@ bool run_calibration(const std::deque<CalibSample>& hist, float& s_est, float& l
         return best;
     };
     float s1=0,dl1=0;
-    if (scan(-40.0f,96.0f,8.0f,s1,dl1)==FLT_MAX) return false;
+    // 搜索步长从既有量导出, 不写字面常数:
+    //   细步 = TICK_MS — 账本按拍记录、指令按拍分段, 一拍是命令时间轴的自然分辨率;
+    //     L 又经相位裕度平滑进入 wn (wn=(90°−PM)π/180/L), 一拍的 L 误差对带宽的影响
+    //     在 2% 量级, 更细不会带来更好的控制效果。
+    //   粗步 = 观测间隔 (hist 样本 dt 的中位 ≈ 1000/fps) — 粗搜的信息来自帧间对齐,
+    //     步长细于观测间隔不产生新信息, 只会成倍放大扫描代价;
+    //   细搜范围 = ±粗步 (覆盖一个粗网格, 保证粗搜不漏点)。
+    //   粗搜范围 [−40, +96]ms (相对初始 l_est) 是**搜索覆盖范围** (覆盖选择, 非调参):
+    //     下限覆盖 s/L 完全未标定的冷启动, 上限覆盖初始值偏小 96ms 的错侧。
+    std::vector<float> dts; dts.reserve(n);
+    for (const auto& r : hist) dts.push_back(r.dt_ms);
+    std::nth_element(dts.begin(), dts.begin()+n/2, dts.end());
+    const float fine_step = TICK_MS;
+    const float coarse_step = std::max(fine_step, dts[n/2]);
+    if (scan(-40.0f,96.0f,coarse_step,s1,dl1)==FLT_MAX) return false;
     float s2=s1,dl2=dl1;
-    if (scan(dl1-8.0f,dl1+8.0f,2.0f,s2,dl2)==FLT_MAX) { s2=s1; dl2=dl1; }
+    if (scan(dl1-coarse_step,dl1+coarse_step,fine_step,s2,dl2)==FLT_MAX) { s2=s1; dl2=dl1; }
     s_est=std::clamp(s2,band.s_min,band.s_max);
     l_est=std::clamp(l_est+dl2,L_MIN,L_MAX);
     return true;

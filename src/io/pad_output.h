@@ -54,10 +54,11 @@ inline float pad_gain_from_s_rp(float s_rp) {
 //   × 实际拍时长 (偏转·ms), 结构与窗口同 CountsHistory。g_counts 不变式 3
 //   ("记录游戏实际收到的全部 counts") 的 pad 对应物 — 估计器与控制律的自身
 //   运动补偿经 own_motion_ledger 读它。
-// 深度: pad 标定的账本必须覆盖整段分级激励窗 (计划最坏时长 8s, 见 io/pad_calib.h
-//   的 PAD_CAL_PLAN_MS) 加每样本的延迟/帧长回溯 (L_MAX+帧长 ≈0.3s), 故比 hid 的
-//   3s 窗深 — 该文件的 static_assert 把本深度与激励计划时长绑在一起。
-const size_t PAD_LEDGER_TICKS = (size_t)10 * DEFAULT_FREQ;
+// 深度: pad 标定的账本必须覆盖整段分级激励的**流程预算** (最坏 = 名义计划 + 一次整轮
+//   重跑, 见 io/pad_calib.h 的 PAD_CAL_BUDGET_MS) 加一段在飞段与每样本的延迟/帧长
+//   回溯 (L_MAX+帧长 ≈0.3s), 故比 hid 的 3s 窗深得多 — 该文件的 static_assert 把本
+//   深度与标定预算绑在一起。
+const size_t PAD_LEDGER_TICKS = (size_t)64 * DEFAULT_FREQ;
 extern CountsHistory g_pad_ledger;
 
 // 自身运动账本的模式路由 (不变式 3 的消费端): hid = g_counts (px = s·Δcounts),

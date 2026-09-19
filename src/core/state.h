@@ -112,6 +112,12 @@ public:
         double f = span > 0 ? elapsed_ms(t, a.t) / span : 0;
         return {a.cx + (b.cx-a.cx)*f, a.cy + (b.cy-a.cy)*f};
     }
+    // 清空: 账本假定时间单调 (at() 按时间二分), 混入不同时间基的记录会让查找失效 —
+    //   合成链路/单测在换时间基时先清空 (真机上账本由单一线程按真实钟写入, 天然单调)。
+    void clear() {
+        std::lock_guard<std::mutex> lk(mtx);
+        buf.clear(); cum_x = 0; cum_y = 0;
+    }
     std::pair<long long,long long> cum() const {
         std::lock_guard<std::mutex> lk(mtx); return {cum_x, cum_y};
     }

@@ -64,7 +64,7 @@ void law_tick(int cam_fps, int16_t real_x, int16_t real_y, uint16_t btns, bool p
         if (si>=slen) {
             if (cal==1) { excite.clear();
                 constexpr int neseg=(int)(sizeof(CAL_EXCITE_SEQ)/sizeof(CalibSeg));
-                for(int i=0;i<5;++i) for(int j=0;j<neseg;++j) excite.push_back(CAL_EXCITE_SEQ[j]);
+                for(int i=0;i<CAL_EXCITE_LOOPS;++i) for(int j=0;j<neseg;++j) excite.push_back(CAL_EXCITE_SEQ[j]);
                 seq=excite.data();slen=(int)excite.size();si=st=0;
                 g_calib_collect=true;cal=2;
             } else if (cal==2) { seq=CAL_SETTLE_SEQ;slen=1;si=st=0;cal=6;fx=fy=0;

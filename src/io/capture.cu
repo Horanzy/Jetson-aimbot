@@ -257,7 +257,7 @@ void ai_thread(std::string model_path, int target_cls,
         }
 
         if (g_calib_request.exchange(false)) {
-            bool ok=false;
+            bool ok=false; int pad_done=2;      // pad 回执码: 1=成功 2=失败 3=请求整轮重跑
             if (pad_mode) {
                 // pad: 段间停顿法 —— 停顿静止窗估噪声底/停顿边沿实测 L → 逐段中段
                 //   取样求增益 (无延迟对齐) → 段/级有效性判定 → 逐级池化 → 幂律外推
@@ -274,8 +274,9 @@ void ai_thread(std::string model_path, int target_cls,
                     std::cout<<"[标定] 逐级 "<<(ax?"Y":"X")<<":";
                     for (int li=0; li<PAD_CAL_LEVELS_N; ++li) {
                         const PadCalLevelDiag& d=cr.lv[ax][li];
-                        if (d.valid) printf(" %d%%=%.1fpx/s(%d/%d段)",(int)(d.d*100+.5f),
-                                            (double)d.px_s,d.seg_ok,d.seg_all);
+                        if (d.valid) printf(" %d%%=%.1fpx/s(%d/%d段%s%s)",(int)(d.d*100+.5f),
+                                            (double)d.px_s,d.seg_ok,d.seg_all,
+                                            d.note[0]?" ":"",d.note);
                         else if (d.val>0) printf(" %d%%=无效(%d/%d段: %s %.3g vs %.3g)",
                                                  (int)(d.d*100+.5f),d.seg_ok,d.seg_all,
                                                  d.why,(double)d.val,(double)d.lim);
@@ -290,30 +291,47 @@ void ai_thread(std::string model_path, int target_cls,
                                ax?"Y":"X",(double)cr.gain[ax],(double)cr.p[ax],
                                (double)cr.res[ax],cr.nlv[ax],
                                cr.linear[ax]?" — 单级线性外推, 指数未测":"");
+                // 死区/响应曲线诊断 (仅日志): 低挡位实测低于"过最高有效挡位的 p=1 直线"
+                //   的一半 → 该挡位落在游戏的死区/非线性段, 外推会被它拉低
+                for (int ax=0; !cr.err[0] && ax<PAD_CAL_AXES_N; ++ax) {
+                    PadCalDeadzone z=pad_cal_deadzone(cr,ax);
+                    if (z.hit)
+                        printf("[标定] 诊断 %s: 低挡位 %d%% 实测 %.1fpx/s 低于最高有效挡位 "
+                               "%d%% 的直线外推 %.1fpx/s 的一半 — 疑似游戏摇杆死区/响应曲线 "
+                               "(建议提高游戏灵敏度或降低死区)\n", ax?"Y":"X",
+                               (int)(cr.lv[ax][z.lo_li].d*100+.5f),(double)z.v_lo,
+                               (int)(cr.lv[ax][z.hi_li].d*100+.5f),(double)z.v_line);
+                }
                 if (!cr.err[0])
                 printf("[标定] 停顿法: 噪声底 σx=%.3f σy=%.3f px/帧 | L=%.1fms "
                        "(停顿位移和 %d 条, 离散 %.1fms; 边沿中位 %.1fms %d 条, 离散 %.1fms)\n",
                        (double)cr.sigma[0],(double)cr.sigma[1],(double)cr.l_est,cr.l_n,
                        (double)cr.l_mad,(double)cr.l_edge_ms,cr.l_edge_n,
                        (double)cr.l_edge_mad);
-                ok=cr.ok; bool oob=false;
+                ok=cr.ok; bool oob=false; pad_done=ok?1:2;
                 if (ok) {
                     // 逐轴带内判定: 带外 = 激励/背景不可信 → 整次失败, 带边垃圾值不回写
                     bool bx=pad_calib_accept(cr.gain[0]), by=pad_calib_accept(cr.gain[1]);
                     if (!bx || !by) { ok=false; oob=true;
                         std::cout<<"[标定] 失败: 满偏转屏速越界 (X="<<cr.gain[0]
                                  <<" Y="<<cr.gain[1]<<" px/s, 设计带 ["
-                                 <<PAD_GAIN_MIN<<","<<PAD_GAIN_MAX<<"])\n"; }
+                                 <<PAD_GAIN_MIN<<","<<PAD_GAIN_MAX<<"]; 低于下界 = 该游戏满偏"
+                                   "屏速跟不上目标 (物理上不可注入), 高于上界 = 超出相关量程)\n"; }
                     else { l_est=cr.l_est;                  // 立即对 pad 拍生效
                            g_pad_stick_gain_x.store(cr.gain[0]);
                            g_pad_stick_gain_y.store(cr.gain[1]); }
                 }
-                if (!ok && !oob)
+                if (!ok && !oob) {
                     std::cout<<"[标定] 失败: "<<(cr.err[0]?cr.err:"有效级不足")
                              <<" — 有效级 X="<<cr.nlv[0]<<"/"<<PAD_CAL_LEVELS_N
                              <<" Y="<<cr.nlv[1]<<"/"<<PAD_CAL_LEVELS_N
                              <<" (每轴需 ≥1 级; ≥2 级做幂律, 1 级线性回退), 样本 "
                              <<hist.size()<<"/"<<collect_frames<<"\n";
+                    pad_done=pad_cal_done_code(cr);        // 3 = 仅样本数不足 → 建议整轮重跑
+                    if (pad_done==3)
+                        std::cout<<"[标定] 失败原因仅为中段样本不足 → 请求整轮重跑 "
+                                   "(段长下限抬高一档)\n";
+                }
                 if (ok) {
                     // 回执行 (webui 逐字抓取): 取值格式与回写一致
                     char line[192];
@@ -342,7 +360,7 @@ void ai_thread(std::string model_path, int target_cls,
                 } else
                     std::cout<<"[标定] 失败: 样本 "<<hist.size()<<"/"<<collect_frames<<"\n";
             }
-            if (pad_mode) g_calib_done=ok?1:2;
+            if (pad_mode) g_calib_done=pad_done;
         }
 
         if (collecting_enabled) {

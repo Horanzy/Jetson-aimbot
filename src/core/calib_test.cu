@@ -28,21 +28,58 @@ int main() {
     CHECK(CALIB_WAIT_TIMEOUT * (double)TICK_MS == 2000.0,
           "等待计算超时 = 2000ms 墙钟");
 
-    std::cout << "[2] 起始方块 (纯视觉信号, 不参与采样)\n";
-    CHECK((int)(sizeof(CAL_START_SEQ) / sizeof(CalibSeg)) == 5, "5 段 (4 边 + 停顿)");
+    std::cout << "[2] 起始十字 (纯视觉信号, 不参与采样)\n";
+    CHECK((int)(sizeof(CAL_START_SEQ) / sizeof(CalibSeg)) == 9, "9 段 (8 腿 + 停顿)");
     CHECK(CAL_START_SEQ[0].dx == 2 && seg_ms(CAL_START_SEQ[0]) == 240.0,
-          "2px/拍, 240ms/边");
-    CHECK(CAL_START_SEQ[0].dx * CAL_START_SEQ[0].ticks == 480, "每边 480 counts");
-    CHECK(CAL_START_SEQ[4].dx == 0 && CAL_START_SEQ[4].dy == 0
-          && seg_ms(CAL_START_SEQ[4]) == 500.0, "收尾停顿 500ms");
+          "2px/拍, 240ms/腿");
+    CHECK(CAL_START_SEQ[0].dx * CAL_START_SEQ[0].ticks == 480, "每腿 480 counts");
+    CHECK(CAL_START_SEQ[8].dx == 0 && CAL_START_SEQ[8].dy == 0
+          && seg_ms(CAL_START_SEQ[8]) == 500.0, "收尾停顿 500ms");
+    {   // 腿序 +x,−x,−x,+x ∈ 每轴 4 腿: 行程以起点为中心 ±480, 每圈回到起点
+        long x = 0, y = 0, mxx = 0, mnx = 0, mxy = 0, mny = 0;
+        for (int i = 0; i < 8; ++i) {
+            x += (long)CAL_START_SEQ[i].dx * CAL_START_SEQ[i].ticks;
+            y += (long)CAL_START_SEQ[i].dy * CAL_START_SEQ[i].ticks;
+            mxx = std::max(mxx, x); mnx = std::min(mnx, x);
+            mxy = std::max(mxy, y); mny = std::min(mny, y);
+        }
+        CHECK(mxx == 480 && mnx == -480 && mxy == 480 && mny == -480 && x == 0 && y == 0,
+              "起始十字对称于起点 (±480 两侧都有) 且净位移 0 — 老方波是 0..+480 单侧");
+    }
 
-    std::cout << "[3] 激励方波 (采样段: 段时长/速度/每边位移为设计量)\n";
-    CHECK((int)(sizeof(CAL_EXCITE_SEQ) / sizeof(CalibSeg)) == 4, "单圈 4 边");
-    for (int j = 0; j < 4; ++j) {
+    std::cout << "[3] 激励十字 + 腿间停顿 (采样段: 时长/速度/每腿位移为设计量)\n";
+    CHECK((int)(sizeof(CAL_EXCITE_SEQ) / sizeof(CalibSeg)) == 16,
+          "单圈 16 段 (8 腿 + 每腿后的零指令停顿)");
+    for (int j = 0; j < 16; ++j) {
         const CalibSeg& s = CAL_EXCITE_SEQ[j];
-        CHECK(std::abs(s.dx) + std::abs(s.dy) == 2 && seg_ms(s) == 250.0,
-              "2px/拍, 250ms/边 (2000 counts/s)");
-        CHECK((std::abs(s.dx) + std::abs(s.dy)) * s.ticks == 500, "每边 500 counts");
+        if (j % 2 == 0) {
+            CHECK(std::abs(s.dx) + std::abs(s.dy) == 2 && seg_ms(s) == 250.0,
+                  "2px/拍, 250ms/腿 (2000 counts/s)");
+            CHECK((std::abs(s.dx) + std::abs(s.dy)) * s.ticks == 500, "每腿 500 counts");
+        } else {
+            CHECK(s.dx == 0 && s.dy == 0 && seg_ms(s) == 150.0,
+                  "腿间零指令停顿 150ms (与 pad 的 PAUSE 同源: L 上界 100ms + 余量)");
+        }
+    }
+    {   // 每圈回到起点, 每轴包络 ±500 (对称), 16 个边沿
+        long x = 0, y = 0, mxx = 0, mnx = 0, mxy = 0, mny = 0;
+        for (int i = 0; i < 16; ++i) {
+            x += (long)CAL_EXCITE_SEQ[i].dx * CAL_EXCITE_SEQ[i].ticks;
+            y += (long)CAL_EXCITE_SEQ[i].dy * CAL_EXCITE_SEQ[i].ticks;
+            mxx = std::max(mxx, x); mnx = std::min(mnx, x);
+            mxy = std::max(mxy, y); mny = std::min(mny, y);
+        }
+        CHECK(mxx == 500 && mnx == -500 && mxy == 500 && mny == -500 && x == 0 && y == 0,
+              "激励单圈行程对称于起点 ±500 counts 且回到起点 (画面内容相似→相关更稳)");
+        int edges = 0, cx = 0, cy = 0;
+        for (int i = 0; i < 16; ++i) {
+            if (CAL_EXCITE_SEQ[i].dx != cx || CAL_EXCITE_SEQ[i].dy != cy) ++edges;
+            cx = CAL_EXCITE_SEQ[i].dx; cy = CAL_EXCITE_SEQ[i].dy;
+        }
+        CHECK(edges == 16, "每圈 16 个指令边沿 (老方波 4 个) → lag 对齐的辨识更强");
+        CHECK(CAL_EXCITE_LOOPS == 3
+              && CAL_EXCITE_LOOPS * 16 * 400 == 19200,
+              "3 圈 × 16 段 × 400ms = 9.6s 激励 (24 条腿, 多于老方波的 5 圈 × 4 = 20)");
     }
 
     std::cout << "[4] 静置与收尾甩动\n";

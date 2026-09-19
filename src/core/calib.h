@@ -38,15 +38,44 @@ const int   CALIB_WAIT_TIMEOUT     = ms_to_ticks(2000);   // 等待计算超时 
 
 struct CalibSeg { int dx, dy, ticks; };
 // 激励轨迹: 每拍位移 (counts) × 拍数; 拍数由段墙钟时长导出, 段速度为设计量 —
-//   激励方波 2px/拍 = 2000 counts/s (s=1 时即速度帽量级), 收尾甩动 4px/拍 =
-//   4000 counts/s。起始方块是纯视觉开始信号 (采样自激励段才开始): 3px→1.5px
-//   非整数, 取 2px/拍 与激励同速。
-inline const CalibSeg CAL_START_SEQ[] = {
-    {2,0,ms_to_ticks(240)},{0,2,ms_to_ticks(240)},{-2,0,ms_to_ticks(240)},{0,-2,ms_to_ticks(240)},
+//   激励腿 2px/拍 = 2000 counts/s (s=1 时即速度帽量级), 收尾甩动 4px/拍 =
+//   4000 counts/s。
+// **以起点为中心的十字**: 腿序 +x → −x → −x → +x → +y → −y → −y → +y, 每条腿从静止
+//   出发、回到静止 (激励单圈每腿后接零指令停顿, 起始十字不接停顿只作视觉信号)。
+//   为什么每轴要 4 条腿: 行程 = 各腿位移的**累积和**, 一条腿只把准星从起点推出去 A;
+//   要让它落到起点两侧必须再有反向腿把准星拉回来 —— 部分和因此是
+//   0 → +A → 0 → −A → 0, 包络 = 起点 ±A。老方波 (+x,+y,−x,−y) 的部分和是
+//   0 → +A → (+A,+A) → (0,+A) → 0, 行程单侧落在起点右下方 → 操作者必须"故意从
+//   左上角起"才不出屏, 而系统光标一旦夹边相机就不再响应 → 该段测量被污染。
+//   其余两条设计后果: 每圈回到起点 → 画面内容保持相似, 块相位相关更稳;
+//   每条腿的启停都是干净边沿 → 每圈 16 个边沿 (老方波 4 个) → lag 对齐回归的辨识更强。
+//   单腿位移与老方波同量级 (2px/拍 × 250ms = 500 counts), 拟合统计量可比。
+// 腿间零指令停顿 = 与 pad 的 PAUSE 同一规则: 用户保证的 L 上界 100ms + 余量 (≥2 帧
+//   @120fps) = 116.7ms → 上取 50ms 的整值 150ms。
+// **停顿的收益 (量化的; 不是"防偏小")**: run_calibration 是 lag 对齐回归, 折返处取的
+//   是区间聚合量 (窗口内指令的混合值与画面位移同口径), 故折返本身不产生系统性偏小 —
+//   这正是正方形一直能标对 s 的原因。停顿的真实收益是三项: (1) **稀释折返邻域样本** —
+//   只有折返附近的样本对 lag 的量化误差敏感, 腿内稳态样本对平移不敏感, 停顿把腿内样本
+//   占比提上去, 那份误差的权重随之下降; (2) **锐化 lag 辨识** — 启停边沿更干净, 相关峰
+//   更尖; (3) 停顿段静止 → 顺带得到噪声底 σ (与 pad 的 pause 同源, 只进日志诊断 —
+//   hid 的验收判据 S_MIN/S_MAX 与样本数判据一动不改)。合成对照见 io/pad_test.cu [20]。
+inline const CalibSeg CAL_START_SEQ[] = {          // 起始十字 (纯视觉信号, 不采样)
+    {2,0,ms_to_ticks(240)},{-2,0,ms_to_ticks(240)},
+    {-2,0,ms_to_ticks(240)},{2,0,ms_to_ticks(240)},
+    {0,2,ms_to_ticks(240)},{0,-2,ms_to_ticks(240)},
+    {0,-2,ms_to_ticks(240)},{0,2,ms_to_ticks(240)},
     {0,0,ms_to_ticks(500)}};
-// 激励方波单圈基元: 每边 2px × 250ms = 500 counts (control.cu 重复 5 圈)
+// 激励单圈基元: 8 腿 × (腿 250ms + 停顿 150ms) = 3200ms
+constexpr int CAL_EXCITE_LOOPS = 3;                // 3 圈 × 8 腿 = 24 条腿 (老方波 5 圈 × 4 = 20)
 inline const CalibSeg CAL_EXCITE_SEQ[] = {
-    {2,0,ms_to_ticks(250)},{0,2,ms_to_ticks(250)},{-2,0,ms_to_ticks(250)},{0,-2,ms_to_ticks(250)}};
+    {2,0,ms_to_ticks(250)},{0,0,ms_to_ticks(150)},
+    {-2,0,ms_to_ticks(250)},{0,0,ms_to_ticks(150)},
+    {-2,0,ms_to_ticks(250)},{0,0,ms_to_ticks(150)},
+    {2,0,ms_to_ticks(250)},{0,0,ms_to_ticks(150)},
+    {0,2,ms_to_ticks(250)},{0,0,ms_to_ticks(150)},
+    {0,-2,ms_to_ticks(250)},{0,0,ms_to_ticks(150)},
+    {0,-2,ms_to_ticks(250)},{0,0,ms_to_ticks(150)},
+    {0,2,ms_to_ticks(250)},{0,0,ms_to_ticks(150)}};
 inline const CalibSeg CAL_SETTLE_SEQ[] = {{0,0,ms_to_ticks(300)}};
 inline const CalibSeg CAL_END_OK_SEQ[] = {
     {0,4,ms_to_ticks(60)},{0,-4,ms_to_ticks(60)},{0,4,ms_to_ticks(60)},

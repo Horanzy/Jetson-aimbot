@@ -107,14 +107,22 @@ struct Synth {
     float p[2] = {1.0f, 1.0f};
     double L_true = 50.0;
     int    seg_ms = 250;
+    int    fps = 120;          // 名义采样帧率 (实测链路里处理线程可能慢于 -f 的标称值)
+    float  jitter = 0.0f;      // 帧长抖动 (相对标准差; 0 = 等间隔)
+    int    drop_every = 0;     // 每 N 帧丢一个样本 (0 = 不丢)
     float  noise = 0.02f;      // 默认给一点采样噪声 (真实链路恒有; σ=0 时噪声底不可测)
     int    seed = 20240919;
     float  scale[2][PAD_CAL_LEVELS_N];
     float  spread[2][PAD_CAL_LEVELS_N];
     bool   lowresp[2][PAD_CAL_LEVELS_N];
+    float  dir_scale[2][2];      // [轴][方向 0=+ 1=−] 响应覆写 (0 = 该方向夹紧)
+    float  resp_dir[2][2];       // [轴][方向] 相关峰 (压低 = 该方向无纹理)
     Synth() {
-        for (int a = 0; a < 2; ++a) for (int l = 0; l < PAD_CAL_LEVELS_N; ++l) {
-            scale[a][l] = 1.0f; spread[a][l] = 2.0f; lowresp[a][l] = false; }
+        for (int a = 0; a < 2; ++a) {
+            for (int l = 0; l < PAD_CAL_LEVELS_N; ++l) {
+                scale[a][l] = 1.0f; spread[a][l] = 2.0f; lowresp[a][l] = false; }
+            for (int k = 0; k < 2; ++k) { dir_scale[a][k] = 1.0f; resp_dir[a][k] = 0.5f; }
+        }
     }
 };
 
@@ -131,7 +139,7 @@ static std::vector<PadExcSeg> synth_play(const Synth& sy, double base_ms,
     std::vector<PadExcSeg> win(pl.size());
     for (size_t i = 0; i < pl.size(); ++i) {
         win[i].axis = pl[i].axis; win[i].level = pl[i].level; win[i].d = pl[i].d;
-        win[i].defl = pl[i].defl; win[i].pause = pl[i].pause;
+        win[i].defl = pl[i].defl; win[i].pause = pl[i].pause; win[i].begun = true;
         win[i].t0 = at_ms(s0[i]); win[i].t1 = at_ms(s1[i] - 1.0);
     }
     CountsHistory& led = g_pad_ledger;
@@ -141,12 +149,16 @@ static std::vector<PadExcSeg> synth_play(const Synth& sy, double base_ms,
         led.add(at_ms(base_ms + k), pl[i].axis ? 0 : pl[i].defl,
                 pl[i].axis ? pl[i].defl : 0);
     }
-    const double dt = 1000.0 / 120.0;
+    const double dt_nom = 1000.0 / (double)sy.fps;
     std::mt19937 rng((unsigned)sy.seed);
     std::normal_distribution<double> nd(0.0, 1.0);
     hist.clear();
-    for (double tt = base_ms; tt < base_ms + total; tt += dt) {
+    int idx = 0;
+    double prev_tt = base_ms;
+    for (double tt = base_ms; tt < base_ms + total; ) {
         size_t j = 0; while (j + 1 < pl.size() && s0[j + 1] <= tt) ++j;
+        // 观测窗 = [t−dt−L, t−L], dt = **实际**帧间隔 (帧抖动如实进模型与账本回溯)
+        const double dt = tt > prev_tt ? tt - prev_tt : dt_nom;
         const double w0 = tt - sy.L_true - dt, w1 = tt - sy.L_true;
         double dx = 0, dy = 0;
         for (size_t i = 0; i < pl.size(); ++i) {
@@ -156,15 +168,24 @@ static std::vector<PadExcSeg> synth_play(const Synth& sy, double base_ms,
             const int ax = pl[i].axis, lv = pl[i].level;
             const double sign = pl[i].defl > 0 ? 1.0 : -1.0;
             const double v = (double)sy.A[ax] * std::pow((double)pl[i].d, (double)sy.p[ax])
-                           * (double)sy.scale[ax][lv];
+                           * (double)sy.scale[ax][lv]
+                           * (double)sy.dir_scale[ax][pl[i].defl > 0 ? 0 : 1];
             if (ax == 0) dx += sign * v * ov / 1000.0;
             else         dy += sign * v * ov / 1000.0;
         }
         const int ax = pl[j].axis, lv = pl[j].level;
-        const float nx = sy.noise > 0 ? (float)(nd(rng) * sy.noise) : 0.0f;
-        const float ny = sy.noise > 0 ? (float)(nd(rng) * sy.noise) : 0.0f;
-        hist.push_back({at_ms(tt), (float)dt, (float)dx + nx, (float)dy + ny,
-                        sy.lowresp[ax][lv] ? 0.01f : 0.5f, sy.spread[ax][lv]});
+        const bool dropped = sy.drop_every > 0 && (idx % sy.drop_every) == sy.drop_every - 1;
+        if (!dropped) {
+            const float nx = sy.noise > 0 ? (float)(nd(rng) * sy.noise) : 0.0f;
+            const float ny = sy.noise > 0 ? (float)(nd(rng) * sy.noise) : 0.0f;
+            hist.push_back({at_ms(tt), (float)dt, (float)dx + nx, (float)dy + ny,
+                            sy.lowresp[ax][lv] ? 0.01f
+                                               : sy.resp_dir[ax][pl[j].defl > 0 ? 0 : 1],
+                            sy.spread[ax][lv]});
+            prev_tt = tt;
+        }
+        ++idx;
+        tt += dt_nom * (sy.jitter > 0 ? (1.0 + (double)sy.jitter * nd(rng)) : 1.0);
     }
     return win;
 }
@@ -191,6 +212,262 @@ static double true_g(const Synth& sy, int axis, float d) {       // px per 偏�
 }
 
 static const float SYN_SHIFT_MAX = pad_cal_shift_max_px(106);   // cap_w=640 → 块 106
+
+// ============ 闭环合成链路 (实时驱动状态机; 触发 → 激励 → 停顿 → 拟合 → 回写) ============
+// 与 ai_thread 同形: 每拍调用 pad_calib_step, 激励拍经 pad_excite 写摇杆账本 (与真机同一条
+//   入账路径); 采样按虚拟 120fps 生成 — 屏幕位移 = 观测模型 [t−L−dt, t−L] 上真实屏速
+//   (幂律 A·d^p; 逐级响应可覆写) 的积分, 加高斯噪声; 每帧位移超过 max_disp_px 时该帧不
+//   出样本 (模拟采样端的块响应门: 画面移动越快相关峰越弱); 收到 g_calib_request 时按
+//   ai_thread 的判定跑 pad_calib_fit → pad_cal_done_code → 回写脚本。
+// 节拍: 一拍 = TICK_MS 真实墙钟 (与真机同), 采样按 1000/fps 拍一个样本 — 段长/L/帧长
+//   的口径与真机逐项相同, 故闭环行为 (探针→段长→拟合) 与真机同构。单场景 ≈ 一个完整
+//   激励计划 (40 段 × (段长+150ms)) ≈ 17–25s, 故只跑一个场景; 判据/逐方向/重跑等
+//   分支用合成窗与状态机单测覆盖 (那些不需要真实节拍)。
+struct LoopCfg {
+    float  A[2] = {3000.0f, 3000.0f};        // 满偏转屏速 px/s
+    float  p[2] = {1.0f, 1.0f};
+    double L_true = 45.0;                    // 环路延迟 ms
+    float  noise = 0.015f;                   // 每样本位移噪声 px
+    float  fps = 120.0f;                     // 采样帧率 (虚拟)
+    float  level_scale[2][PAD_CAL_LEVELS_N]; // 逐级响应覆写 (0 = 死区)
+    float  dir_scale[2][2];                  // [轴][方向: 0=+, 1=−] 响应覆写 (0 = 夹紧)
+    float  resp_dir[2][2];                   // 该方向的相位相关峰 (压低 = 无纹理)
+    float  max_disp_px = 0.0f;               // >0: 每帧位移超它 → 该帧不出样本
+    int    gate_rounds = 99;                 // 该门只在前 N 轮生效 (瞬态)
+    unsigned seed = 7;
+    LoopCfg() {
+        for (int a = 0; a < 2; ++a) {
+            for (int l = 0; l < PAD_CAL_LEVELS_N; ++l) level_scale[a][l] = 1.0f;
+            for (int k = 0; k < 2; ++k) { dir_scale[a][k] = 1.0f; resp_dir[a][k] = 0.5f; }
+        }
+    }
+};
+struct LoopOut {
+    PadCalibResult res{};
+    std::vector<PadExcSeg> plan;
+    int    done = 0, fits = 0;
+    double seg_ms[PAD_CAL_AXES_N][PAD_CAL_LEVELS_N][PAD_CAL_SEGS_PER_LEVEL];
+    int    seg_n[PAD_CAL_AXES_N][PAD_CAL_LEVELS_N];
+    double travel[PAD_CAL_AXES_N][PAD_CAL_LEVELS_N];     // 实测行程 (px, 真实口径)
+    bool   wrote = false;
+    std::string script;
+    int    hist_n = 0;
+    float  probe_px_s = 0;
+};
+
+static LoopOut run_loop(const LoopCfg& cf, const std::string& script_path) {
+    LoopOut o{};
+    for (int a = 0; a < PAD_CAL_AXES_N; ++a) for (int l = 0; l < PAD_CAL_LEVELS_N; ++l) {
+        o.seg_n[a][l] = 0; o.travel[a][l] = 0; }
+    own_motion_ledger_set(true);
+    g_pad_ledger.clear();                     // 闭环 harness 用真实钟 → 丢弃其它时间基
+    const bool  saved_aim  = g_aim_enabled.load();
+    const float saved_gx   = g_pad_stick_gain_x.load();
+    const float saved_gy   = g_pad_stick_gain_y.load();
+    g_aim_enabled.store(true);
+    g_calib_collect.store(false); g_calib_request.store(false); g_calib_done.store(0);
+    for (int a = 0; a < PAD_CAL_AXES_N; ++a)
+        for (int l = 0; l < PAD_CAL_LEVELS_N; ++l) g_pad_mid_n[a][l].store(PAD_CAL_MID_N_NONE);
+    g_pad_probe_px_s.store(0); g_pad_probe_d.store(0); g_pad_probe_travel_px.store(0);
+
+    std::deque<CalibSample> hist;
+    const int hist_max = pad_cal_hist_frames(120);
+    struct Defl { std::chrono::steady_clock::time_point t; int16_t x, y; };
+    std::deque<Defl> dq;
+    std::mt19937 rng(cf.seed);
+    std::normal_distribution<double> nd(0.0, 1.0);
+    auto level_of = [](int16_t d) {
+        const int ad = std::abs((int)d);
+        for (int l = 0; l < PAD_CAL_LEVELS_N; ++l)
+            if (std::abs(ad - (int)pad_level_defl(PAD_CAL_LEVELS[l])) <= 1) return l;
+        return 0;
+    };
+    auto speed = [&](int axis, int16_t d) -> double {       // px/ms
+        if (!d) return 0.0;
+        const int l = level_of(d);
+        return (double)cf.A[axis]
+             * std::pow(std::fabs((double)d) / (double)PAD_AXIS_MAX, (double)cf.p[axis])
+             * (double)cf.level_scale[axis][l] * (double)cf.dir_scale[axis][d > 0 ? 0 : 1]
+             / 1000.0 * (d > 0 ? 1.0 : -1.0);
+    };
+    // 采样质量量: 逐方向相关峰 (压低 = 该方向无纹理 → 只污染该方向)
+    auto resp_of = [&](int axis, int16_t d) -> float {
+        return cf.resp_dir[axis][d > 0 ? 0 : 1];
+    };
+    auto disp = [&](int axis, std::chrono::steady_clock::time_point a,
+                    std::chrono::steady_clock::time_point b) -> double {
+        double acc = 0;
+        for (size_t i = 0; i + 1 < dq.size(); ++i) {
+            const auto s0 = std::max(a, dq[i].t), s1 = std::min(b, dq[i + 1].t);
+            if (s1 <= s0) continue;
+            acc += speed(axis, axis ? dq[i].y : dq[i].x) * elapsed_ms(s1, s0);
+        }
+        return acc;
+    };
+
+    const auto t0 = std::chrono::steady_clock::now();
+    g_padcalib_request.store(true);           // 热参触发 (等价 L3+R3 长按)
+    PadLogical human;
+    bool ever = false, was_collect = false;
+    double next_sample_ms = 0;
+    auto t_sample = t0;
+    struct HSeg { int slot; int ticks; double travel; };
+    std::vector<HSeg> seg_rec;
+    int last_slot = -2; long seg_start_tick = 0;
+    const long max_tick = (long)((double)PAD_CAL_BUDGET_MS * 3.0);
+    for (long tick = 0; tick < max_tick; ++tick) {
+        const double rms = (double)tick * (double)TICK_MS;
+        while (elapsed_ms(std::chrono::steady_clock::now(), t0) < rms) { /* 忙等对拍 */ }
+        const auto now = std::chrono::steady_clock::now();
+        const PadCalibStep st = pad_calib_step(0, 120);
+        if (st.active) { human = pad_excite(human, st.dx, st.dy, now); ever = true; }
+        else {
+            if (ever) break;
+            PadLogical z; pad_excite(z, 0, 0, now);      // 标定外也保持账本连续
+        }
+        dq.push_back({now, st.dx, st.dy});
+        while (dq.size() > 8192) dq.pop_front();          // 覆盖最长段 (600 拍) 的实时长
+        const bool collecting = g_calib_collect.load();
+        if (collecting && !was_collect) hist.clear();
+        was_collect = collecting;
+        {
+            auto snap = g_pad_exc_plan.snapshot();
+            int slot = -1;
+            for (size_t i = 0; i < snap.size(); ++i) if (snap[i].begun) slot = (int)i;
+            if (slot != last_slot) {
+                if (last_slot >= 0 && last_slot < (int)snap.size()) {
+                    const PadExcSeg& e = snap[(size_t)last_slot];
+                    const double tr = e.pause ? 0.0
+                        : std::fabs(disp(e.axis, e.t0, shift_ms(e.t1, (double)TICK_MS)));
+                    seg_rec.push_back({last_slot, (int)(tick - seg_start_tick), tr});
+                }
+                last_slot = slot; seg_start_tick = tick;
+            }
+        }
+        if (collecting && elapsed_ms(now, t0) >= next_sample_ms) {
+            next_sample_ms += 1000.0 / (double)cf.fps;
+            const double dt = std::max(1e-4, elapsed_ms(now, t_sample));
+            t_sample = now;
+            const float sx = (float)disp(0, shift_ms(now, -(cf.L_true + dt)),
+                                         shift_ms(now, -cf.L_true)) + (float)(nd(rng) * cf.noise);
+            const float sy = (float)disp(1, shift_ms(now, -(cf.L_true + dt)),
+                                         shift_ms(now, -cf.L_true)) + (float)(nd(rng) * cf.noise);
+            const bool gated = cf.max_disp_px > 0.0f && o.fits < cf.gate_rounds
+                            && std::hypot((double)sx, (double)sy) > (double)cf.max_disp_px;
+            if (!gated) {
+                hist.push_back({now, (float)dt, sx, sy,
+                                resp_of(0, st.dx), 2.0f});
+                if ((int)hist.size() > hist_max) hist.pop_front();
+                pad_calib_update_probe(hist, g_pad_exc_plan.snapshot());
+            }
+        }
+        if (g_calib_request.exchange(false)) {          // ai_thread 的角色
+            o.plan = g_pad_exc_plan.snapshot();          // 收尾序列会清空计划表 → 先抓
+            o.hist_n = (int)hist.size();
+            o.probe_px_s = g_pad_probe_px_s.load();
+
+            o.res = pad_calib_fit(hist, o.plan, SYN_SHIFT_MAX);
+            o.done = pad_cal_done_code(o.res);
+            ++o.fits;
+            if (o.done == 1) {
+                g_pad_stick_gain_x.store(o.res.gain[0]);
+                g_pad_stick_gain_y.store(o.res.gain[1]);
+                if (!script_path.empty()) {
+                    const CalibVar vars[3] = {{PAD_CAL_VAR_GAIN_X, o.res.gain[0], "%.4f"},
+                                              {PAD_CAL_VAR_GAIN_Y, o.res.gain[1], "%.4f"},
+                                              {PAD_CAL_VAR_L, o.res.l_est, "%.1f"}};
+                    o.wrote = persist_calibration(script_path, vars, 3);
+                }
+            }
+            g_calib_done.store(o.done);
+        }
+    }
+    // 逐级段长 (拍 = 虚拟 ms; 取**最后一次尝试**的段) 与实测行程 (px, 合成植物真值)
+    {
+        const auto& pl = pad_cal_plan();
+        for (size_t i = 0; i < seg_rec.size(); ++i) {
+            const int slot = seg_rec[i].slot;
+            if (slot < 0 || slot >= (int)pl.size() || pl[(size_t)slot].pause) continue;
+            const int a = pl[(size_t)slot].axis, l = pl[(size_t)slot].level;
+            const int k = (slot - (a * PAD_CAL_LEVELS_N + l) * PAD_CAL_SEGS_PER_LEVEL * 2) / 2;
+            if (k >= 0 && k < PAD_CAL_SEGS_PER_LEVEL) {
+                o.seg_ms[a][l][k] = seg_rec[i].ticks;                 // 取最后一次尝试
+                o.travel[a][l] = seg_rec[i].travel;
+                o.seg_n[a][l] = std::max(o.seg_n[a][l], k + 1);
+            }
+        }
+    }
+    if (!script_path.empty()) { std::ifstream in(script_path); std::ostringstream ss;
+                                ss << in.rdbuf(); o.script = ss.str(); }
+    g_aim_enabled.store(saved_aim);
+    g_pad_stick_gain_x.store(saved_gx); g_pad_stick_gain_y.store(saved_gy);
+    g_calib_collect.store(false); g_calib_request.store(false); g_calib_done.store(0);
+    own_motion_ledger_set(false);
+    return o;
+}
+
+struct SegPlay { int idx; int ticks; int axis; int level; bool pause; int16_t defl; };
+
+static std::vector<SegPlay> drive_segments(PadCalibStep& s, int max_segs, long max_ticks,
+                                           const std::function<void(int,int,bool)>& on_tick) {
+    std::vector<SegPlay> out;
+    long total = 0;
+    int cur = -2, ticks = 0, cur_axis = -1, cur_level = 0; bool cur_pause = false;
+    int16_t cur_defl = 0;
+    while ((int)out.size() < max_segs && total < max_ticks) {
+        auto p = g_pad_exc_plan.snapshot();
+        int last = -1;
+        for (size_t i = 0; i < p.size(); ++i) if (p[i].begun) last = (int)i;
+        const int axis = last >= 0 ? p[(size_t)last].axis : -1;
+        const int level = last >= 0 ? p[(size_t)last].level : 0;
+        const bool pause = last >= 0 && p[(size_t)last].pause;
+        const int16_t defl = last >= 0 ? p[(size_t)last].defl : 0;
+        on_tick(axis, level, pause);              // AI 线程的角色: 刷新级采样状态
+        s = pad_calib_step(0, 120);
+        ++total;
+        if (last != cur) {
+            if (cur >= 0) out.push_back({cur, ticks, cur_axis, cur_level, cur_pause, cur_defl});
+            cur = last; cur_axis = axis; cur_level = level; cur_pause = pause;
+            cur_defl = defl; ticks = 0;
+        }
+        ++ticks;
+    }
+    if (cur >= 0) out.push_back({cur, ticks, cur_axis, cur_level, cur_pause, cur_defl});
+    return out;
+}
+
+// ============ hid 合成链路 (run_calibration 的输入: counts 账本 + 帧样本) ============
+// 指令时间线 = 激励表重复 loops 圈, 每拍 (1ms) 一段 constant counts 速率; 记账进 g_counts
+//   (hid 路由), 样本按 fps 给出屏幕位移 = 该窗口内账本增量 (灵敏度恒等 1 时为真值) 加高斯
+//   噪声。真 L 非整数 (如 47.3ms) 时 fit 的 lag 网格只能落在它附近 → 残余失配就是 lag
+//   量化误差的口径。
+struct HidSyn { float s_true = 1.0f; double L_true = 47.3; float noise = 0.1f;
+                int fps = 120; unsigned seed = 3; };
+
+static void hid_synth(const std::vector<CalibSeg>& segs, int loops, const HidSyn& hs,
+                      double base_ms, std::deque<CalibSample>& hist) {
+    std::vector<std::pair<int,int>> cmd;
+    for (int l = 0; l < loops; ++l)
+        for (const CalibSeg& sg : segs)
+            for (int k = 0; k < sg.ticks; ++k) cmd.push_back({sg.dx, sg.dy});
+    const int T = (int)cmd.size();
+    CountsHistory& led = g_counts;
+    const int keep = (int)CALIB_HIST_FRAMES * 25;          // 样本窗 (~2.5s) 覆盖的拍数
+    const int t_start = std::max(0, T - keep);
+    for (int k = t_start; k < T; ++k) led.add(at_ms(base_ms + k), cmd[k].first, cmd[k].second);
+    const double dt = 1000.0 / (double)hs.fps;
+    std::mt19937 rng(hs.seed);
+    std::normal_distribution<double> nd(0.0, 1.0);
+    hist.clear();
+    for (double tt = base_ms + t_start; tt < base_ms + T; tt += dt) {
+        auto c1 = led.at(at_ms(tt - hs.L_true));
+        auto c0 = led.at(at_ms(tt - hs.L_true - dt));
+        const float sx = (float)(hs.s_true * (c1.first - c0.first)) + (float)(nd(rng) * hs.noise);
+        const float sy = (float)(hs.s_true * (c1.second - c0.second)) + (float)(nd(rng) * hs.noise);
+        hist.push_back({at_ms(tt), (float)dt, sx, sy, 0.5f, 2.0f});
+        if ((int)hist.size() > CALIB_HIST_FRAMES) hist.pop_front();
+    }
+}
 
 int main() {
     using namespace std::chrono;
@@ -449,14 +726,14 @@ int main() {
         }
     }
 
-    std::cout << "[10] 激励计划表与自适应段时长\n";
+    std::cout << "[10] 激励计划表与自适应段时长 (等行程 + 闭环校正)\n";
     {
         CHECK(PAD_CAL_TRIGGER_TICKS * (double)TICK_MS == 5000.0,
               "L3+R3 长按触发 = 5000ms 墙钟 (拍数由墙钟导出)");
         const auto& pl = pad_cal_plan();
-        CHECK((int)pl.size() == PAD_CAL_SEGS_N && PAD_CAL_SEGS_N == 32
-              && PAD_CAL_EXCITE_N == 16,
-              "计划 = 32 段 (16 激励段 + 16 段后停顿)");
+        CHECK((int)pl.size() == PAD_CAL_SEGS_N && PAD_CAL_SEGS_N == 80
+              && PAD_CAL_EXCITE_N == 40,
+              "计划 = 80 段 (40 激励 + 40 停顿; 2 轴 × 5 级 × 对称段序 4 段)");
         bool pat_ok = true, alt_ok = true, pause_ok = true;
         for (int ax = 0; ax < 2; ++ax)
             for (int li = 0; li < PAD_CAL_LEVELS_N; ++li)
@@ -466,39 +743,56 @@ int main() {
                     const PadPlanSeg& e = pl[(size_t)b];        // 激励段
                     const PadPlanSeg& p = pl[(size_t)b + 1];    // 段后停顿
                     if (e.axis != ax || e.level != li || e.pause) pat_ok = false;
-                    if (e.defl != (k ? -pad_level_defl(PAD_CAL_LEVELS[li])
-                                     : pad_level_defl(PAD_CAL_LEVELS[li]))) alt_ok = false;
+                    // 对称段序 [+d,−d,−d,+d]: 行程以该级起点为中心 ±A
+                    const int sg = (k == 0 || k == PAD_CAL_SEGS_PER_LEVEL - 1) ? 1 : -1;
+                    if (e.defl != (int16_t)(sg * pad_level_defl(PAD_CAL_LEVELS[li])))
+                        alt_ok = false;
                     if (!p.pause || p.defl != 0 || p.axis != ax || p.level != li
                         || p.ticks != ms_to_ticks(PAD_CAL_PAUSE_MS)) pause_ok = false;
                     if (e.ticks != ms_to_ticks(PAD_CAL_SEG_MS_MAX)) pat_ok = false;
                 }
-        CHECK(pat_ok, "先 X 后 Y, 逐级逐段 (两轴同为 {10,25,50,70}%, 每级 ± 各一段)");
-        CHECK(alt_ok, "同级两段方向交替 (±) — 围绕原点往复, 不累积漂移");
+        CHECK(pat_ok && alt_ok,
+              "先 X 后 Y 逐级逐段; 级内段序 [+d,−d,−d,+d] (对称, 行程以起点为中心)");
         CHECK(pause_ok, "每段后接零偏转停顿 (150ms = L 上界 100ms + 余量)");
-        CHECK((int)(sizeof(PAD_CAL_LEVELS) / sizeof(float)) == 4, "级集 4 级");
+        CHECK((int)(sizeof(PAD_CAL_LEVELS) / sizeof(float)) == 5 && PAD_CAL_LEVELS_N == 5,
+              "级集 5 级 (可用区间 {30,40,50,60,70}%, 低端避开死区, 高端外推跨度 1.43)");
+        CHECK(PAD_CAL_LEVELS[0] == 0.30f && PAD_CAL_LEVELS[4] == 0.70f,
+              "级集端点 = 30% / 70% (实机: 10/25% 落在摇杆死区, 满偏不测)");
 
         bool small = true;
         for (const CalibSeg& s : PAD_CAL_START_SEQ) if (s.dx || s.dy) small &= seg_small(s);
         for (const CalibSeg& s : PAD_CAL_END_OK_SEQ) small &= seg_small(s);
         for (const CalibSeg& s : PAD_CAL_END_FAIL_SEQ) small &= seg_small(s);
-        CHECK(small && PAD_CAL_ANIM_DEFL == 8192,
-              "起始方块/成功点头/失败摇头 = 25% 偏转 (8192), 非满偏甩动");
+        CHECK(small && PAD_CAL_ANIM_DEFL == pad_level_defl(PAD_CAL_LEVELS[0])
+              && PAD_CAL_ANIM_DEFL == 9830,
+              "视觉信号 = 级集最低挡 (30%, 9830) — 不另立常量, 非满偏甩动");
         CHECK(seg_ms(PAD_CAL_START_SEQ[0]) == 240.0 && seg_ms(PAD_CAL_START_SEQ[4]) == 500.0
               && seg_ms(PAD_CAL_END_OK_SEQ[0]) == 120.0 && seg_ms(PAD_CAL_SETTLE_SEQ[0]) == 300.0,
               "段时长: 方块 240ms/边 + 500ms 停顿, 收尾 120ms/程, 静置 300ms");
 
-        // 自适应段时长: 下限 = P + 帧长×(1+采样下限); 上限 = 流程预算; 行程目标 = 屏高/4
-        CHECK(pad_cal_seg_ms_min(120) == 192 && pad_cal_seg_ms_min(60) == 233,
-              "中段统计下限 = P + 帧长×(1+4) = 192ms@120fps / 233ms@60fps");
-        CHECK(pad_cal_seg_ticks(0.0f, 0.0f, 0.25f, 120) == ms_to_ticks(pad_cal_seg_ms_min(120)),
+        // 段长下限 = P + 帧长×(1+样本下限+抖动余量): 258ms@120fps / 367ms@60fps
+        CHECK(pad_cal_seg_ms_min(120) == 258 && pad_cal_seg_ms_min(60) == 367,
+              "中段统计下限 = 150 + 帧长×13 = 258ms@120fps / 367ms@60fps (8 样本 + 4 帧余量)");
+        CHECK(PAD_CAL_SEG_MS_MAX == 600 && PAD_CAL_PLAN_MS == 30000
+              && PAD_CAL_BUDGET_MS == 60000,
+              "段长上限 600ms (覆盖采样周期 4×标称), 名义计划 30s, 流程预算 = 2×计划");
+        CHECK(pad_cal_seg_floor_ms(120, false) == 258
+              && pad_cal_seg_floor_ms(120, true) == 516
+              && pad_cal_seg_floor_ms(60, true) == 600,
+              "整轮重跑的下限 = min(2×下限, 上限) (抬高一档)");
+        CHECK(pad_cal_seg_ticks(0.0f, 0.0f, 0.30f, 258) == ms_to_ticks(258),
               "探针级 (无实测) → 段长取下限 (行程最小, 最安全)");
-        CHECK(pad_cal_seg_ticks(100.0f, 0.10f, 0.25f, 120) == ms_to_ticks(250),
-              "自适应: 100px/s@10% → 25% 预测 625px/s → 432ms → 夹到上限 250ms");
-        CHECK(pad_cal_seg_ticks(2000.0f, 0.10f, 0.25f, 120)
-              == ms_to_ticks(pad_cal_seg_ms_min(120)),
-              "自适应: 快游戏 → 目标行程对应段长短于统计下限 → 取下限");
-        CHECK(pad_cal_seg_ticks(10.0f, 0.10f, 0.70f, 120) == ms_to_ticks(250),
-              "自适应: 迟钝游戏 (10px/s@10% → 70% 预测 490px/s → 551ms) → 夹到上限 250ms");
+        // 等行程: T = 目标/V̂, V̂ = v·(d_next/d_meas)^P_MAX (最陡曲线 = 高估屏速 = 安全方向)
+        CHECK(pad_cal_seg_ticks(180.0f, 0.30f, 0.40f, 258) == ms_to_ticks(422),
+              "等行程: 180px/s@30% → 40% 预测 320px/s → 段长 422ms (目标行程 135px)");
+        CHECK(pad_cal_seg_ticks(2000.0f, 0.30f, 0.40f, 258) == ms_to_ticks(258),
+              "快游戏 → 目标行程对应段长短于统计下限 → 取下限 (行程超目标, 量程门兜底)");
+        CHECK(pad_cal_seg_ticks(20.0f, 0.30f, 0.40f, 258) == ms_to_ticks(600),
+              "迟钝游戏 (20px/s@30% → 40% 预测 36px/s → 3704ms) → 夹到上限 600ms");
+        CHECK(pad_cal_seg_ticks(180.0f, 0.30f, 0.70f, 258) == ms_to_ticks(258),
+              "同轴跨度更大的一档 (30%→70%): 预测 980px/s → 138ms → 仍夹到下限 258ms");
+        // 行程目标: 上界 = 投影保真圆 (2.4%@150px) 与俯仰夹紧, 下界 = 实测散度的倍数
+        CHECK(PAD_CAL_TRAVEL_PX == 135.0f, "行程目标 = 屏高/8 = 135px (保真圆 150px 内)");
         bool travel_ok = true; float worst = 0;
         const int lo = pad_cal_seg_ms_min(120);
         for (float pn : {1.0f, 1.5f, 2.0f})
@@ -507,7 +801,7 @@ int main() {
                     const float dp = PAD_CAL_LEVELS[a], dn = PAD_CAL_LEVELS[b];
                     for (float A : {300.0f, 3000.0f, 30000.0f}) {
                         const float v_meas = A * std::pow(dp, pn);
-                        const float ticks = pad_cal_seg_ticks(v_meas, dp, dn, 120);
+                        const float ticks = pad_cal_seg_ticks(v_meas, dp, dn, lo);
                         const float ms = ticks * TICK_MS;
                         if (ms <= (float)lo + 0.5f) continue;      // 已夹到下限
                         const float travel = A * std::pow(dn, pn) * ms / 1000.0f;
@@ -515,7 +809,7 @@ int main() {
                         if (travel > PAD_CAL_TRAVEL_PX + 1.0f) travel_ok = false;
                     }
                 }
-        CHECK(travel_ok, "按最陡曲线 (p≤2) 假设定的段长 → 单段行程不超屏高 1/4 (270px)");
+        CHECK(travel_ok, "按最陡曲线 (p≤2) 假设定的段长 → 单段行程不超目标 135px");
         std::cout << "      (最坏行程 " << std::fixed << std::setprecision(1) << worst
                   << "px / 目标 " << PAD_CAL_TRAVEL_PX << "px)\n";
         std::cout << std::defaultfloat << std::setprecision(6);   // 恢复默认格式 (后续诊断行)
@@ -541,45 +835,67 @@ int main() {
         CHECK(s.active && s.dx == 0 && s.dy == 0,
               "满 5000 拍 → 触发 (触发拍不播激励, 与 hid 同形)");
 
-        const int edge = ms_to_ticks(240), P = ms_to_ticks(PAD_CAL_PAUSE_MS);
+        const int edge = ms_to_ticks(240);
         const int lo = ms_to_ticks(pad_cal_seg_ms_min(120));
-        const int16_t d10 = pad_level_defl(0.10f), d25 = pad_level_defl(0.25f);
+        const int16_t anim = PAD_CAL_ANIM_DEFL;
         run(1);
-        CHECK(s.dx == PAD_CAL_ANIM_DEFL && s.dy == 0, "起始方块 1/4: +25% (小幅慢速)");
+        CHECK(s.dx == anim && s.dy == 0, "起始十字 1/4: +30%");
         run(edge - 1); run(edge);
-        CHECK(s.dy == PAD_CAL_ANIM_DEFL && s.dx == 0, "2/4: +25% 纵向");
-        run(edge); CHECK(s.dx == -PAD_CAL_ANIM_DEFL && s.dy == 0, "3/4: −25%");
-        run(edge); CHECK(s.dy == -PAD_CAL_ANIM_DEFL && s.dx == 0, "4/4: −25% 纵向");
+        CHECK(s.dx == -anim && s.dy == 0, "2/4: −30% (换到起点另一侧 → 行程居中)");
+        run(edge); CHECK(s.dx == 0 && s.dy == anim, "3/4: +30% 纵向");
+        run(edge); CHECK(s.dx == 0 && s.dy == -anim, "4/4: −30% 纵向");
         run(ms_to_ticks(500) - 1);
         CHECK(!g_calib_collect.load(), "起始方块期不采样 (纯视觉开始信号)");
         run(1);
         CHECK(g_calib_collect.load(), "起始方块结束 → 采样开 (激励自下一拍起)");
         CHECK(g_pad_exc_plan.snapshot().size() == (size_t)PAD_CAL_SEGS_N,
-              "段窗口表已建 (32 段, 时间戳随播放写入)");
+              "段窗口表已建 (80 段, 时间戳随播放写入)");
 
-        run(1);
-        CHECK(s.dx == d10 && s.dy == 0, "激励段 1: X 10% +3277 (探针级)");
-        run(lo - 1);
-        CHECK(s.dx == d10, "探针级段长 = 中段统计下限 192 拍");
-        run(1);
-        CHECK(s.dx == 0 && s.dy == 0, "段后停顿: 摇杆归零 (L 与噪声底的来源)");
-        run(P - 1);
-        CHECK(s.dx == 0 && s.dy == 0, "停顿段长 = 150 拍");
-        run(1);
-        CHECK(s.dx == -d10, "同级第二段: 方向交替 −3277");
-        run(lo - 1); run(1);
-        CHECK(s.dx == 0, "第二段后同样停顿");
-        run(P - 1);
-        g_pad_probe_px_s.store(100.0f); g_pad_probe_d.store(0.10f);
-        run(1);
-        CHECK(s.dx == d25 && s.dy == 0, "激励 25%: +8192");
-        run(ms_to_ticks(250) - 1);
-        CHECK(s.dx == d25, "级间段长按已测屏速自适应 (250ms = 上限)");
-        run(1);
-        CHECK(s.dx == 0, "25% 段后停顿");
+        // 30% 级: 逐段驱动 (记录实际播放时长) — 对称段序 4 段 + 每段后 150ms 停顿
+        auto noop = [](int, int, bool) {};
+        auto p0 = drive_segments(s, 6, 300000, noop);      // 槽位 0..5 (3 段 + 3 停顿)
+        bool seq_ok = (int)p0.size() >= 6;
+        for (int k = 0; seq_ok && k < 3; ++k) {
+            const int16_t d = pad_level_defl(PAD_CAL_LEVELS[0]);
+            const int16_t want = (int16_t)(k == 0 ? d : -d);
+            seq_ok = seq_ok && p0[(size_t)(k * 2)].idx == 2 * k
+                  && !p0[(size_t)(k * 2)].pause && p0[(size_t)(k * 2)].defl == want
+                  && p0[(size_t)(k * 2 + 1)].idx == 2 * k + 1
+                  && p0[(size_t)(k * 2 + 1)].pause
+                  && std::abs(p0[(size_t)(k * 2 + 1)].ticks - ms_to_ticks(PAD_CAL_PAUSE_MS)) <= 2;
+        }
+        std::cout << "      (逐段: 槽位@拍数 —";
+        for (size_t i = 0; i < p0.size(); ++i)
+            std::cout << " " << p0[i].idx << "@" << p0[i].ticks;
+        std::cout << ")\n";
+        CHECK(seq_ok, "30% 级 = 对称段序 [+d,−d,−d,+d] 4 段, 每段后接 150ms 停顿");
+        CHECK(p0[0].ticks >= lo - 2 && p0[0].ticks <= lo + 2,
+              "探针级 (尚无实测) 段长 = 中段统计下限 258 拍");
+        {
+            auto snp = g_pad_exc_plan.snapshot();
+            CHECK(snp[0].begun && snp[6].begun && !snp[8].begun,
+                  "已播段带 begun 标志, 未触碰的槽位不带 (旧判据 t1>=t0 无法区分 — 见 [17])");
+        }
+
+        // 趁 30% 级最后一个停顿: 注入探针 (180px/s@30%) → 40% 级段长 = 135px/320px·s⁻¹
+        //   = 422ms (行程闭环校正比 = 1: 上一级实测行程 = 目标)
+        g_pad_probe_px_s.store(180.0f); g_pad_probe_d.store(0.30f);
+        g_pad_probe_travel_px.store(PAD_CAL_TRAVEL_PX);
+        for (int a = 0; a < PAD_CAL_AXES_N; ++a)
+            for (int l = 0; l < PAD_CAL_LEVELS_N; ++l) g_pad_mid_n[a][l].store(16);
+        auto p1 = drive_segments(s, 6, 300000, noop);       // 槽位 6..11 (进入 40% 级)
+        int t8 = -1;
+        for (size_t i = 0; i < p1.size(); ++i) if (p1[i].idx == 8) t8 = p1[i].ticks;
+        std::cout << "      (40% 级首段 " << t8 << " 拍 (探针级 258 拍))\n";
+        CHECK(t8 >= 420 && t8 <= 424,
+              "级间段长按探针等行程自适应 422 拍 (不再恒为下限)");
 
         int n = 0;
-        while (g_calib_collect.load() && n < 60000) { s = pad_calib_step(0, 120); ++n; }
+        while (g_calib_collect.load() && n < 600000) {
+            for (int a = 0; a < PAD_CAL_AXES_N; ++a)
+                for (int l = 0; l < PAD_CAL_LEVELS_N; ++l) g_pad_mid_n[a][l].store(16);
+            s = pad_calib_step(0, 120); ++n;
+        }
         CHECK(!g_calib_collect.load() && g_calib_request.load(),
               "激励结束 → 采样关, 请求 ai_thread 拟合");
         CHECK(s.active && s.dx == 0 && s.dy == 0, "等待回执期摇杆静置 (律让位)");
@@ -589,12 +905,12 @@ int main() {
               && plan_done.back().t1 > plan_done.front().t1,
               "段窗口逐段记录 (首尾时间戳自洽, 拟合按它归段)");
         int np = 0; for (auto& g : plan_done) np += g.pause ? 1 : 0;
-        CHECK(np == PAD_CAL_SEGS_N / 2, "停顿段窗口同样记录 (16 条)");
+        CHECK(np == PAD_CAL_SEGS_N / 2, "停顿段窗口同样记录 (40 条)");
 
         g_calib_request.store(false);
         g_calib_done.store(1);
         run(2);
-        CHECK(s.dy == PAD_CAL_ANIM_DEFL && s.dx == 0, "回执成功 → 纵向点头收尾 (25%)");
+        CHECK(s.dy == PAD_CAL_ANIM_DEFL && s.dx == 0, "回执成功 → 纵向点头收尾 (30%)");
         run(ms_to_ticks(120) * 6 + 1);
         CHECK(!s.active, "收尾结束 → 回到空闲");
         g_calib_done.store(0);
@@ -606,11 +922,15 @@ int main() {
         CHECK(!g_padcalib_request.load(), "标定请求一次消费即清 (exchange)");
         run(edge * 4 + ms_to_ticks(500) + 1);
         n = 0;
-        while (g_calib_collect.load() && n < 60000) { s = pad_calib_step(0, 120); ++n; }
+        while (g_calib_collect.load() && n < 600000) {
+            for (int a = 0; a < PAD_CAL_AXES_N; ++a)
+                for (int l = 0; l < PAD_CAL_LEVELS_N; ++l) g_pad_mid_n[a][l].store(16);
+            s = pad_calib_step(0, 120); ++n;
+        }
         g_calib_request.store(false);
         g_calib_done.store(2);
         run(2);
-        CHECK(s.dx == PAD_CAL_ANIM_DEFL && s.dy == 0, "回执失败 → 横向摇头收尾 (25%)");
+        CHECK(s.dx == PAD_CAL_ANIM_DEFL && s.dy == 0, "回执失败 → 横向摇头收尾 (30%)");
         run(ms_to_ticks(120) * 6 + 1);
         CHECK(!s.active, "失败收尾后回到空闲 (可重复触发)");
         g_calib_done.store(0);
@@ -636,6 +956,90 @@ int main() {
         pad_calib_step(0, 120);                       // 复位
         g_aim_enabled.store(saved_aim);
         g_calib_collect.store(false); g_calib_request.store(false); g_calib_done.store(0);
+    }
+
+    std::cout << "[11b] 取样不足 → 重播阶梯 (级内加倍 → 上限) 与整轮重跑 (仅一次)\n";
+    {
+        bool saved_aim = g_aim_enabled.load();
+        g_aim_enabled.store(true);
+        PadCalibStep s{false, 0, 0};
+        for (int a = 0; a < PAD_CAL_AXES_N; ++a)
+            for (int l = 0; l < PAD_CAL_LEVELS_N; ++l)
+                g_pad_mid_n[a][l].store(PAD_CAL_MID_N_NONE);
+        g_padcalib_request.store(true);
+        s = pad_calib_step(0, 120);
+        g_padcalib_request.store(false);
+        for (int i = 0; i < ms_to_ticks(240) * 4 + ms_to_ticks(500) + 1; ++i)
+            s = pad_calib_step(0, 120);
+        CHECK(g_calib_collect.load(), "进入激励期 (热参触发 + 起始十字)");
+
+        // 30% 级全程报"中段样本 3 < 8" (仅样本数不足) → 级边界连续重播到上限
+        auto on_tick = [](int axis, int level, bool pause) {
+            if (!pause && axis == 0 && level == 0) g_pad_mid_n[0][0].store(3);
+        };
+        const int L8 = 2 * PAD_CAL_SEGS_PER_LEVEL;          // 一级 = 8 个计划段
+        auto played = drive_segments(s, 3 * L8, 900000, on_tick);
+        std::cout << "      (激励段 计划序号@拍数 —";
+        for (int i = 0; i < (int)played.size(); ++i)
+            if (!played[(size_t)i].pause)
+                std::cout << " " << played[(size_t)i].idx << "@" << played[(size_t)i].ticks;
+        std::cout << ")\n";
+        const int lo_ms = pad_cal_seg_ms_min(120);
+        CHECK((int)played.size() >= 3 * L8 - 1 && played[2 * L8].idx == 0,
+              "取到 3 次尝试的逐段记录 (第 3 次尝试已开播)");
+        CHECK(played[0].idx == 0 && played[0].ticks >= lo_ms - 2 && played[0].ticks <= lo_ms + 2,
+              "首次尝试: 30% 级首段取下限 258 拍 (探针级: 无实测)");
+        CHECK(played[L8].idx == 0 && played[L8].ticks >= 2 * lo_ms - 4,
+              "第 1 次重播: 回退到该级首段, 段长加倍 (258→516)");
+        CHECK(played[2 * L8].idx == 0 && played[2 * L8].ticks >= PAD_CAL_SEG_MS_MAX - 2,
+              "第 2 次重播: 再加倍到上限 600ms");
+        CHECK(played[L8 + 2].idx == 2 && !played[L8 + 2].pause,
+              "重播重走该级的对称段序 (计划槽位复用, 非新增槽位)");
+        CHECK(played[L8 - 1].pause && played[L8 - 1].idx == 2 * PAD_CAL_SEGS_PER_LEVEL - 1,
+              "首次尝试走完 4 段 + 4 停顿后才到级边界");
+
+        // 上限后不再重播 → 正常进入下一挡
+        auto rest = drive_segments(s, 4, 900000, on_tick);
+        bool again = false, nxt = false;
+        for (size_t i = 0; i < rest.size(); ++i) {
+            if (rest[i].idx == 0) again = true;
+            if (!rest[i].pause && rest[i].axis == 0 && rest[i].level == 1) nxt = true;
+        }
+        CHECK(!again && nxt, "阶梯到顶后不再重播 → 正常进入下一挡 (40%)");
+
+        int n = 0;
+        while (g_calib_collect.load() && n < 900000) { s = pad_calib_step(0, 120); ++n; }
+        CHECK(g_calib_request.load(), "整轮结束 → 请求拟合");
+        g_calib_request.store(false);
+
+        // 回执 3 (仅样本数不足) → 整轮重跑: 下限抬高一档 (258→516ms), 计划表重建
+        g_calib_done.store(3);
+        s = pad_calib_step(0, 120);
+        CHECK(s.active && g_calib_collect.load() && g_calib_done.load() == 0,
+              "回执 3 → 整轮重跑: 采样重开, 回执码清零");
+        {
+            auto pz = g_pad_exc_plan.snapshot();
+            bool any = false; for (size_t i = 0; i < pz.size(); ++i) any |= pz[i].begun;
+            CHECK(!any, "重跑重建窗口表 (首轮尝试的时间戳全部作废)");
+        }
+        auto p2 = drive_segments(s, 1, 900000, on_tick);
+        CHECK(!p2.empty() && p2[0].idx == 0 && p2[0].ticks >= 2 * lo_ms - 4,
+              "重跑的首段 = 抬高一档的下限 (516ms) — 整轮下限整体上移");
+
+        // 第二次回执 3: 已重跑过 → 不再重跑, 转失败收尾 (不写垃圾值)
+        n = 0;
+        while (g_calib_collect.load() && n < 900000) { s = pad_calib_step(0, 120); ++n; }
+        g_calib_request.store(false);
+        g_calib_done.store(3);
+        s = pad_calib_step(0, 120);
+        CHECK(!s.active || s.dx == 0, "第二次回执 3 当拍: 尚未进入收尾序列");
+        s = pad_calib_step(0, 120);
+        CHECK(s.active && !g_calib_collect.load() && s.dx == PAD_CAL_ANIM_DEFL && s.dy == 0,
+              "第二次回执 3 → 不再重跑 (仅一次), 转失败摇头收尾");
+        for (int i = 0; i < ms_to_ticks(120) * 6 + 2; ++i) s = pad_calib_step(0, 120);
+        CHECK(!s.active, "收尾结束 → 空闲 (失败路径可重复触发)");
+        g_calib_collect.store(false); g_calib_request.store(false); g_calib_done.store(0);
+        g_aim_enabled.store(saved_aim);
     }
 
     std::cout << "[12] 激励期独占右摇杆与账本\n";
@@ -785,7 +1189,7 @@ int main() {
         std::deque<CalibSample> hist;
         double base = 260000.0;
 
-        // (a) 70% 级超量程 (位移放大模拟回卷/游戏太快) → 整级丢弃, 其余级照常拟合
+        // (a) 60% 级超量程 (位移放大模拟回卷/游戏太快) → 整级丢弃, 其余级照常拟合
         {
             Synth sy;
             sy.A[0] = 3000.0f; sy.p[0] = 1.3f;
@@ -796,11 +1200,11 @@ int main() {
             PadCalibResult r = pad_calib_fit(hist, win, SYN_SHIFT_MAX);
             const PadCalLevelDiag& d = r.lv[0][3];
             CHECK(!d.valid && d.why[0] != 0 && d.val > d.lim,
-                  std::string("70% 级因超量程整级丢弃, 原因可读: ").append(d.why).c_str());
-            CHECK(r.ok && r.nlv[0] == 3 && r.nlv[1] >= 3,
-                  "X 取其余 3 级 (70% 被丢), Y 仍 ≥3 级 — 各自有效级数入日志");
+                  std::string("60% 级因超量程整级丢弃, 原因可读: ").append(d.why).c_str());
+            CHECK(r.ok && r.nlv[0] == 4 && r.nlv[1] == 5,
+                  "X 取其余 4 级 (60% 被丢), Y 仍 5 级 — 各自有效级数入日志");
             CHECK(near(r.gain[0], 3000.0f, 1e-3f) && near(r.p[0], 1.3f, 1e-3f),
-                  "丢掉 70% 级后仍复原 X 的 A/p (幂律由其余级定出)");
+                  "丢掉 60% 级后仍复原 X 的 A/p (幂律由其余级定出)");
             CHECK(near(r.gain[1], 1200.0f, 1e-3f), "Y 轴不受 X 级丢弃影响");
         }
         // (b) 块间离散超量程 (回卷的另一种证据) → 整级丢弃
@@ -812,8 +1216,8 @@ int main() {
             auto win = synth_play(sy, base, hist);
             base += 20000.0;
             PadCalibResult r = pad_calib_fit(hist, win, SYN_SHIFT_MAX);
-            CHECK(!r.lv[0][1].valid && r.nlv[0] == 3 && r.ok,
-                  "块间离散越界 → 该级丢弃 (非静默取值), 其余三级仍拟合");
+            CHECK(!r.lv[0][1].valid && r.nlv[0] == 4 && r.ok,
+                  "块间离散越界 → 该级丢弃 (非静默取值), 其余四级仍拟合");
             CHECK(near(r.gain[0], 2000.0f, 1e-3f), "丢弃后 A 仍复原");
         }
         // (c) 夹紧 (屏幕不响应注入): 中段位移≈0 → 整级丢弃
@@ -840,7 +1244,7 @@ int main() {
             auto win = synth_play(sy, base, hist);
             base += 20000.0;
             PadCalibResult r = pad_calib_fit(hist, win, SYN_SHIFT_MAX);
-            CHECK(!r.lv[0][0].valid && r.nlv[0] <= 3 && r.ok,
+            CHECK(!r.lv[0][0].valid && r.nlv[0] <= 4 && r.ok,
                   "相关响应过低 → 该级丢弃 (其余级拟合)");
         }
         // (e) 恰好 1 级有效 → 线性回退 (p=1, A = 该级屏速/d), 线性植物下精确
@@ -921,6 +1325,312 @@ int main() {
                   "不存在的脚本 → 回写失败 (不创建文件)");
             unlink(path.c_str()); unlink(path2.c_str()); rmdir(dir);
         }
+    }
+
+
+    std::cout << "[17] 采样状态: 探针判据与旧的哨兵缺陷 (实机根因复核)\n";
+    {
+        own_motion_ledger_set(true);
+        std::deque<CalibSample> hist;
+        double base = 500000.0;
+        Synth sy; sy.A[0] = 3000.0f; sy.p[0] = 1.0f;
+        sy.A[1] = 3000.0f; sy.p[1] = 1.0f; sy.L_true = 45.0; sy.seg_ms = 258;
+        auto win = synth_play(sy, base, hist);
+        // 只把前 14 段标成"已开播" (X 30% 级已播完, 40% 级进行中)
+        for (size_t i = 14; i < win.size(); ++i) win[i].begun = false;
+        int old_last = -1;                       // 旧判据: t1 >= t0 (未被触碰的槽位也满足)
+        for (size_t i = 0; i < win.size(); ++i) if (win[i].t1 >= win[i].t0) old_last = (int)i;
+        int new_last = -1;                       // 新判据: begun
+        for (size_t i = 0; i < win.size(); ++i) if (win[i].begun) new_last = (int)i;
+        CHECK(old_last == (int)win.size() - 1 && new_last == 13,
+              "旧哨兵 (t1>=t0) 命中未触碰的最后槽位; 新判据 (begun) 命中真正已播段");
+        // 旧代码的等价状态: 未触碰槽位 = 默认时间戳 (t0==t1), 但被旧判据当成"已播" —
+        //   探针于是永远池化最后一个槽位所属的级 (Y 70%), 其窗口在激励早期全空 → cc=0
+        //   → 探针永不发布 → 段长恒取下限 → 级仍无效 (实机"每级都标 (探针级)"的死循环)
+        std::vector<PadExcSeg> oldwin = win;
+        for (size_t i = 0; i < oldwin.size(); ++i) {
+            oldwin[i].begun = true;
+            if (i >= 14) { oldwin[i].t0 = std::chrono::steady_clock::time_point{};
+                           oldwin[i].t1 = oldwin[i].t0; }
+        }
+        g_pad_probe_px_s.store(0.0f); g_pad_probe_d.store(0.0f);
+        pad_calib_update_probe(hist, oldwin);
+        CHECK(g_pad_probe_px_s.load() == 0.0f, "旧判据下探针恒 0 (窗口全空的自强化死循环)");
+        pad_calib_update_probe(hist, win);
+        std::cout << "      (探针 " << g_pad_probe_px_s.load() << "px/s @ d="
+                  << g_pad_probe_d.load() << " | 行程读数 "
+                  << g_pad_probe_travel_px.load() << "px | 级采样状态 (0,2)="
+                  << g_pad_mid_n[0][2].load() << ")\n";
+        CHECK(g_pad_probe_px_s.load() > 0.0f && near(g_pad_probe_d.load(), 0.4f, 1e-3f),
+              "新判据下探针可用 (最后已播段所属级 = 40%)");
+        CHECK(near(g_pad_probe_px_s.load(), 3000.0f * 0.4f, 0.05f),
+              "探针屏速 ≈ 该级真值 (宽松判据 2σ + 量级钳制)");
+        CHECK(g_pad_mid_n[0][1].load() >= PAD_CAL_SEG_MIN_N,
+              "级采样状态 ≥ 样本下限 (重播裁决的输入)");
+        // 行程读数 = 该级整段位移积分 = v·(段长−L) (合成链路用固定 258ms 段长,
+        //   不是自适应段长 → 此处只校验口径, 不是目标行程)
+        const double trav_expect = 3000.0 * 0.4 * (258.0 - 45.0) / 1000.0;
+        std::cout << "      (行程读数 " << g_pad_probe_travel_px.load() << "px, 口径预期 "
+                  << trav_expect << "px = v·(T−L))\n";
+        CHECK(near(g_pad_probe_travel_px.load(), (float)trav_expect, 0.15f),
+              "实测行程读数 = v·(段长−L) (闭环校正的输入口径)");
+        // ---- 旧设计点的复现 (根因 1: 中段窗零余量) ----
+        // 旧下限 = P + 帧长×(1+4) = 192ms → 中段窗 = T−P−帧长 = 33.7ms ≈ 4.04 帧
+        //   (标称 120fps)。实测采样周期只要略慢于标称 (处理线程跟不上采集), 样本数
+        //   就掉到 3 < 4 → **每级**"中段样本不足" → 全级无效; 探针又因哨兵缺陷恒 0 →
+        //   段长恒取下限 → 自我强化 (实机日志"每级都标 (探针级)"+"全部级无效")。
+        // 新下限 = P + 帧长×13 = 258ms → 同一采样周期下有 10 个样本 (≥8)。
+        {
+            const double f110 = 1000.0 / 110.0;      // 实测采样周期 (略慢于标称 120fps)
+            const int n192 = (int)((192.0 - PAD_CAL_PAUSE_MS - f110) / f110) + 1;
+            const int n258 = (int)((258.0 - PAD_CAL_PAUSE_MS - f110) / f110) + 1;
+            std::cout << "      (中段样本 @110fps: 旧下限 192ms → " << n192
+                      << " 个 (旧判据需 ≥4) | 新下限 258ms → " << n258
+                      << " 个 (需 ≥8))"<< std::endl;
+            CHECK(n192 <= 4 && n258 >= PAD_CAL_SEG_MIN_N + 2,
+                  "旧下限的窗恰卡在旧判据门限上 (3–4 个 = 零余量), 新下限 10–11 个有真实余量");
+            Synth old_sy; old_sy.fps = 110; old_sy.A[0] = old_sy.A[1] = 3000.0f;
+            old_sy.seg_ms = 192;
+            auto w192 = synth_play(old_sy, base, hist); base += 40000.0;
+            PadCalibResult r192 = pad_calib_fit(hist, w192, SYN_SHIFT_MAX);
+            bool all_short = (r192.nlv[0] == 0 && r192.nlv[1] == 0);
+            for (int l = 0; l < PAD_CAL_LEVELS_N && all_short; ++l)
+                all_short = !r192.lv[0][l].valid && r192.lv[0][l].why_samples;
+            CHECK(all_short, "旧设计点复现: 段长 192ms → 两级全无效, 原因全是中段样本不足");
+            old_sy.seg_ms = 258;
+            auto w258 = synth_play(old_sy, base, hist); base += 40000.0;
+            PadCalibResult r258 = pad_calib_fit(hist, w258, SYN_SHIFT_MAX);
+            CHECK(r258.ok && r258.nlv[0] >= PAD_CAL_LEVELS_N - 1 && r258.nlv[1] >= PAD_CAL_LEVELS_N - 1
+                  && near(r258.gain[0], 3000.0f, 0.03f),
+                  "同一采样周期下新下限 258ms → 各级有效且 A 复原 (余量起作用)");
+        }
+        own_motion_ledger_set(false);
+    }
+
+    std::cout << "[18] 闭环合成 e2e: 触发→激励→停顿→拟合→回写\n";
+    {
+        char tmpl[] = "/tmp/pad_test_loop_XXXXXX";
+        char* dir = mkdtemp(tmpl);
+        const std::string script = dir ? std::string(dir) + "/game.sh" : std::string();
+        if (!script.empty()) {
+            std::ofstream o(script);
+            o << "#!/bin/bash\nPAD_STICK_GAIN_X=0.0000\nPAD_STICK_GAIN_Y=0.0000\nL_EST_PAD=0.0\n";
+        }
+        // 中速游戏: 30% 级探针 → 40%/50% 级段长按等行程拉长, 高挡位再落回下限 —
+        //   一次真实节拍的闭环同时验证探针、自适应段长、行程闭环校正与拟合复原
+        LoopCfg mid; mid.A[0] = 800.0f; mid.A[1] = 800.0f;
+        mid.p[0] = mid.p[1] = 1.0f; mid.noise = 0.02f; mid.seed = 11;
+        LoopOut rm = run_loop(mid, script);
+        std::cout << "      (X A=" << rm.res.gain[0] << " p=" << rm.res.p[0] << " L="
+                  << rm.res.l_est << "ms | 段长";
+        for (int l = 0; l < PAD_CAL_LEVELS_N; ++l) std::cout << " " << rm.seg_ms[0][l][0];
+        std::cout << "ms | 行程";
+        for (int l = 0; l < PAD_CAL_LEVELS_N; ++l) std::cout << " " << rm.travel[0][l];
+        std::cout << "px | done=" << rm.done << ")\n";
+        if (rm.done != 1) {
+            std::cerr << "      [dbg] err=[" << rm.res.err << "] sigma=" << rm.res.sigma[0]
+                      << "/" << rm.res.sigma[1] << " nlv=" << rm.res.nlv[0] << "/" << rm.res.nlv[1]
+                      << " hist=" << rm.hist_n << " probe=" << rm.probe_px_s << std::endl;
+            for (int l = 0; l < PAD_CAL_LEVELS_N; ++l)
+                std::cerr << "      [dbg] lv" << l << " ok=" << rm.res.lv[0][l].seg_ok
+                          << "/" << rm.res.lv[0][l].seg_all << " why=" << rm.res.lv[0][l].why
+                          << " val=" << rm.res.lv[0][l].val << " lim=" << rm.res.lv[0][l].lim
+                          << std::endl;
+        }
+        CHECK(rm.done == 1 && rm.res.ok && rm.wrote, "闭环: 标定成功并回写脚本");
+        CHECK(near(rm.res.gain[0], 800.0f, 0.06f) && near(rm.res.gain[1], 800.0f, 0.06f),
+              "闭环: 两轴满偏屏速复原在 6% 内 (探针 → 段长 → 中段取样 → 幂律外推)");
+        CHECK(std::fabs(rm.res.l_est - 45.0f) <= 8.0f, "闭环: L 复原 (停顿位移和)");
+        CHECK(rm.seg_ms[0][1][0] > rm.seg_ms[0][0][0] + 20.0,
+              "闭环: 40% 级段长 > 30% 级下限 (探针驱动的等行程自适应生效)");
+        CHECK(rm.seg_ms[0][4][0] <= rm.seg_ms[0][1][0],
+              "闭环: 更高挡位段长不增 (T = 目标/V̂)");
+        int nb = 0; double worst = 0;
+        for (int l = 0; l < PAD_CAL_LEVELS_N; ++l) {          // 未被夹住的级: 行程贴近目标
+            if (rm.seg_ms[0][l][0] <= pad_cal_seg_ms_min(120) + 1.0) continue;
+            if (rm.seg_ms[0][l][0] >= PAD_CAL_SEG_MS_MAX - 1.0) continue;
+            ++nb; worst = std::max(worst, std::fabs(rm.travel[0][l] - (double)PAD_CAL_TRAVEL_PX));
+        }
+        std::cout << "      (未被夹住的级 n=" << nb << " 最大行程偏差 " << worst << "px)\n";
+        CHECK(nb > 0 && worst <= 0.5 * (double)PAD_CAL_TRAVEL_PX,
+              "闭环: 行程闭环校正使未被夹住级的实测行程贴近目标 (±50%)");
+        if (!script.empty()) unlink(script.c_str());
+        if (dir) rmdir(dir);
+    }
+
+    std::cout << "[18b] 逐方向判定 (合成窗, 快速): 无纹理单方向采纳 / 夹紧丢弃 / 死区丢弃\n";
+    {
+        own_motion_ledger_set(true);
+        std::deque<CalibSample> hist;
+        double base = 700000.0;
+        // (a) 死区级: 两方向都不响应 → 整级丢弃, 原因不是样本数 (重播/重跑救不了)
+        {
+            Synth sy; sy.seg_ms = 258; sy.A[0] = sy.A[1] = 3000.0f;
+            sy.scale[0][0] = 0.0f;
+            auto win = synth_play(sy, base, hist); base += 40000.0;
+            PadCalibResult r = pad_calib_fit(hist, win, SYN_SHIFT_MAX);
+            CHECK(r.ok && !r.lv[0][0].valid && !r.lv[0][0].why_samples && r.nlv[0] == 4,
+                  "死区级整级丢弃 (位移≈0), 原因不是样本数");
+            CHECK(near(r.gain[0], 3000.0f, 0.03f), "丢一级后 A 仍复原");
+            CHECK(!pad_cal_deadzone(r, 0).hit, "被丢弃的挡位不进死区诊断");
+        }
+        // (b) 单方向无纹理 (+向相关峰压低) → 采用 −向并标注, 该级仍有效
+        {
+            Synth sy; sy.seg_ms = 258; sy.A[0] = sy.A[1] = 3000.0f;
+            sy.resp_dir[0][0] = 0.005f;
+            auto win = synth_play(sy, base, hist); base += 40000.0;
+            PadCalibResult r = pad_calib_fit(hist, win, SYN_SHIFT_MAX);
+            CHECK(r.ok && r.lv[0][0].valid && r.lv[0][0].note[0] != 0,
+                  "单方向无纹理 → 采纳另一方向并标注 (级仍有效)");
+            CHECK(near(r.gain[0], 3000.0f, 0.03f), "单方向测量无偏 (A 复原)");
+            CHECK(!pad_cal_deadzone(r, 0).hit, "单方向测量不触发死区诊断");
+        }
+        // (c) 单方向夹紧 (+向位移≈0 但相关正常) → 整级丢弃 (判据不放宽)
+        {
+            Synth sy; sy.seg_ms = 258; sy.A[0] = sy.A[1] = 3000.0f;
+            sy.dir_scale[0][0] = 0.0f;
+            auto win = synth_play(sy, base, hist); base += 40000.0;
+            PadCalibResult r = pad_calib_fit(hist, win, SYN_SHIFT_MAX);
+            CHECK(!r.lv[0][0].valid && r.lv[0][0].note[0] == 0
+                  && std::string(r.lv[0][0].why).find("位移") != std::string::npos,
+                  "单方向夹紧 → 整级丢弃且不标注 (夹紧不是换个方向能回答的)");
+            CHECK(r.nlv[0] == 0 && r.nlv[1] == 5,
+                  "该轴全级丢弃 (该方向的注入被夹住 = 该轴不可标定), 另一轴不受扰");
+            CHECK(near(r.gain[1], 3000.0f, 0.03f), "另一轴仍复原 A (逐轴独立)");
+        }
+        // (d) 轻度死区 (低挡位显著低于过最高挡位的直线) → 死区诊断命中 (仅日志)
+        {
+            Synth sy; sy.seg_ms = 258; sy.A[0] = sy.A[1] = 3000.0f;
+            sy.scale[0][0] = 0.15f;
+            auto win = synth_play(sy, base, hist); base += 40000.0;
+            PadCalibResult r = pad_calib_fit(hist, win, SYN_SHIFT_MAX);
+            PadCalDeadzone z = pad_cal_deadzone(r, 0);
+            std::cout << "      (死区诊断: hit=" << z.hit << " 低挡 " << z.v_lo
+                      << "px/s vs 直线 " << z.v_line << "px/s)\n";
+            CHECK(z.hit && z.lo_li == 0 && z.v_lo < z.v_line, "低挡位低于直线外推 → 诊断命中");
+            CHECK(!pad_cal_deadzone(r, 1).hit, "另一轴正常 → 不命中 (逐轴独立)");
+        }
+        own_motion_ledger_set(false);
+    }
+
+    std::cout << "[19] 回执码与整轮重跑判定 (合成结果, 快速)\n";
+    {
+        PadCalibResult r{};
+        r.ok = true; r.gain[0] = 3000.0f; r.gain[1] = 1200.0f;
+        CHECK(pad_cal_done_code(r) == 1, "成功且落带内 → 回执 1");
+        r.gain[1] = PAD_GAIN_MAX + 1.0f;
+        CHECK(pad_cal_done_code(r) == 2, "带外 → 回执 2 (失败, 不回写)");
+        r.ok = false; r.gain[1] = 1200.0f; r.nlv[0] = 1; r.nlv[1] = 5;
+        for (int a = 0; a < PAD_CAL_AXES_N; ++a)
+            for (int l = 0; l < PAD_CAL_LEVELS_N; ++l) {
+                r.lv[a][l].valid = true; r.lv[a][l].why_samples = false; }
+        r.lv[0][0].valid = false; r.lv[0][0].why_samples = true;
+        CHECK(pad_cal_done_code(r) == 3, "仅因中段样本不足且某轴 <2 级 → 回执 3 (建议整轮重跑)");
+        r.lv[0][1].valid = false; r.lv[0][1].why_samples = true;   // 仍 <2 级, 原因同为样本数
+        CHECK(pad_cal_done_code(r) == 3, "多级样本不足仍 → 回执 3");
+        r.lv[0][2].valid = false; r.lv[0][2].why_samples = false;  // 混入可信度原因
+        CHECK(pad_cal_done_code(r) == 2, "丢级原因不纯 (含量程/一致性) → 回执 2, 不重跑");
+        PadCalibResult e{}; e.err = "静止参考样本不足";
+        CHECK(pad_cal_done_code(e) == 2, "整体不可测 → 回执 2 (重跑救不了)");
+    }
+
+    std::cout << "[20] hid 十字+停顿: 行程居中与 lag 量化下的 s 偏差\n";
+    {
+        // (a) 行程对称于起点 (由激励表直接积分: 每段位移 = dx·ticks)
+        auto traj = [](const CalibSeg* segs, int n, int loops, long out[6]) {
+            long x = 0, y = 0, mxx = 0, mnx = 0, mxy = 0, mny = 0;
+            for (int l = 0; l < loops; ++l)
+                for (int i = 0; i < n; ++i) {
+                    x += (long)segs[i].dx * segs[i].ticks;
+                    y += (long)segs[i].dy * segs[i].ticks;
+                    mxx = std::max(mxx, x); mnx = std::min(mnx, x);
+                    mxy = std::max(mxy, y); mny = std::min(mny, y);
+                }
+            out[0]=mxx; out[1]=mnx; out[2]=mxy; out[3]=mny; out[4]=x; out[5]=y;
+        };
+        const int ne = (int)(sizeof(CAL_EXCITE_SEQ) / sizeof(CalibSeg));
+        const int ns = (int)(sizeof(CAL_START_SEQ) / sizeof(CalibSeg));
+        long a[6], b[6];
+        traj(CAL_EXCITE_SEQ, ne, 1, a);
+        traj(CAL_START_SEQ, ns, 1, b);
+        CHECK(a[0] == 500 && a[1] == -500 && a[2] == 500 && a[3] == -500,
+              "激励单圈: 最大偏移 ±500 counts **对称于起点** (老方波是 0..+500 单侧)");
+        CHECK(a[4] == 0 && a[5] == 0, "每圈回到起点 (画面内容相似 → 块相关更稳)");
+        CHECK(b[0] == 480 && b[1] == -480 && b[2] == 480 && b[3] == -480
+              && b[4] == 0 && b[5] == 0, "起始十字: ±480 counts 同样对称于起点");
+        int edges = 0, cx = 0, cy = 0;
+        for (int i = 0; i < ne; ++i) {
+            const CalibSeg& sg = CAL_EXCITE_SEQ[i];
+            if (sg.dx != cx || sg.dy != cy) ++edges;
+            cx = sg.dx; cy = sg.dy;
+        }
+        CHECK(edges == 16, "激励单圈 16 个指令边沿 (方波 4 个) → lag 对齐的辨识更强");
+        CHECK(ne == 16 && CAL_EXCITE_SEQ[1].dx == 0 && CAL_EXCITE_SEQ[1].dy == 0
+              && CAL_EXCITE_SEQ[1].ticks * (double)TICK_MS == 150.0,
+              "腿间零指令停顿 150ms (与 pad 的 P 同源: L 上界 100ms + 余量)");
+
+        // (b) 非整数 L: 新网格 (细步 = TICK_MS = 1ms) 复原在 ±1ms 内
+        own_motion_ledger_set(false);
+        const std::vector<CalibSeg> cross(CAL_EXCITE_SEQ, CAL_EXCITE_SEQ + ne);
+        const std::vector<CalibSeg> square = {{2,0,ms_to_ticks(250)},{0,2,ms_to_ticks(250)},
+                                              {-2,0,ms_to_ticks(250)},{0,-2,ms_to_ticks(250)}};
+        std::deque<CalibSample> h1;
+        HidSyn hs; hs.s_true = 1.0f; hs.L_true = 47.3; hs.noise = 0.1f; hs.fps = 120;
+        hid_synth(cross, 5, hs, 1000000.0, h1);
+        float s1 = 1.0f, l1 = 47.3f;
+        CHECK(run_calibration(h1, s1, l1, CALIB_BAND_COUNTS), "hid 合成链路: 拟合成功");
+        std::cout << "      (非整数 L=47.3ms → 复原 L=" << l1 << "ms s=" << s1
+                  << " (真 1.0); 旧网格半步 1.0ms / 新网格半步 0.5ms)\n";
+        CHECK(std::fabs(l1 - 47.3f) <= 1.0f, "lag 网格 (细步 = TICK_MS) 复原在 ±1ms 内");
+        CHECK(near(s1, 1.0f, 0.03f), "s 复原在 3% 内 (非整数 L 的残余失配下)");
+
+        // (c) 停顿的量化理由: 把真 L 放在网格最坏相位 (锚点整数 + 0.5ms), 比较两条轨迹
+        //     的 s 偏差。100fps 采样 → 粗步 10ms (整数) → 可达 lag 集为 1ms 栅格,
+        //     真 L = 锚点 + 0.5 时拟合只能落在 ±0.5ms → 残差固定且可比。
+        auto run_traj = [&](const std::vector<CalibSeg>& segs, int loops, double base,
+                            double& s_hat, double& l_hat) {
+            HidSyn h2; h2.s_true = 1.0f; h2.L_true = 47.5; h2.noise = 0.1f;
+            h2.fps = 100; h2.seed = 31;
+            std::deque<CalibSample> hh;
+            hid_synth(segs, loops, h2, base, hh);
+            float sa = 1.0f, la = 47.0f;                 // 锚点 47.0 → 真值在半点上
+            run_calibration(hh, sa, la, CALIB_BAND_COUNTS);
+            s_hat = sa; l_hat = la;
+        };
+        double sc = 0, lc = 0, sq = 0, lq = 0;
+        run_traj(cross, 5, 2000000.0, sc, lc);
+        run_traj(square, 5, 3000000.0, sq, lq);
+        std::cout << "      (lag 半数失配: 十字+停顿 s=" << sc << " (偏差 "
+                  << 100.0 * (sc - 1.0) << "%) L=" << lc << "ms | 无停顿方波 s=" << sq
+                  << " (偏差 " << 100.0 * (sq - 1.0) << "%) L=" << lq << "ms)\n";
+        CHECK(std::fabs(sc - 1.0) <= std::fabs(sq - 1.0) + 1e-3,
+              "同一 lag 量化失配下, 有停顿的十字 s 偏差不大于无停顿方波");
+
+        // (d) 停顿段静止 → 噪声底 (与注入噪声同量级; 只进日志诊断)
+        {
+            std::vector<float> nz;
+            double t = 1000000.0;
+            std::vector<double> pause_mid;
+            for (int l = 0; l < 5; ++l)
+                for (int i = 0; i < ne; ++i) {
+                    const double dur = CAL_EXCITE_SEQ[i].ticks * (double)TICK_MS;
+                    if (CAL_EXCITE_SEQ[i].dx == 0 && CAL_EXCITE_SEQ[i].dy == 0)
+                        pause_mid.push_back(t + dur * 0.5);
+                    t += dur;
+                }
+            for (const CalibSample& smp : h1)
+                for (size_t k = 0; k < pause_mid.size(); ++k)
+                    if (std::fabs(elapsed_ms(smp.t, at_ms(pause_mid[k]))) <= 40.0) {
+                        nz.push_back(smp.sx); nz.push_back(smp.sy); break; }
+            std::sort(nz.begin(), nz.end());
+            const float sigma = nz.empty() ? 0.0f
+                              : 1.4826f * std::fabs(nz[nz.size() / 2]);
+            std::cout << "      (停顿样本估噪声底 σ=" << sigma << "px (注入 0.1px), n="
+                      << nz.size() << ")\n";
+            CHECK(nz.size() > 50 && sigma < 0.5f,
+                  "停顿段静止 → 可估噪声底且与注入噪声同量级 (诊断用, 不改验收判据)");
+        }
+        own_motion_ledger_set(false);
     }
 
     std::cout << (g_fail ? "FAILED\n" : "ALL PASS\n");
