@@ -7,7 +7,7 @@ AI visual aimbot (mouse pass-through). Target hardware: **NVIDIA Jetson Orin** (
 ```
 Capture card (UVC 1080p NV12) → GStreamer nvvidconv → CUDA preprocess → TensorRT YOLO
 → alpha-beta tracking → control law (pole-placement PI + type-2 velocity feedforward)
-→ merged with the real mouse → USB Gadget (/dev/hidg0, generic HID mouse) → game
+→ merged with the real mouse → USB raw_gadget userspace device stack (generic HID mouse) → game
 ```
 
 No hand-tuned gains: a bilateral side-key trigger runs auto-calibration, estimating sensitivity s (px/count) and loop delay L (ms) online. Adapts to PC / PS5 / 60fps / 120fps.
@@ -97,6 +97,7 @@ never reported as verified from here.
 - **All scripts resolve paths from their own location** (`realpath "$0"`, walking up to `ROOT`), independent of the calling cwd. **The whole directory can be moved/renamed freely** without breaking anything — no hardcoded deployment paths; only system paths like `/usr`, `/dev`, `/sys` are absolute.
 - `dataset/` is always at the **project root** (`$ROOT/dataset`, a sibling of `engine/` and `scripts/`); it never ends up inside `bin/` just because the binary lives there — `-o` receives an absolute path computed from the script location.
 - This machine has no TRT/GStreamer and **cannot compile or verify**. After edits, hand off to the user to run `scripts/compile.sh` on the Jetson; never claim anything was verified here.
+- The USB output channel depends on the kernel **`raw_gadget` module** (mainline `drivers/usb/gadget/legacy/raw_gadget.c`, v6.8.12-era path) — an external dependency the deployment machine must provide itself: from the distro package when available, otherwise built out-of-tree per the kernel doc `Documentation/usb/raw_gadget.rst`. `scripts/setup_mouse.sh` only loads the module and frees the UDC; the device stack itself lives in `src/io/usbraw.cu` and talks to `/dev/raw-gadget` directly.
 
 ## Files
 
@@ -110,11 +111,12 @@ never reported as verified from here.
 | `src/core/trt.cu/.h` | TensorRT Logger / `CHECK_CUDA` / BGR→RGB CHW preprocess kernels (kernel and its launch wrapper share one TU — no `-rdc`) / output-tensor parsing + NMS |
 | `src/core/state.cu/.h` | shared globals: system constants, TargetState/CountsHistory/MouseState, hot-param & calibration atomics, time helpers, async save queue, signal |
 | `src/io/capture.cu/.h` | GStreamer pipeline + `ai_thread` (capture → inference → publish; three-source collection and preview) |
-| `src/io/hid_mouse.cu/.h` | evdev mouse read (EVIOCGRAB) + `/dev/hidg0` HID report write (control counts merged via the overlay callback) |
+| `src/io/hid_mouse.cu/.h` | evdev mouse read (EVIOCGRAB) + the USB mouse device definition (device/config/report descriptors — the report descriptor's source of truth) + per-tick 9-byte HID report assembly submitted into the raw_gadget session's latest-report slot (control counts merged via the overlay callback) |
+| `src/io/usbraw.cu/.h` | raw_gadget 会话承载: sysfs UDC 两级名字发现 → INIT/RUN/VBUS_DRAW;ep0 标准请求表(描述符按 wLength 截断 / 状态 / 配置 / 接口 / feature;OUT 或零长 SETUP 经 EP0_READ 收尾),设备特有(类/vendor)请求仅经可选钩子应答、不设即 STALL;单发送线程把"最新报告槽"灌入中断 IN 端点,报告率 = min(拍率 1000Hz, 主机服务率 8kHz)。ep0 标准部分与具体 HID 报告无关 — 第二个设备(手柄)各自提供描述符与钩子 |
 | `src/io/hotctl.cu/.h` | UDP hot-parameter channel 127.0.0.1:47700 |
 | `scripts/compile.sh` | nvcc build of aimbot → `bin/` + `build/calib_test` unit test (run on the Jetson) |
 | `scripts/convert.sh` | Batch ONNX → TensorRT engine conversion |
-| `scripts/setup_mouse.sh` | USB Gadget config, creates `/dev/hidg0` |
+| `scripts/setup_mouse.sh` | raw_gadget 模块加载 + UDC 独占腾空(解绑 configfs 遗留 gadget)+ `/dev/raw-gadget` 权限 |
 | `scripts/game/template.sh.example` | Per-game launcher template — copy to `<game>.sh` (`.example` keeps the webui from listing it as a launchable profile). Relative paths; mouse-takeover switch `AIM_ENABLED` and screenshot-collection switches (`CAPTURE` master + per-source `CAP_FIRE`/`CAP_DET`/`CAP_AUTO`); auto write-back of calibration values `S_EST`/`L_EST`; the `MAX_SPEED` rule and its derivation live in the file |
 | `arena/` | Pure-Python control-law simulation evaluator (neutral simulator + 10 laws + standard + FPS test suites); see dedicated section |
 

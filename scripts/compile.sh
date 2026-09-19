@@ -3,7 +3,7 @@
 #  编译脚本 — 在 Jetson 上执行, 产物输出到 <根目录>/bin/
 #  路径相对脚本自身解析, 与部署位置无关。
 #  模块结构: main (入口) + core/ (控制律/估计器/标定/TRT 辅助/共享状态)
-#            + io/ (采集/HID 鼠标/热参); 逐个编译到 build/ 再链接。
+#            + io/ (采集/USB 鼠标/raw_gadget 会话/热参); 逐个编译到 build/ 再链接。
 # ==============================================================================
 set -e
 ROOT="$(cd "$(dirname "$(realpath "$0")")/.." && pwd)"
@@ -21,7 +21,7 @@ TRT="-lnvinfer -lnvinfer_plugin -lcudart -Xcompiler -pthread"
 
 MODULES="main \
          core/control core/estimator core/calib core/trt core/state \
-         io/capture io/hid_mouse io/hotctl"
+         io/capture io/hid_mouse io/usbraw io/hotctl"
 
 OBJS=""
 for m in $MODULES; do

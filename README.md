@@ -1,13 +1,13 @@
 # Jetson-aimbot
 
-AI visual aimbot (mouse pass-through) running on an NVIDIA Jetson Orin. The Jetson receives the game picture through a capture card, detects targets with TensorRT YOLO, and computes mouse corrections with a delay-aware control law. Commands are merged with the real mouse and emitted through a USB gadget (the device identifies as a generic USB mouse), so it behaves like an ordinary mouse.
+AI visual aimbot (mouse pass-through) running on an NVIDIA Jetson Orin. The Jetson receives the game picture through a capture card, detects targets with TensorRT YOLO, and computes mouse corrections with a delay-aware control law. Commands are merged with the real mouse and emitted through a user-space USB device stack (USB raw_gadget; the device identifies as a generic USB mouse), so it behaves like an ordinary mouse.
 
 ## Pipeline
 
 ```
 Capture card (UVC 1080p NV12) → GStreamer nvvidconv → CUDA preprocess → TensorRT YOLO
 → alpha-beta tracking → control law (pole-placement PI + type-2 velocity feedforward)
-→ merged with the real mouse → USB Gadget (/dev/hidg0) → game
+→ merged with the real mouse → USB raw_gadget device stack → game
 ```
 
 ## No hand-tuned gains
@@ -22,7 +22,8 @@ The single binary `bin/aimbot` runs **ff_pi**: pole-placement PI + type-2 veloci
 
 ```
 src/       CUDA/C++ source (aimbot.cu — the ff_pi law)
-scripts/   compile.sh / convert.sh (ONNX→engine) / setup_mouse.sh (USB gadget) / game/template.sh.example
+scripts/   compile.sh / convert.sh (ONNX→engine) / setup_mouse.sh (raw_gadget mouse channel)
+           / game/template.sh.example
 arena/     pure-Python control-law simulator + benchmark suite
 engine/    TensorRT engines (not committed)
 onnx/      ONNX models (not committed)
@@ -33,13 +34,13 @@ onnx/      ONNX models (not committed)
 ```bash
 scripts/compile.sh            # → bin/
 scripts/convert.sh            # onnx/*.onnx → engine/*.engine (TensorRT 10)
-scripts/setup_mouse.sh        # create the /dev/hidg0 USB gadget mouse
+scripts/setup_mouse.sh        # load raw_gadget, free the UDC, /dev/raw-gadget permissions
 cp scripts/game/template.sh.example scripts/game/<game>.sh   # one launcher per game
 chmod +x scripts/game/<game>.sh
 scripts/game/<game>.sh        # calibrate once; S_EST/L_EST are written back into it
 ```
 
-Requires JetPack with TensorRT 10, CUDA, OpenCV 4, GStreamer, and a UVC capture card supporting 1080p NV12 @ 120 Hz.
+Requires JetPack with TensorRT 10, CUDA, OpenCV 4, GStreamer, and a UVC capture card supporting 1080p NV12 @ 120 Hz. The USB output needs the kernel **`raw_gadget` module** — an external dependency to provide on the deployment machine (distro package, or built out-of-tree per the kernel doc `Documentation/usb/raw_gadget.rst`).
 
 ## arena (control-law development)
 

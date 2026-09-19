@@ -3,7 +3,7 @@
 //
 //  链路: 采集卡 (UVC 1080p NV12, -d 按名字选择) → GStreamer nvvidconv
 //        → CUDA 预处理 → TensorRT YOLO 检测 → alpha-beta 目标跟踪
-//        → 控制律 (极点配置 PI + type-2 速度前馈) → USB Gadget 透传
+//        → 控制律 (极点配置 PI + type-2 速度前馈) → USB raw_gadget 鼠标透传
 //
 //  控制律: 收敛带宽 wn 由标定延迟 L 自动导出 (wn=(90°−PM)π/180/L, PM=50°, 免手调),
 //    ζ=1 临界阻尼; type-2 速度前馈 (FF_GAIN_VAL=1) 补匀速跟踪零拖尾; 创新均值反演 â
@@ -26,7 +26,8 @@
 //
 //  本文件为程序入口: 参数解析, 设备打开, 线程孵化与 timerfd 控制主循环
 //    (拍率 = DEFAULT_FREQ, 见 core/state.h);
-//    模块划分 — core/ (控制律/估计器/标定/TRT 辅助/共享状态), io/ (采集/HID 鼠标/热参)。
+//    模块划分 — core/ (控制律/估计器/标定/TRT 辅助/共享状态), io/ (采集/USB
+//    鼠标/raw_gadget 会话/热参)。
 // ============================================================================
 
 #include <algorithm>
@@ -40,7 +41,6 @@
 #include <string>
 #include <thread>
 
-#include <fcntl.h>
 #include <signal.h>
 #include <sys/epoll.h>
 #include <sys/timerfd.h>
@@ -52,6 +52,7 @@
 #include "io/capture.h"
 #include "io/hid_mouse.h"
 #include "io/hotctl.h"
+#include "io/usbraw.h"
 
 // ========================= 命令行交互 =========================
 static std::string get_input_with_default(const std::string& prompt, const std::string& def) {
@@ -159,7 +160,7 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // 热参数原子初始化 = CLI 值 (未收热参时运行行为与旧版完全一致)
+    // 热参数原子初始化 = CLI 值 (不接热参即纯 CLI 语义)
     g_conf_thr.store(conf); g_y_off_pct.store(y_off); g_max_v.store(max_v);
     g_aim_mode.store(aim_mode); g_fov_radius.store(fov_r);
     g_aim_enabled.store(aim_on);
@@ -175,11 +176,9 @@ int main(int argc, char* argv[]) {
         std::cerr<<"❌ 采集卡设备不存在: "<<cam_dev<<"\n"; return 1; }
     std::cout<<"✅ 采集卡: "<<cam_dev<<"\n";
 
-    std::string real_dev=find_mouse_device(DEFAULT_KEYWORD);
-    if (real_dev.empty()) { std::cerr<<"❌ 未找到鼠标\n"; return 1; }
-    std::cout<<"✅ 鼠标: "<<real_dev<<"\n";
-    int virt_fd=open(DEFAULT_VIRT_DEV,O_WRONLY);
-    if (virt_fd<0) { std::cerr<<"❌ 无法打开 "<<DEFAULT_VIRT_DEV<<"\n"; return 1; }
+    MouseState state;
+    UsbRawSession usb_session;
+    if (!hid_mouse_start(state,usb_session)) return 1;   // 可行动原因已打印 (设备/模块/UDC 占用)
 
     signal(SIGINT,signal_handler); signal(SIGTERM,signal_handler);
     { std::lock_guard<std::mutex> lk(g_target.mtx);
@@ -196,8 +195,6 @@ int main(int argc, char* argv[]) {
     } else
         std::cout<<"采集: 关闭 (未传 -o)\n";
 
-    MouseState state;
-    std::thread reader(reader_thread,real_dev,std::ref(state));
     std::thread writer; if (do_collect) writer=std::thread(writer_thread,jpeg_q);
     std::thread hot(hotctl_thread);
     std::thread ai(ai_thread,model_path,cls,cam_dev,cam_fps,preview,
@@ -220,16 +217,17 @@ int main(int argc, char* argv[]) {
         uint64_t exp; read(tfd,&exp,sizeof(exp));
         int16_t x,y;int8_t w,hw;uint16_t b;
         extract_and_clear(state,x,y,w,hw,b);
-        send_report(virt_fd,x,y,w,hw,b,[cam_fps](std::array<uint8_t,HID_REPORT_LEN>& rpt,
-                                                 int16_t rx, int16_t ry) {
+        hid_report_submit(usb_session,x,y,w,hw,b,[cam_fps](std::array<uint8_t,HID_REPORT_LEN>& rpt,
+                                                           int16_t rx, int16_t ry) {
             control_apply(cam_fps,rpt.data(),rx,ry); });
     }
 
     global_running=false;
     g_save_cv.notify_all();
-    reader.join(); hot.join(); ai.join();
+    hid_mouse_stop(usb_session);
+    hot.join(); ai.join();
     if (do_collect) writer.join();
-    close(virt_fd);close(tfd);close(ep);
+    close(tfd);close(ep);
     std::cout<<"已停止\n";
     return 0;
 }

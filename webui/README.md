@@ -56,15 +56,15 @@ sudo python3 -m pip install --no-index --find-links wheels/ -r requirements.txt
 
 ## 权限模型（为什么服务以 root 跑）
 
-现有流程里，`jetson_clocks`、USB gadget 配置（写 `/sys/kernel/config/usb_gadget`）、
-`/dev/hidg0`、采集卡节点全部在 `sudo` 之下 —— 手动 SSH 跑 game 脚本就是 root 环境。
+现有流程里，`jetson_clocks`、USB gadget 配置（`setup_mouse.sh` 解绑遗留 gadget、
+载入 raw_gadget）、`/dev/raw-gadget`、采集卡节点全部在 `sudo` 之下 —— 手动 SSH 跑 game 脚本就是 root 环境。
 WebUI 要 1:1 复刻该环境，只有两条路：
 
 1. **服务直接以 root 跑（采用）**：零 sudoers 维护；部署目录改名/移动后不需要任何额外配置；
    行为与手动跑完全一致。
 2. 替代方案（更小权限面）：服务跑普通用户，sudoers 里只放行三条固定路径 ——
    `<部署根>/scripts/setup_mouse.sh`、`jetson_clocks`、`<部署根>/bin/aimbot`（NOPASSWD）。
-   代价：换部署根要同步改 sudoers；aimbot 直接 exec 时若 `/dev/hidg0` 权限不足仍会失败
+   代价：换部署根要同步改 sudoers；aimbot 直接 exec 时若 `/dev/raw-gadget` 权限不足仍会失败
    （setup_mouse.sh 每次 launch 都会 `chmod 666`，通常没问题）。
 
 暴露面 = 局域网 + 密码门槛（token 兜底）。不需要暴露时，在设置页把监听改成 `127.0.0.1`。

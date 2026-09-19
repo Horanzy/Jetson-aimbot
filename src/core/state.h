@@ -26,7 +26,6 @@
 constexpr size_t HID_REPORT_LEN  = 9;
 constexpr int    DEFAULT_FREQ    = 1000;             // 控制拍频率 Hz (透传与控制律同一节拍)
 constexpr const char* DEFAULT_KEYWORD  = "";         // 空 = 匹配任意 *-event-mouse 设备
-constexpr const char* DEFAULT_VIRT_DEV = "/dev/hidg0";
 constexpr const char* DEV_SEARCH_PATH  = "/dev/input/by-id/";
 
 const float FOV_RADIUS   = 150.0f;                   // FOV 半径默认值 (px): 目标筛选圈兼积分器边界; 经 -r 或热参 fov 覆盖 (运行时 g_fov_radius)
