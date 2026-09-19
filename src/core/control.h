@@ -57,6 +57,7 @@ void control_apply(int cam_fps, uint8_t* rpt, int16_t real_x, int16_t real_y);
 // pad 模式的律入口 (与 control_apply 同一 law_tick, 律数学逐句一致): btns 为
 //   触发键位字 (fire→LEFT_KEY, ads→RIGHT_KEY, 由 pad 侧 RT/LT 门控生成 — 侧键
 //   抑制与双侧键标定是 hid 键位语义, pad 键位字恒无那些位, 分支自然惰性)。
-//   输出期望速度 (px/ms) 与注入门 (接管开 × 触发保持窗内); 速度帽取
-//   min(热参 x, 满偏转屏速)。量化/报文/counts 尾巴是 hid 专属, pad 路径不含。
+//   输出期望速度 (px/ms) 与注入门 (接管开 × 触发保持窗内); 速度帽逐轴取
+//   min(热参 x, 该轴满偏转屏速) — 注入打到该轴满偏即该轴行程上限 (hid 两轴同为
+//   热参 x, 算式与单帽逐位相同)。量化/报文/counts 尾巴是 hid 专属, pad 路径不含。
 bool control_apply_pad(int cam_fps, uint16_t btns, float& out_vx, float& out_vy);

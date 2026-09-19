@@ -114,11 +114,13 @@ const PARAM_DEFS = [
     info: "在 Jetson 接屏幕/桌面会话时显示检测画面 (框选 + 瞄准点)。没有接屏时开启会导致启动报错 —— 日志会如实显示, 改回关闭再启动即可。❄ 冷参数, 下次启动生效。" },
   { group: "手柄输出 (pad)", key: "output_mode", label: "输出模式", type: "select", options: ["hid", "pad"], hot: false,
     labels: { hid: "hid — USB 鼠标 (鼠标标定)", pad: "pad — XInput 手柄 (手柄标定)" },
-    info: "输出通道二选一: 两模式互斥且各自独占 USB 设备控制器, 切换必须重启进程。hid: 真实鼠标 1:1 透传 + 注入鼠标位移, 标定量 s (px/count) 与 L_EST 由鼠标双侧键长按 5 秒标定。pad: 物理 Xbox 布局手柄 1:1 透传 + 注入右摇杆, 标定量 PAD_STICK_GAIN (满偏转屏速 px/s) 与 L_EST_PAD 由 L3+R3 长按 5 秒或顶部「开始标定」按钮标定。两套标定值互不覆盖。❄ 冷参数, 下次启动生效。" },
+    info: "输出通道二选一: 两模式互斥且各自独占 USB 设备控制器, 切换必须重启进程。hid: 真实鼠标 1:1 透传 + 注入鼠标位移, 标定量 s (px/count) 与 L_EST 由鼠标双侧键长按 5 秒标定。pad: 物理 Xbox 布局手柄 1:1 透传 + 注入右摇杆, 标定量 PAD_STICK_GAIN_X/_Y (逐轴满偏转屏速 px/s) 与 L_EST_PAD 由 L3+R3 长按 5 秒或顶部「开始标定」按钮标定。两套标定值互不覆盖。❄ 冷参数, 下次启动生效。" },
   { group: "手柄输出 (pad)", key: "pad_keyword", label: "手柄匹配子串", type: "text", hot: false, showIf: { key: "output_mode", value: "pad" },
     info: "按 /dev/input/by-id 设备名 (大小写不敏感子串) 选择物理手柄; 留空 = 任意 *-event-joystick 节点 (uinput 虚拟手柄与蓝牙手柄无 by-id 节点, 走设备名 + 摇杆能力回落匹配)。多个设备同时命中会启动失败并列出候选, 用子串收窄即可。❄ 冷参数, 下次启动生效。" },
-  { group: "手柄输出 (pad)", key: "pad_stick_gain", label: "满偏转屏速 (标定回写)", type: "calib", unit: "px/s", hot: false, showIf: { key: "output_mode", value: "pad" },
-    info: "右摇杆满偏 (±32767) 对应的准星屏速; 注入换算 v·1000/gain 与 pad 速度帽 min(-x, gain) 都由它给出。标定 (L3+R3 / 「开始标定」) 成功后由固件自动回写脚本的 PAD_STICK_GAIN, 本页只读显示 —— 与 S_EST/L_EST 同类, WebUI 不写。未标定时固件用设计缺省 3000 px/s。" },
+  { group: "手柄输出 (pad)", key: "pad_stick_gain_x", label: "水平轴满偏转屏速 (标定回写)", type: "calib", unit: "px/s", hot: false, showIf: { key: "output_mode", value: "pad" },
+    info: "右摇杆水平满偏 (±32767) 对应的准星屏速 (X 轴)。注入换算 v·1000/gain_x 与 pad 速度帽 min(-x, gain_x) 都由它给出。标定 (L3+R3 / 「开始标定」) 成功后由固件自动回写脚本的 PAD_STICK_GAIN_X, 本页只读显示 —— 与 S_EST/L_EST 同类, WebUI 不写。未标定时固件用设计缺省 3000 px/s。" },
+  { group: "手柄输出 (pad)", key: "pad_stick_gain_y", label: "垂直轴满偏转屏速 (标定回写)", type: "calib", unit: "px/s", hot: false, showIf: { key: "output_mode", value: "pad" },
+    info: "右摇杆垂直满偏对应的准星屏速 (Y 轴) —— 垂直灵敏度常低于水平 (FPS 普遍), 故逐轴标定、逐轴存放, 否则 Y 轴系统性偏差。脚本 VAR: PAD_STICK_GAIN_Y。" },
   { group: "手柄输出 (pad)", key: "pad_l_est", label: "手柄回路延迟 (标定回写)", type: "calib", unit: "ms", hot: false, showIf: { key: "output_mode", value: "pad" },
     info: "pad 模式的环路延迟 L (注入 → 屏幕 → 采集 → 检测), 与鼠标模式同一物理含义但独立测量、独立存放 (脚本 VAR: L_EST_PAD)。控制律带宽 wn 由它自动导出, 故它偏大只会变慢、偏小才危险 (欠补偿)。未标定时固件用命令行 -l 或默认 60ms。" },
   { group: "训练数据采集", key: "capture_enabled", label: "开启采集", type: "bool", hot: false, captureSwitch: true,
@@ -263,7 +265,8 @@ function runningPadMode() {
 // 标定回写量 (只读): 运行中有固件回执优先, 否则脚本值 — 两套 (hid/pad) 分别存放
 function calibOf() {
   const p = curProfile();
-  const c = Object.assign({ s: null, l: null, pad_gain: null, pad_l: null },
+  const c = Object.assign({ s: null, l: null, pad_gain_x: null, pad_gain_y: null,
+                            pad_l: null },
                           p && p.calib ? p.calib : {});
   const live = S.state && S.state.instance ? S.state.instance.calib_live : null;
   if (live) Object.assign(c, live);
@@ -345,7 +348,7 @@ function renderTopbar() {
   $("#btnCalib").disabled = !(inst.state === "running" && !inst.adopted
                               && inst.hot_capable && runningPadMode());
   $("#btnCalib").title = runningPadMode()
-    ? "手柄标定 (pad 模式运行中): 对准有细节的静止背景后点按 — 固件独占右摇杆播放满偏方波 (约 11 秒), 成功点头/失败摇头, 结果回写脚本的 PAD_STICK_GAIN/L_EST_PAD"
+    ? "手柄标定 (pad 模式运行中): 对准有细节的静止背景后点按 — 固件独占右摇杆播放小幅分级激励 (约 13 秒), 成功点头/失败摇头, 结果回写脚本的 PAD_STICK_GAIN_X/_Y 与 L_EST_PAD"
     : "手柄标定仅 pad 模式运行中可用 (hid 模式的鼠标标定是双侧键长按 5 秒, 无按钮)";
   $("#btnSave").classList.toggle("dirty", S.dirty);
   $("#btnSave2").classList.toggle("dirty", S.dirty);
@@ -393,11 +396,14 @@ function renderRunTab() {
   const tel = S.state.telemetry, p = curProfile();
   const model = S.params && S.params.model ? String(S.params.model).split("/").pop() : "（未选）";
   const padMode = isPadMode(S.params);
-  // 标定卡随输出模式: hid = s(px/count)·L(ms), pad = 满偏转屏速(px/s)·L_EST_PAD(ms)
+  // 标定卡随输出模式: hid = s(px/count)·L(ms), pad = 逐轴满偏转屏速(px/s)·L_EST_PAD(ms)
   const cv = calibOf();
   const calibCard = padMode
-    ? { k: "标定 摇杆增益 · L", v: cv.pad_gain != null ? cv.pad_gain + " · " + cv.pad_l : "—",
-        small: inst.calib_live && inst.calib_live.pad_gain != null ? "运行中回执" : "脚本值" }
+    ? { k: "标定 摇杆增益 X·Y · L",
+        v: cv.pad_gain_x != null
+           ? cv.pad_gain_x + " · " + (cv.pad_gain_y != null ? cv.pad_gain_y : "—") + " · " + cv.pad_l
+           : "—",
+        small: inst.calib_live && inst.calib_live.pad_gain_x != null ? "运行中回执" : "脚本值" }
     : { k: "标定 s · L", v: cv.s != null ? (cv.s + " · " + cv.l) : "—",
         small: inst.calib_live && inst.calib_live.s != null ? "运行中回执" : "脚本值" };
   const soc = tel && tel.soc_temp != null ? tel.soc_temp : null;
@@ -563,7 +569,9 @@ function paramRow(d) {
           (d.unit ? `<span class="p-unit">${d.unit}</span>` : "");
   } else if (d.type === "calib") {
     const c = calibOf();
-    const cv = fmtCalib(d.key === "pad_stick_gain" ? c.pad_gain : c.pad_l);
+    const cm = { pad_stick_gain_x: c.pad_gain_x, pad_stick_gain_y: c.pad_gain_y,
+                 pad_l_est: c.pad_l };
+    const cv = fmtCalib(cm[d.key]);
     ctl = cv == null
       ? `<span class="p-unit" title="尚未标定: 固件用命令行值或内置默认">未标定 (固件默认)</span>`
       : `<span class="p-unit"><b>${esc(cv)}</b> ${esc(d.unit || "")}</span>`;
@@ -689,17 +697,18 @@ async function stopInstance() {
   } catch (e) { toast("停止失败: " + e.message, "err"); }
 }
 
-// 手柄标定 (pad 模式): 经热参通道下发 padcalib=1 — 固件独占右摇杆播放满偏方波
-//   (画方 → 点头/摇头), 结果回写脚本 PAD_STICK_GAIN/L_EST_PAD。回执在日志 [标定] 行。
+// 手柄标定 (pad 模式): 经热参通道下发 padcalib=1 — 固件独占右摇杆播放小幅分级激励
+//   (逐级 10/25/50/70% + 段间停顿, 逐轴 → 点头/摇头), 结果回写脚本
+//   PAD_STICK_GAIN_X/_Y 与 L_EST_PAD。回执在日志 [标定] 行。
 async function requestPadCalib() {
   if (!confirm("开始手柄标定?\n\n① 先对准有细节的静止背景 (游戏内 = 站定不动, 画面里要有纹理; " +
                "按住的 L3+R3 会照常透传给游戏, 请挑不会误触的场合);\n" +
-               "② 点「确定」后请不要碰右摇杆, 固件会独占右摇杆播放满偏方波 (约 11 秒);\n" +
+               "② 点「确定」后请不要碰右摇杆, 固件会独占右摇杆播放小幅分级激励 (约 13 秒);\n" +
                "③ 成功 = 准星纵向点头两下, 失败 = 横向摇头 (画面没动/没有游戏时必然失败)。\n\n" +
                "继续?")) return;
   try {
     await api("/api/instance/padcalib", { method: "POST" });
-    toast("标定请求已下发 (padcalib=1); 回执看日志 [标定] 行, 成功后 PAD_STICK_GAIN/L_EST_PAD 自动回写脚本", "ok");
+    toast("标定请求已下发 (padcalib=1); 回执看日志 [标定] 行, 成功后 PAD_STICK_GAIN_X/_Y 与 L_EST_PAD 自动回写脚本", "ok");
     showTab("run");
   } catch (e) { toast("标定请求失败: " + e.message, "err"); }
 }

@@ -60,9 +60,10 @@ SCRIPT_VARS = {
 }
 
 # 标定回写量 (脚本 VAR → calib 键): 归固件写, WebUI 只读显示、从不写回 —
-#   hid 一套 (S_EST/L_EST), pad 一套 (PAD_STICK_GAIN px/s / L_EST_PAD ms),
-#   两套互不覆盖
-CALIB_VARS = {"S_EST": "s", "L_EST": "l", "PAD_STICK_GAIN": "pad_gain", "L_EST_PAD": "pad_l"}
+#   hid 一套 (S_EST/L_EST), pad 一套 (PAD_STICK_GAIN_X/_Y 各轴满偏转屏速 px/s /
+#   L_EST_PAD ms), 两套互不覆盖
+CALIB_VARS = {"S_EST": "s", "L_EST": "l", "PAD_STICK_GAIN_X": "pad_gain_x",
+              "PAD_STICK_GAIN_Y": "pad_gain_y", "L_EST_PAD": "pad_l"}
 
 
 def root_status(root: Path):

@@ -1,7 +1,9 @@
 // ============================================================================
 //  estimator.cu — estimator_step 的实现: 延迟补偿预测 → 清洗创新 → σ 自标定
 //    CUSUM/â 传感器更新 → 滤波位置/速度推进 → TargetState 发布 (无检测帧只
-//    发布 valid=false)。
+//    发布 valid=false)。自身运动补偿的账本来源与账本→像素比例由
+//    own_motion_ledger/own_motion_scale 随模式路由 (hid = g_counts + 标定 s;
+//    pad = 摇杆账本 + 逐轴满偏屏速换算), 消费端算式两模式同形。
 // ============================================================================
 
 #include "core/estimator.h"
@@ -11,7 +13,7 @@
 #include <mutex>
 
 #include "core/state.h"
-#include "io/pad_output.h"      // own_motion_ledger: 自身运动补偿账本来源随模式 (hid=g_counts / pad=摇杆账本)
+#include "io/pad_output.h"      // own_motion_ledger/own_motion_scale: 账本来源与账本→像素比例随模式; s_est 仍为 hid 语义 (pad 的比例按轴取自运行期原子)
 
 // â = ȳ·β/T² (创新均值自洽反演加速度, 任何帧率下都精确); ȳ 不过白噪声显著性地板
 //   (ACC_SNR·σ_noise·√(ρ/(2−ρ)), σ_noise² = m₂−ȳ² 精确分解) → â = 0 (硬门限)
@@ -29,6 +31,10 @@ float estimator_step(EstimatorState& st, std::chrono::steady_clock::time_point n
     float dt=(float)elapsed_ms(now,st.t_prev); st.t_prev=now;
     dt=std::clamp(dt,1.0f,100.0f);
 
+    // 账本 → 像素 的每轴比例 (自身运动补偿的唯一换算来源): hid = 标定 s (两轴同值),
+    //   pad = 逐轴满偏屏速换算 — 两模式消费端算式同形
+    const LedgerPxScale sc=own_motion_scale(s_est);
+
     if (found) {
         if (!st.filt_init) { st.fx=best_dx;st.fy=best_dy;st.fvx=0;st.fvy=0;st.filt_init=true;
                               st.sig2x=st.sig2y=1;st.csx=st.csy=0;
@@ -38,7 +44,7 @@ float estimator_step(EstimatorState& st, std::chrono::steady_clock::time_point n
             auto c0=own_motion_ledger().at(shift_ms(now,-(double)Lc-dt));
             auto c1=own_motion_ledger().at(shift_ms(now,-(double)Lc));
             float cax=(float)(c1.first-c0.first), cay=(float)(c1.second-c0.second);
-            float px_pred=st.fx+st.fvx*dt-s_est*cax, py_pred=st.fy+st.fvy*dt-s_est*cay;
+            float px_pred=st.fx+st.fvx*dt-sc.x*cax, py_pred=st.fy+st.fvy*dt-sc.y*cay;
             float inx=best_dx-px_pred, iny=best_dy-py_pred;
             if (std::hypot(inx,iny)>TRACK_JUMP_GATE) { st.fx=best_dx;st.fy=best_dy;st.fvx=0;st.fvy=0;
                 st.csx=st.csy=0;
@@ -63,8 +69,8 @@ float estimator_step(EstimatorState& st, std::chrono::steady_clock::time_point n
                    //   真实目标创新; 失配残留 ∝ Δ·a_own, 瞬态成对, 由活动门吸收)
                    auto c0n=own_motion_ledger().at(shift_ms(now,-(double)l_est-dt));
                    auto c1n=own_motion_ledger().at(shift_ms(now,-(double)l_est));
-                   float inx_c=inx-s_est*((c1.first-c0.first)-(float)(c1n.first-c0n.first));
-                   float iny_c=iny-s_est*((c1.second-c0.second)-(float)(c1n.second-c0n.second));
+                   float inx_c=inx-sc.x*((c1.first-c0.first)-(float)(c1n.first-c0n.first));
+                   float iny_c=iny-sc.y*((c1.second-c0.second)-(float)(c1n.second-c0n.second));
                    float clx=std::clamp(inx_c,-ACC_SIG_CLIP_K*srx,ACC_SIG_CLIP_K*srx);
                    float cly=std::clamp(iny_c,-ACC_SIG_CLIP_K*sry,ACC_SIG_CLIP_K*sry);
                    st.sig2rx+=beta*(clx*clx-st.sig2rx);
@@ -77,10 +83,10 @@ float estimator_step(EstimatorState& st, std::chrono::steady_clock::time_point n
                    auto s2=own_motion_ledger().at(shift_ms(now,-(double)dt));
                    auto s3=own_motion_ledger().at(shift_ms(now,-(double)dt-(double)w_own));
                    float th_a=max_v/(ACC_OW_ACTIV_K*std::max(1.0f,l_est));
-                   float aown_x=(s_est*((float)(s0.first-s1.first)
-                                       -(float)(s2.first-s3.first))/w_own)/dt;
-                   float aown_y=(s_est*((float)(s0.second-s1.second)
-                                       -(float)(s2.second-s3.second))/w_own)/dt;
+                   float aown_x=(sc.x*((float)(s0.first-s1.first)
+                                      -(float)(s2.first-s3.first))/w_own)/dt;
+                   float aown_y=(sc.y*((float)(s0.second-s1.second)
+                                      -(float)(s2.second-s3.second))/w_own)/dt;
                    float tx=aown_x/th_a, ty=aown_y/th_a;
                    float gx_own=1.0f/(1.0f+tx*tx*tx*tx*tx*tx);
                    float gy_own=1.0f/(1.0f+ty*ty*ty*ty*ty*ty);

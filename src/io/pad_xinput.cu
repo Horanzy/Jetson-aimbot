@@ -19,9 +19,13 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
+#include <iostream>
+#include <string>
 #include <thread>
 
 #include <linux/usb/ch9.h>
+#include <unistd.h>                      // gethostname (序列号派生的最末数据源)
 
 #include "core/state.h"
 #include "io/pad_output.h"               // pad_publish_snapshot (发布点契约)
@@ -91,11 +95,49 @@ constexpr bool xinput_ep_blob_matches(size_t off, const usb_endpoint_descriptor&
 static_assert(xinput_ep_blob_matches(34, XINPUT_EP_IN), "配置节 IN 端点字节与 EP_ENABLE 描述符不一致");
 static_assert(xinput_ep_blob_matches(41, XINPUT_EP_OUT), "配置节 OUT 端点字节与 EP_ENABLE 描述符不一致");
 
-static const UsbRawStringDef XINPUT_STRINGS[] = {
-    { 1, "GENERIC" }, { 2, "XINPUT CONTROLLER" }, { 3, "1.0" },
-};
+// ---- 身份字符串 -------------------------------------------------------------
+// 序列号 (iSerialNumber) 按**本机身份派生**, 不用任何公开常量:
+//   主机侧的设备实例 ID 由它决定 (重复的序列号 = 同一个设备实例, 两个单元同时
+//   插入会撞实例; 且固定串等于把设备指纹写成公开字符串)。派生规则 (可复现):
+//     源 = /etc/machine-id, 缺失时退到 /var/lib/dbus/machine-id, 再退到 hostname;
+//     取 FNV-1a 64 位哈希 → 12 位大写十六进制。
+//   "派生"而非"随机": 重启/重插保持同一身份 (主机不会每次都当新设备), 且与
+//   其它任何单元都不同。三个源都读不到时用固定回退串并在 stderr 告警 (仅此时
+//   退化为"与同版固件相同"的旧行为)。
+// 厂商/产品串保持参考固件的取值: 改它们需要"正版手柄实际上报什么"的一手依据
+//   (抓包/描述符 dump), 目前只有二手转录, 故不动 (见 AGENTS.md 的 Pad output)。
+static std::string xinput_serial_from(const std::string& src) {
+    uint64_t h = 1469598103934665603ULL;                 // FNV-1a 64 偏移基
+    for (unsigned char c : src) { h ^= c; h *= 1099511628211ULL; }
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%012llX", (unsigned long long)(h & 0xFFFFFFFFFFFFULL));
+    return buf;
+}
+static std::string read_first_line(const char* path) {
+    std::ifstream f(path);
+    std::string s;
+    if (f.good() && std::getline(f, s) && !s.empty()) return s;
+    return {};
+}
+static const std::string& xinput_serial() {
+    static const std::string s = [] {
+        for (const char* p : { "/etc/machine-id", "/var/lib/dbus/machine-id" }) {
+            std::string m = read_first_line(p);
+            if (!m.empty()) return xinput_serial_from(m);
+        }
+        char host[256] = {0};
+        if (gethostname(host, sizeof(host) - 1) == 0 && host[0])
+            return xinput_serial_from(host);
+        std::cerr << "⚠ 无可用本机身份 (machine-id/hostname 皆不可读): 序列号退回固定串\n";
+        return std::string("000000000001");
+    }();
+    return s;
+}
 
 const UsbRawDeviceDef& pad_xinput_usb_def() {
+    static const UsbRawStringDef XINPUT_STRINGS[] = {
+        { 1, "GENERIC" }, { 2, "XINPUT CONTROLLER" }, { 3, xinput_serial().c_str() },
+    };
     static const UsbRawDeviceDef def = [] {
         UsbRawDeviceDef d{};
         memcpy(&d.device, XINPUT_DEVICE_DESC, sizeof(XINPUT_DEVICE_DESC));

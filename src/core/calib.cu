@@ -55,21 +55,23 @@ bool run_calibration(const std::deque<CalibSample>& hist, float& s_est, float& l
     l_est=std::clamp(l_est+dl2,L_MIN,L_MAX);
     return true;
 }
-bool persist_calibration(const std::string& path, const char* var_s, float s,
-                         const char* var_l, float l) {
+// 值的书写格式随 VAR (灵敏度/增益 %.4f — px/count 与 px/s 同精度口径; L %.1f ms):
+//   替换整行 ("VAR=值", 行内注释一并被回写值覆盖), 缺行追加到文件末尾。
+bool persist_calibration(const std::string& path, const CalibVar* vars, int n) {
     std::ifstream in(path); if (!in.good()) return false;
     std::vector<std::string> lines; std::string line;
     while (std::getline(in,line)) lines.push_back(line); in.close();
-    // 值的书写格式与 VAR 名无关: 灵敏度/增益 %.4f (px/count 与 px/s 同精度口径),
-    //   L %.1f (ms)
-    std::string sline=std::string(var_s)+"=", lline=std::string(var_l)+"=";
-    char sbuf[80],lbuf[80];
-    snprintf(sbuf,sizeof(sbuf),"%s=%.4f",var_s,(double)s);
-    snprintf(lbuf,sizeof(lbuf),"%s=%.1f",var_l,(double)l);
-    bool fs=false,fl=false;
-    for (auto& ln:lines) { if (ln.rfind(sline,0)==0){ln=sbuf;fs=true;}
-                           else if (ln.rfind(lline,0)==0){ln=lbuf;fl=true;} }
-    if (!fs) lines.push_back(sbuf); if (!fl) lines.push_back(lbuf);
+    std::vector<std::string> text(n); std::vector<bool> found(n,false);
+    for (int i=0;i<n;++i) { char buf[80];
+        snprintf(buf,sizeof(buf),"%s=%s",vars[i].name,vars[i].fmt);
+        // 格式串自带精度: 先把 VAR 名与格式拼成 "VAR=%.4f", 再用值 render 一次
+        char full[96]; snprintf(full,sizeof(full),"%s=",vars[i].name);
+        snprintf(buf,sizeof(buf),(std::string(full)+vars[i].fmt).c_str(),(double)vars[i].value);
+        text[i]=buf; }
+    for (auto& ln:lines)
+        for (int i=0;i<n;++i)
+            if (ln.rfind(std::string(vars[i].name)+"=",0)==0) { ln=text[i]; found[i]=true; }
+    for (int i=0;i<n;++i) if (!found[i]) lines.push_back(text[i]);
     struct stat st{}; bool have=(stat(path.c_str(),&st)==0);
     std::string tmp=path+".tmp";
     { std::ofstream o(tmp,std::ios::trunc); if (!o.good()) return false;

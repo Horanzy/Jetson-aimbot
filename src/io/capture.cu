@@ -1,9 +1,11 @@
 // ============================================================================
 //  capture.cu — ai_thread 的实现: 引擎反序列化与张量绑定, GStreamer 管道搭建
 //    (整幅预览 / 居中裁剪两种管道), 逐帧采集 → 预处理 → 推理 → 输出解析 →
-//    NMS → FOV 目标筛选 → estimator_step; 标定采样 (半分辨率 3×3 块相位
-//    相关) 与 g_calib_request 驱动的标定计算/回写 (hid: S_EST/L_EST, pad:
-//    PAD_STICK_GAIN/L_EST_PAD — 单位制与 VAR 名随输出模式), 三源截图入队与预览叠加。
+//    NMS → FOV 目标筛选 → estimator_step; 标定采样 (半分辨率 3×3 块相位相关 +
+//    逐帧响应/块间离散质量量) 与 g_calib_request 驱动的标定计算/回写
+//    (hid: run_calibration → S_EST/L_EST; pad: pad_calib_fit 分轴分级幂律外推 →
+//    PAD_STICK_GAIN_X/_Y/L_EST_PAD), 逐帧探针供 pad 状态机定段时长, 三源截图入队
+//    与预览叠加。
 // ============================================================================
 
 #include "io/capture.h"
@@ -112,12 +114,15 @@ void ai_thread(std::string model_path, int target_cls,
 
     EstimatorState est;
 
+    // hid: 标定灵敏度 s (px/count); pad: 逐轴满偏屏速标定后直接原子回写, 账本→
+    //   像素比例按轴取自运行期原子 (io/pad_output.h 的 own_motion_scale) — 本局部
+    //   量在 pad 模式只作 x 轴等价量承载 (两模式共用签名的结果)
     float s_est=init_s, l_est=init_l;
-    // 标定的灵敏度钳制带与回写 VAR 名随输出模式 (单位制不同, 机制同一); 账本
-    //   来源经 own_motion_ledger 路由, 与模式无关地走 run_calibration 同一段数学
-    const CalibBand calib_band = pad_mode ? CALIB_BAND_PAD : CALIB_BAND_COUNTS;
     std::deque<CalibSample> hist; bool was_collecting=false;
     int collect_frames=0;
+    // 采样窗深度 (帧): hid 的周期方波只需尾窗 (既有设计值); pad 的分级激励不周期,
+    //   样本必须覆盖整段计划 (窗深由 io/pad_calib.h 按计划最坏时长导出)
+    const int hist_max = pad_mode ? pad_cal_hist_frames(cam_fps) : CALIB_HIST_FRAMES;
     int bs_w=cap_w/6, bs_h=cap_h/6;
     cv::Mat hann; cv::createHanningWindow(hann,cv::Size(bs_w,bs_h),CV_32F);
     cv::Mat prev_gray_f;
@@ -140,8 +145,13 @@ void ai_thread(std::string model_path, int target_cls,
             if (++read_fails>30) { std::cerr<<"AI: 采集卡断开\n"; global_running=false; break; }
             std::this_thread::sleep_for(std::chrono::milliseconds(5)); continue; }
         read_fails=0;
+        float max_v=g_max_v.load();
+        // pad: 估计器的速度尺度取实际注入帽 min(-x, 逐轴满偏转屏速的最小者) —
+        //   自身活动门/â 限幅都以它为尺度 (hid 不变)
+        if (pad_mode) max_v=std::min(max_v,std::min(g_pad_stick_gain_x.load(),
+                                                   g_pad_stick_gain_y.load())/1000.0f);
         const float conf_thr=g_conf_thr.load(), y_off_pct=g_y_off_pct.load(),
-                    fov_r=g_fov_radius.load(), max_v=g_max_v.load();
+                    fov_r=g_fov_radius.load();
 
         ++fps_cnt;
         auto fps_now=std::chrono::steady_clock::now();
@@ -220,54 +230,119 @@ void ai_thread(std::string model_path, int target_cls,
             cv::resize(gray,small,cv::Size(cap_w/2,cap_h/2),0,0,cv::INTER_AREA);
             small.convertTo(sf,CV_32F);
             if (!prev_gray_f.empty()) {
-                float shx[9],shy[9];int nv=0;
+                float shx[9],shy[9],rsv[9];int nv=0;
                 for(int by=0;by<3;++by)for(int bx=0;bx<3;++bx){
                     cv::Rect r(bx*bs_w,by*bs_h,bs_w,bs_h); double resp=0;
                     cv::Point2d sh=cv::phaseCorrelate(prev_gray_f(r),sf(r),hann,&resp);
-                    if(resp>0.01){shx[nv]=(float)sh.x;shy[nv]=(float)sh.y;++nv;} }
+                    if(resp>CALIB_BLOCK_RESP){shx[nv]=(float)sh.x;shy[nv]=(float)sh.y;
+                                              rsv[nv]=(float)resp;++nv;} }
                 ++collect_frames;
-                if (nv>=4) { std::nth_element(shx,shx+nv/2,shx+nv);
-                             std::nth_element(shy,shy+nv/2,shy+nv);
-                             hist.push_back({now,dt,-2.0f*shx[nv/2],-2.0f*shy[nv/2]});
-                             if((int)hist.size()>300)hist.pop_front(); }
+                if (nv>=CALIB_BLOCK_MIN) {
+                    // 中位位移的取法不变 (先备份各块位移, 再 nth_element 取中位):
+                    //   备份只用于质量量 — 响应中位 (相关峰高) 与块间离散 (相对中位的
+                    //   最大偏离, ×2 还原全分辨率)。采样值 s 的算式逐位不变。
+                    float cx[9],cy[9];for(int i=0;i<nv;++i){cx[i]=shx[i];cy[i]=shy[i];}
+                    std::nth_element(shx,shx+nv/2,shx+nv);
+                    std::nth_element(shy,shy+nv/2,shy+nv);
+                    float mx=shx[nv/2],my=shy[nv/2],sp=0;
+                    for(int i=0;i<nv;++i) sp=std::max(sp,(float)std::hypot(cx[i]-mx,cy[i]-my));
+                    std::nth_element(rsv,rsv+nv/2,rsv+nv);
+                    hist.push_back({now,dt,-2.0f*mx,-2.0f*my,rsv[nv/2],2.0f*sp});
+                    if((int)hist.size()>hist_max)hist.pop_front(); }
             }
             prev_gray_f=sf;
+            // pad: 逐帧更新"已测级屏速"探针 — 状态机据此给下一级定段时长 (激励全程,
+            //   只在本级样本上池化, 代价 O(本级样本))
+            if (pad_mode) pad_calib_update_probe(hist,g_pad_exc_plan.snapshot());
         }
 
         if (g_calib_request.exchange(false)) {
             bool ok=false;
-            for(int it=0;it<8;++it) ok|=run_calibration(hist,s_est,l_est,calib_band);
-            float gain=0; bool oob=false;
-            if (ok && pad_mode) {
-                // pad: 拟合出的是 px per (偏转·ms), 换算成满偏转屏速 px/s
-                //   (×32767×1000)。带外 = 激励/背景不可信 (钳制把拟合停在带边),
-                //   按失败收尾 — 带边垃圾值不回写。
-                gain=pad_gain_from_s_rp(s_est);
-                oob=!pad_calib_accept(gain);
-                if (oob) { ok=false;
-                    std::cout<<"[标定] 失败: 摇杆增益越界 (拟合钳到 "<<gain<<" px/s, 设计带 ["
-                             <<PAD_GAIN_MIN<<","<<PAD_GAIN_MAX<<"])\n"; }
-                else s_est=pad_s_rp_from_gain(gain);   // 与运行期增益同一来源
-            }
-            g_calib_done=ok?1:2;
-            if (ok) {
-                if (pad_mode) {
-                    g_pad_stick_gain.store(gain);       // 立即对 pad 拍生效
-                    std::cout<<"[标定] stick_gain="<<gain<<" px/s, L="<<l_est<<" ms\n";
+            if (pad_mode) {
+                // pad: 段间停顿法 —— 停顿静止窗估噪声底/停顿边沿实测 L → 逐段中段
+                //   取样求增益 (无延迟对齐) → 段/级有效性判定 → 逐级池化 → 幂律外推
+                //   满偏 (单级则线性回退)。诊断行无论成败都打: 失败时它就是现场证据
+                //   (哪一级被丢、为什么)。
+                PadCalibResult cr=pad_calib_fit(hist,g_pad_exc_plan.snapshot(),
+                                                pad_cal_shift_max_px(bs_w));
+                if (cr.err[0]) {
+                    std::cout<<"[标定] 无法测量: "<<cr.err<<" (样本 "<<hist.size()<<"/"
+                             <<collect_frames<<")\n";
+                    g_calib_done=2;                       // 早退: 无逐级数据可打, 直接失败收尾
+                }
+                for (int ax=0; !cr.err[0] && ax<PAD_CAL_AXES_N; ++ax) {
+                    std::cout<<"[标定] 逐级 "<<(ax?"Y":"X")<<":";
+                    for (int li=0; li<PAD_CAL_LEVELS_N; ++li) {
+                        const PadCalLevelDiag& d=cr.lv[ax][li];
+                        if (d.valid) printf(" %d%%=%.1fpx/s(%d/%d段)",(int)(d.d*100+.5f),
+                                            (double)d.px_s,d.seg_ok,d.seg_all);
+                        else if (d.val>0) printf(" %d%%=无效(%d/%d段: %s %.3g vs %.3g)",
+                                                 (int)(d.d*100+.5f),d.seg_ok,d.seg_all,
+                                                 d.why,(double)d.val,(double)d.lim);
+                        else printf(" %d%%=无效(%d/%d段: %s)",(int)(d.d*100+.5f),
+                                    d.seg_ok,d.seg_all,d.why);
+                    }
+                    std::cout<<"\n";
+                }
+                for (int ax=0; !cr.err[0] && ax<PAD_CAL_AXES_N; ++ax)
+                    if (cr.nlv[ax]>0)
+                        printf("[标定] 拟合 %s: A=%.4fpx/s p=%.3f (残差 %.4f, %d 级%s)\n",
+                               ax?"Y":"X",(double)cr.gain[ax],(double)cr.p[ax],
+                               (double)cr.res[ax],cr.nlv[ax],
+                               cr.linear[ax]?" — 单级线性外推, 指数未测":"");
+                if (!cr.err[0])
+                printf("[标定] 停顿法: 噪声底 σx=%.3f σy=%.3f px/帧 | L=%.1fms "
+                       "(停顿位移和 %d 条, 离散 %.1fms; 边沿中位 %.1fms %d 条, 离散 %.1fms)\n",
+                       (double)cr.sigma[0],(double)cr.sigma[1],(double)cr.l_est,cr.l_n,
+                       (double)cr.l_mad,(double)cr.l_edge_ms,cr.l_edge_n,
+                       (double)cr.l_edge_mad);
+                ok=cr.ok; bool oob=false;
+                if (ok) {
+                    // 逐轴带内判定: 带外 = 激励/背景不可信 → 整次失败, 带边垃圾值不回写
+                    bool bx=pad_calib_accept(cr.gain[0]), by=pad_calib_accept(cr.gain[1]);
+                    if (!bx || !by) { ok=false; oob=true;
+                        std::cout<<"[标定] 失败: 满偏转屏速越界 (X="<<cr.gain[0]
+                                 <<" Y="<<cr.gain[1]<<" px/s, 设计带 ["
+                                 <<PAD_GAIN_MIN<<","<<PAD_GAIN_MAX<<"])\n"; }
+                    else { l_est=cr.l_est;                  // 立即对 pad 拍生效
+                           g_pad_stick_gain_x.store(cr.gain[0]);
+                           g_pad_stick_gain_y.store(cr.gain[1]); }
+                }
+                if (!ok && !oob)
+                    std::cout<<"[标定] 失败: "<<(cr.err[0]?cr.err:"有效级不足")
+                             <<" — 有效级 X="<<cr.nlv[0]<<"/"<<PAD_CAL_LEVELS_N
+                             <<" Y="<<cr.nlv[1]<<"/"<<PAD_CAL_LEVELS_N
+                             <<" (每轴需 ≥1 级; ≥2 级做幂律, 1 级线性回退), 样本 "
+                             <<hist.size()<<"/"<<collect_frames<<"\n";
+                if (ok) {
+                    // 回执行 (webui 逐字抓取): 取值格式与回写一致
+                    char line[192];
+                    snprintf(line,sizeof(line),"[标定] stick_gain_x=%.4f px/s, "
+                             "stick_gain_y=%.4f px/s, L=%.1f ms",
+                             (double)cr.gain[0],(double)cr.gain[1],(double)l_est);
+                    std::cout<<line<<"\n";
                     if (!persist_path.empty()) {
-                        if (persist_calibration(persist_path,PAD_CAL_VAR_GAIN,gain,
-                                                PAD_CAL_VAR_L,l_est))
-                            std::cout<<"[标定] 已回写 "<<persist_path<<"\n";
-                        else std::cerr<<"[标定] 回写失败\n"; }
-                } else {
-                    std::cout<<"[标定] s="<<s_est<<" px/count, L="<<l_est<<" ms\n";
-                    if (!persist_path.empty()) {
-                        if (persist_calibration(persist_path,"S_EST",s_est,"L_EST",l_est))
+                        const CalibVar vars[3]={{PAD_CAL_VAR_GAIN_X,cr.gain[0],"%.4f"},
+                                                {PAD_CAL_VAR_GAIN_Y,cr.gain[1],"%.4f"},
+                                                {PAD_CAL_VAR_L,l_est,"%.1f"}};
+                        if (persist_calibration(persist_path,vars,3))
                             std::cout<<"[标定] 已回写 "<<persist_path<<"\n";
                         else std::cerr<<"[标定] 回写失败\n"; }
                 }
-            } else if (!oob)
-                std::cout<<"[标定] 失败: 样本 "<<hist.size()<<"/"<<collect_frames<<"\n";
+            } else {
+                for(int it=0;it<8;++it) ok|=run_calibration(hist,s_est,l_est,CALIB_BAND_COUNTS);
+                g_calib_done=ok?1:2;
+                if (ok) {
+                    std::cout<<"[标定] s="<<s_est<<" px/count, L="<<l_est<<" ms\n";
+                    if (!persist_path.empty()) {
+                        const CalibVar vars[2]={{"S_EST",s_est,"%.4f"},{"L_EST",l_est,"%.1f"}};
+                        if (persist_calibration(persist_path,vars,2))
+                            std::cout<<"[标定] 已回写 "<<persist_path<<"\n";
+                        else std::cerr<<"[标定] 回写失败\n"; }
+                } else
+                    std::cout<<"[标定] 失败: 样本 "<<hist.size()<<"/"<<collect_frames<<"\n";
+            }
+            if (pad_mode) g_calib_done=ok?1:2;
         }
 
         if (collecting_enabled) {

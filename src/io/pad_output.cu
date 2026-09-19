@@ -16,14 +16,21 @@
 #include "core/state.h"
 #include "io/pad_calib.h"
 
-CountsHistory g_pad_ledger;
+CountsHistory g_pad_ledger(PAD_LEDGER_TICKS);
 PadPublishState g_pad_publish;
-std::atomic<float> g_pad_stick_gain{PAD_STICK_GAIN_DEFAULT};
+std::atomic<float> g_pad_stick_gain_x{PAD_STICK_GAIN_DEFAULT};
+std::atomic<float> g_pad_stick_gain_y{PAD_STICK_GAIN_DEFAULT};
 
 namespace { bool ledger_pad = false; }
 
 void own_motion_ledger_set(bool pad) { ledger_pad = pad; }
 const CountsHistory& own_motion_ledger() { return ledger_pad ? g_pad_ledger : g_counts; }
+
+LedgerPxScale own_motion_scale(float s_hid) {
+    if (!ledger_pad) return {s_hid, s_hid};      // hid: 单一灵敏度, 两轴同值
+    return {pad_s_rp_from_gain(g_pad_stick_gain_x.load()),
+            pad_s_rp_from_gain(g_pad_stick_gain_y.load())};
+}
 
 float pad_gain_clamp(float gain) {
     return std::clamp(gain, PAD_GAIN_MIN, PAD_GAIN_MAX);
@@ -58,15 +65,35 @@ void ledger_add(const PadLogical& out, std::chrono::steady_clock::time_point now
 
 } // namespace
 
+// 行程形状 = 圆 (径向), 实测驱动: G7 Pro 的合成幅度被限制在半径 32767 的圆内 —
+//   (逐轴满偏转屏速 gain_x/gain_y 各自折算满偏比例后再合成: 响应曲线与灵敏度
+//   逐轴不同, 混合比例用同一个 gain 会让一轴系统性偏快/偏慢)
+//   四方向单轴可达 ±32767, 对角两轴各约 0.71 满偏; 上机采样 max|(rx,ry)| ≈ 33074
+//   (= 32767×1.009, 设备固件自身的径向限幅加约 1% 容差), 无任何样本出现逐轴
+//   同时满偏 (方形会给出 √2 倍幅度)。故合并与注入的几何一律径向:
+//   - 注入向量 (律的速度指令) 先径向缩放到 |r| ≤ 1: 律要的是方向 + 速度, 逐轴
+//     钳制会在对角方向改写方向 (自瞄方向即由此失真); 律本身对本函数一无所知
+//     (独立算速度), 现实在此处收口;
+//   - 合并向量 (人类通道 + 注入) 再径向缩放到 |·| ≤ 满偏 — 与设备/引擎的行程
+//     形状一致 (把方形对角喂给圆形行程, 引擎仍会径向压回并改写方向);
+//   - 账本按最终提交值入账: 自身运动补偿的口径 = 游戏实收 (对角方向若按逐轴
+//     满偏记账会高估最多 √2 倍, 直接污染估计器)。
 PadLogical pad_merge(const PadLogical& human, float aim_vx, float aim_vy,
-                     float stick_gain, std::chrono::steady_clock::time_point now) {
+                     float gain_x, float gain_y, std::chrono::steady_clock::time_point now) {
     PadLogical out = human;
-    float fx = aim_vx*1000.0f/stick_gain;    // px/ms → px/s → 满偏转比例
-    float fy = aim_vy*1000.0f/stick_gain;
-    out.rx = (int16_t)std::clamp((int)human.rx + (int)std::lround(std::clamp(fx,-1.0f,1.0f)*PAD_AXIS_MAX),
-                                 -PAD_AXIS_MAX, PAD_AXIS_MAX);
-    out.ry = (int16_t)std::clamp((int)human.ry + (int)std::lround(std::clamp(fy,-1.0f,1.0f)*PAD_AXIS_MAX),
-                                 -PAD_AXIS_MAX, PAD_AXIS_MAX);
+    float fx = aim_vx*1000.0f/gain_x;        // px/ms → px/s → 该轴满偏转比例
+    float fy = aim_vy*1000.0f/gain_y;
+    float r = std::hypot(fx, fy);
+    if (r > 1.0f) { fx /= r; fy /= r; }      // 注入向量径向限幅 (方向保持)
+    float mx = (float)human.rx + fx*PAD_AXIS_MAX;
+    float my = (float)human.ry + fy*PAD_AXIS_MAX;
+    float m = std::hypot(mx, my);
+    if (m > (float)PAD_AXIS_MAX) {           // 合并向量径向限幅 (方向保持)
+        float k = (float)PAD_AXIS_MAX / m;
+        mx *= k; my *= k;
+    }
+    out.rx = (int16_t)std::lround(mx);
+    out.ry = (int16_t)std::lround(my);
     ledger_add(out, now);
     return out;
 }
@@ -104,7 +131,7 @@ void pad_tick(int cam_fps, PadState& in, bool dump) {
     bool ads  = h.lt != 0;                   //   触发语义, 扳机模拟量 1:1 直映无阈值
     uint16_t btns = (uint16_t)((fire?LEFT_KEY:0) | (ads?RIGHT_KEY:0));
     auto now = std::chrono::steady_clock::now();
-    PadCalibStep cal = pad_calib_step(h.btns);   // 标定拍 (L3+R3 长按 / 热参请求)
+    PadCalibStep cal = pad_calib_step(h.btns, cam_fps);   // 标定拍 (L3+R3 长按 / 热参请求)
     float vx = 0, vy = 0;
     bool gate = false;
     PadLogical out;
@@ -114,7 +141,7 @@ void pad_tick(int cam_fps, PadState& in, bool dump) {
         out = pad_excite(h, cal.dx, cal.dy, now);
     } else {
         gate = control_apply_pad(cam_fps, btns, vx, vy);
-        out = pad_merge(h, vx, vy, g_pad_stick_gain.load(), now);
+        out = pad_merge(h, vx, vy, g_pad_stick_gain_x.load(), g_pad_stick_gain_y.load(), now);
     }
     {   // 发布点覆盖写 (最新报告槽语义, 契约见 pad_output.h)
         std::lock_guard<std::mutex> lk(g_pad_publish.mtx);

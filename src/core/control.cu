@@ -5,8 +5,9 @@
 //    core/calib.h) 也在此驱动。跨帧控制状态 (积分器/状态机相位/量化余量) 为
 //    law_tick 内 static。律输出在执行器缝合点分流: hid = counts 量化进报文位
 //    移字节并记 g_counts; pad = 交付期望速度 (px/ms), 量化/报文/counts 尾巴
-//    是 hid 专属。自身运动补偿账本来源随模式路由 (io/pad_output.h: hid=
-//    g_counts, pad=摇杆账本), 律数学两模式逐句一致。
+//    是 hid 专属。自身运动补偿账本来源与账本→像素比例随模式路由 (io/pad_output.h:
+//    hid = g_counts + 标定 s, pad = 摇杆账本 + 逐轴满偏屏速换算), 律数学两模式
+//    逐句一致 — hid 的 max_vx==max_vy 使逐轴帽退化为单帽, 算术逐位不变。
 // ============================================================================
 
 #include "core/control.h"
@@ -19,7 +20,7 @@
 
 #include "core/calib.h"
 #include "core/state.h"
-#include "io/pad_output.h"     // own_motion_ledger + g_pad_stick_gain:
+#include "io/pad_output.h"     // own_motion_ledger/own_motion_scale + g_pad_stick_gain_x/y:
                                //   自身运动账本来源与 pad 速度帽随输出模式
 
 namespace {
@@ -92,12 +93,17 @@ void law_tick(int cam_fps, int16_t real_x, int16_t real_y, uint16_t btns, bool p
             double age=elapsed_ms(now,tp);
             if (valid&&age<TARGET_STALE_MS) {
                 float max_v=g_max_v.load(); const float fov_r=g_fov_radius.load();
-                if (pad) max_v=std::min(max_v,g_pad_stick_gain.load()/1000.0f);  // 注入通道满偏转屏速 = pad 物理速度帽
+                // pad: 逐轴物理速度帽 = 该轴满偏转屏速 (注入通道打满即该轴满偏行程);
+                //   hid 两轴同为 -x (max_vx==max_vy → 下方算式与单帽逐位相同)
+                float max_vx=max_v, max_vy=max_v;
+                if (pad) { max_vx=std::min(max_v,g_pad_stick_gain_x.load()/1000.0f);
+                           max_vy=std::min(max_v,g_pad_stick_gain_y.load()/1000.0f); }
+                const LedgerPxScale sc=own_motion_scale(se);
                 float Lc=le*PRED_L_COMP;
                 auto cp=own_motion_ledger().at(shift_ms(tp,-(double)Lc));
                 auto cn=own_motion_ledger().cum();
-                float ifx=se*(float)(cn.first-cp.first);
-                float ify=se*(float)(cn.second-cp.second);
+                float ifx=sc.x*(float)(cn.first-cp.first);
+                float ify=sc.y*(float)(cn.second-cp.second);
                 // 加速度偏差补偿: ε = â·T·(α/β−½) 修 α-β 速度结构滞后,
                 //   位置外推加 ½â·W²; 前馈用 v̂+ε — 对匀加速目标, 当前真实
                 //   速度才是 type-2 零拖尾的精确开环指令
@@ -114,15 +120,16 @@ void law_tick(int cam_fps, int16_t real_x, int16_t real_y, uint16_t btns, bool p
                 float kp=2.0f*FF_ZETA*wn;
                 float ki=wn*wn;
                 float gate=FF_I_GATE/(FF_I_GATE+r);
-                float i_lim=FF_I_FRAC*max_v/std::max(ki,1e-9f);
+                float i_lim_x=FF_I_FRAC*max_vx/std::max(ki,1e-9f);
+                float i_lim_y=FF_I_FRAC*max_vy/std::max(ki,1e-9f);
                 float vx_u=kp*ex+ki*int_x;
                 float vy_u=kp*ey+ki*int_y;
                 if (ex*ex+ey*ey>fov_r*fov_r) { int_x=int_y=0; }
                 else {
-                    bool wx=(vx_u>max_v&&ex>0)||(vx_u<-max_v&&ex<0);
-                    bool wy=(vy_u>max_v&&ey>0)||(vy_u<-max_v&&ey<0);
-                    if(!wx)int_x=std::clamp(int_x+ex*TICK_MS*gate,-i_lim,i_lim);
-                    if(!wy)int_y=std::clamp(int_y+ey*TICK_MS*gate,-i_lim,i_lim);
+                    bool wx=(vx_u>max_vx&&ex>0)||(vx_u<-max_vx&&ex<0);
+                    bool wy=(vy_u>max_vy&&ey>0)||(vy_u<-max_vy&&ey<0);
+                    if(!wx)int_x=std::clamp(int_x+ex*TICK_MS*gate,-i_lim_x,i_lim_x);
+                    if(!wy)int_y=std::clamp(int_y+ey*TICK_MS*gate,-i_lim_y,i_lim_y);
                 }
                 // FF 门控 = 信任度插值: 信任满格 (稳态追击) → 无门控全力
                 // 前馈 (sharp); CUSUM 告警 (模型破缺, 该轴 v̂ 已归零重拉)
@@ -140,8 +147,8 @@ void law_tick(int cam_fps, int16_t real_x, int16_t real_y, uint16_t btns, bool p
                 float ff_eff=FF_GAIN_VAL*ff_gate*gap_scale;
                 vx_u+=ff_eff*vffx;
                 vy_u+=ff_eff*vffy;
-                float vcx=std::clamp(vx_u,-max_v,max_v);
-                float vcy=std::clamp(vy_u,-max_v,max_v);
+                float vcx=std::clamp(vx_u,-max_vx,max_vx);
+                float vcy=std::clamp(vy_u,-max_vy,max_vy);
                 if (pad) { *out_vx=vcx; *out_vy=vcy; }    // 缝合: pad 交付期望速度 (px/ms)
                 else {
                     float s=std::clamp(se,S_MIN,S_MAX);

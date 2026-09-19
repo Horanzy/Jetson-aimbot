@@ -10,10 +10,13 @@
 #  路径全部相对脚本自身解析 (realpath 向上找 ROOT), 整个目录可以随意移动/改名。
 #
 #  标定 (两套, 互不覆盖): 鼠标模式双侧键长按 5 秒, 手柄模式 L3+R3 长按 5 秒 —
-#        都是"对准有细节的静止背景 → 画正方形/满偏方波 → 点头(成功)/摇头(失败)";
+#        都是"对准有细节的静止背景 → 小幅激励 → 点头(成功)/摇头(失败)";
 #        成功后固件自动把标定值回写到本脚本 (原子替换), 无需手改:
-#          鼠标 hid → S_EST / L_EST           (px/count, ms)
-#          手柄 pad → PAD_STICK_GAIN / L_EST_PAD (满偏转屏速 px/s, ms)
+#          鼠标 hid → S_EST / L_EST                      (px/count, ms)
+#          手柄 pad → PAD_STICK_GAIN_X / _Y / L_EST_PAD  (满偏转屏速 px/s, px/s, ms)
+#        手柄标定逐轴进行 (垂直灵敏度常低于水平): 偏转级 10/25/50/70% 逐级 + 段间
+#        停顿, 外推满偏; 全程小幅慢速 (±25% 起步/收尾), 约 6-14s。垂直/水平各存一个
+#        增益, 注入换算与速度帽逐轴取用。
 #        手柄标定也可以从 WebUI 运行页的「开始标定」按钮触发 (热参 padcalib=1)。
 # ==============================================================================
 
@@ -58,13 +61,14 @@ JPEG_Q=95                   # JPEG 质量
 # 下面四行都是占位 (行内留白是给回写值的; 固件回写整行替换): 没标定过就直接跑,
 # 准星跟随会明显偏慢或偏快 —— 先标定, 再谈手感。
 #   鼠标模式用 S_EST (灵敏度 px/count) / L_EST (回路延迟 ms), 双侧键长按 5s 标定;
-#   手柄模式用 PAD_STICK_GAIN (满偏转屏速 px/s) / L_EST_PAD (延迟 ms), L3+R3 长按 5s
-#   标定 — 两套独立存放, 互不覆盖。
-#   PAD_STICK_GAIN 的 3000px/s 缺省取值依据见固件头常量 (AGENTS.md 速度帽推导的
+#   手柄模式用 PAD_STICK_GAIN_X / PAD_STICK_GAIN_Y (各轴满偏转屏速 px/s) / L_EST_PAD
+#   (延迟 ms), L3+R3 长按 5s 标定 — 两套独立存放, 互不覆盖。
+#   PAD_STICK_GAIN_X/_Y 的 3000px/s 缺省取值依据见固件头常量 (AGENTS.md 速度帽推导的
 #   上一档: 行为库最快屏速 ≈2000px/s 必须能跟上)。
 S_EST=1.0
 L_EST=60.0
-PAD_STICK_GAIN=3000.0
+PAD_STICK_GAIN_X=3000.0
+PAD_STICK_GAIN_Y=3000.0
 L_EST_PAD=60.0
 
 # ==============================================================================
@@ -75,7 +79,7 @@ SCRIPT_PATH="$(realpath "$0")"
 
 # 模式参数: hid 用鼠标标定值 (-s/-l), pad 用手柄标定值与手柄选择 (-M/-P/-G/-l)
 if [ "$OUTPUT_MODE" = "pad" ]; then
-  MODE_ARGS=(-M pad -P "$PAD_KEYWORD" -G "$PAD_STICK_GAIN" -l "$L_EST_PAD")
+  MODE_ARGS=(-M pad -P "$PAD_KEYWORD" -G "$PAD_STICK_GAIN_X,$PAD_STICK_GAIN_Y" -l "$L_EST_PAD")
 else
   MODE_ARGS=(-s "$S_EST" -l "$L_EST")
 fi

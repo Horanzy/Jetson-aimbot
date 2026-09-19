@@ -17,7 +17,7 @@ Capture card (UVC 1080p NV12) → GStreamer nvvidconv → CUDA preprocess → Te
 
 Aim at a static background with texture and hold both side keys for 5 seconds: the program excites the loop (draws a square), measures background motion with block phase correlation, and estimates sensitivity `s` (px/count) and loop delay `L` (ms) online with least squares. The control-law bandwidth is then derived from the calibrated `L` via phase margin (`wn=(90°−PM)π/180/L`, PM=50°) — no hand-tuned magic numbers, adapts to PC/PS5 and 60/120fps. The calibration values are written back into the per-game launch script automatically.
 
-Each output mode has its own calibration, stored separately and never overwriting the other: mouse mode (`-M hid`) measures `s`/`L` from the side-key trigger and writes `S_EST`/`L_EST`; pad mode (`-M pad`) is triggered by L3+R3 (or the WebUI's 「开始标定」 button = hot param `padcalib=1`) and measures the loop delay plus the stick's **full-deflection screen speed** — the firmware owns the right stick for ~11 s and plays the same square at full deflection — writing `PAD_STICK_GAIN` (px/s) / `L_EST_PAD`. Both follow the same measurement chain (phase correlation → least squares → delay sweep); a pad fit outside its design band (e.g. a screen that does not answer the injection, i.e. no game running) fails with a shake and writes nothing.
+Each output mode has its own calibration, stored separately and never overwriting the other: mouse mode (`-M hid`) measures `s`/`L` from the side-key trigger and writes `S_EST`/`L_EST`; pad mode (`-M pad`) is triggered by L3+R3 (or the WebUI's 「开始标定」 button = hot param `padcalib=1`) and measures **each axis's full-deflection screen speed** plus the loop delay — the firmware owns the right stick for ~13 s and plays a small per-axis, per-level excitation (10/25/50/70 % deflection, alternating signs, a 150 ms zero pause after every segment; the start square / nod / shake are at 25 % deflection too), writing `PAD_STICK_GAIN_X`/`PAD_STICK_GAIN_Y` (px/s per axis — vertical sensitivity is commonly lower than horizontal) / `L_EST_PAD`. Full deflection is deliberately *not* measured: the phase-correlation chain only resolves ≈70 px of per-frame screen shift (≈8400 px/s at 120 fps), which a game's full-deflection speed normally exceeds; the pauses give the delay directly (the picture keeps moving for L after the command edge) and the segment mid-windows give each level's gain with no delay alignment, so the level gains fit a power law whose full-deflection extrapolation is the answer. Levels that exceed the measurement range, or that clamp, are discarded whole with the reason logged (≥2 levels → power law, exactly 1 → linear fallback, 0 → fail). A result outside the design band (e.g. a screen that does not answer the injection, i.e. no game running) fails with a shake and writes nothing.
 
 ## Control law
 
@@ -50,13 +50,13 @@ scripts/game/<game>.sh        # calibrate once; the calibration values are writt
 ```
 
 `OUTPUT_MODE` in the launcher selects the channel (`hid` = USB mouse, `pad` = XInput pad); pad
-mode additionally passes `-P <by-id substring>`, `-G <stick gain>` and `-l <L_EST_PAD>`, hid mode
-passes `-s`/`-l` — the launcher branches on the mode, the mouse-mode arguments being exactly as
+mode additionally passes `-P <by-id substring>`, `-G <x gain>,<y gain>` and `-l <L_EST_PAD>`, hid
+mode passes `-s`/`-l` — the launcher branches on the mode, the mouse-mode arguments being exactly as
 before.
 
 Requires JetPack with TensorRT 10, CUDA, OpenCV 4, GStreamer, and a UVC capture card supporting 1080p NV12 @ 120 Hz. The USB output needs the kernel **`raw_gadget` module** — an external dependency to provide on the deployment machine (distro package, or built out-of-tree per the kernel doc `Documentation/usb/raw_gadget.rst`). Both output modes (`-M hid` mouse, `-M pad` XInput pad) own the UDC, so they run one at a time; `scripts/setup_mouse.sh` frees the UDC and sets `/dev/raw-gadget` permissions for either.
 
-Pad mode (`-M pad`, physical gamepad on `/dev/input/by-id`, `-P` to select it; L3+R3 held 5 s calibrates it):
+Pad mode (`-M pad`, physical gamepad on `/dev/input/by-id`, `-P` to select it; L3+R3 held 5 s calibrates it; `-G <x>,<y>` sets the per-axis full-deflection screen speed):
 
 ```bash
 bin/aimbot -M pad -m engine/apex.engine -d /dev/video0 -f 120 -k fire   # XInput pad output

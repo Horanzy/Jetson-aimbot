@@ -24,8 +24,9 @@ from . import discover
 HANDSHAKE_RE = re.compile(r"热参数通道: 127\.0\.0\.1:(\d+)")
 FPS_RE = re.compile(r"\[AI FPS\] (\d+) fps")
 CALIB_RE = re.compile(r"\[标定\] s=([0-9.eE+-]+) px/count, L=([0-9.eE+-]+) ms")
-# pad 标定回执 (固件同一行号: 满偏转屏速 px/s + L ms, 见 src/io/capture.cu)
-PAD_CALIB_RE = re.compile(r"\[标定\] stick_gain=([0-9.eE+-]+) px/s, L=([0-9.eE+-]+) ms")
+# pad 标定回执 (固件同一行号: 逐轴满偏转屏速 px/s + L ms, 见 src/io/capture.cu)
+PAD_CALIB_RE = re.compile(r"\[标定\] stick_gain_x=([0-9.eE+-]+) px/s, "
+                          r"stick_gain_y=([0-9.eE+-]+) px/s, L=([0-9.eE+-]+) ms")
 # [SAVE] fire  (fire=12 det=3 auto=1 drop=0) — 每张截图一行, 计数是固件的累计值
 SAVE_RE = re.compile(r"\[SAVE\]\s*\S+\s*\(fire=(\d+) det=(\d+) auto=(\d+)")
 STATS_RE = re.compile(r"采集统计: fire=(\d+) det=(\d+) auto=(\d+)")
@@ -55,8 +56,8 @@ def build_argv(root: Path, params: dict, calib: dict, script_path: Path) -> list
     """拼装 aimbot 命令行 (与脚本同构)。calib 缺项时省略 -s/-l/-G, 固件按默认兜底。
 
     输出模式分支 (与 scripts/game 模板逐字同构): hid 传 -s/-l (S_EST/L_EST,
-    px/count), pad 传 -M pad -P <子串> -G <满偏转屏速> -l <L_EST_PAD> — 两套
-    标定量互不覆盖, 固件侧单位制与速度帽随之切换。"""
+    px/count), pad 传 -M pad -P <子串> -G <x 轴屏速>,<y 轴屏速> -l <L_EST_PAD> —
+    两套标定量互不覆盖, 固件侧单位制/逐轴注入换算与速度帽随之切换。"""
     model = str(params.get("model") or "")
     model_abs = model if os.path.isabs(model) else str(root / model)
     argv = [str(root / "bin" / "aimbot"),
@@ -74,8 +75,10 @@ def build_argv(root: Path, params: dict, calib: dict, script_path: Path) -> list
             "-v", "y" if params.get("preview") else "n"]
     if str(params.get("output_mode") or "hid") == "pad":
         argv += ["-M", "pad", "-P", str(params.get("pad_keyword") or "")]
-        if calib.get("pad_gain") is not None:
-            argv += ["-G", fmt_num(calib["pad_gain"])]
+        gx, gy = calib.get("pad_gain_x"), calib.get("pad_gain_y")
+        if gx is not None:
+            # -G x[,y]: y 省略 = 与 x 相同 (缺 y 时按单值给, 固件同义)
+            argv += ["-G", fmt_num(gx) if gy is None else "%s,%s" % (fmt_num(gx), fmt_num(gy))]
         if calib.get("pad_l") is not None:
             argv += ["-l", fmt_num(calib["pad_l"])]
     else:
@@ -373,8 +376,9 @@ class InstanceManager:
             m = PAD_CALIB_RE.search(line)
             if m:
                 try:
-                    self.calib_live = {"pad_gain": float(m.group(1)),
-                                       "pad_l": float(m.group(2))}
+                    self.calib_live = {"pad_gain_x": float(m.group(1)),
+                                       "pad_gain_y": float(m.group(2)),
+                                       "pad_l": float(m.group(3))}
                 except ValueError:
                     pass
             self._append_log(line)

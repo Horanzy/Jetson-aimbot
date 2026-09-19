@@ -87,16 +87,18 @@ extern TargetState g_target;
 // 回溯深度 = 3s 墙钟的拍数: 标定采样窗 (~300 帧 ≈ 2.5s @120fps) 加每样本的延迟
 //   回溯 (lag+dt, ≤ ~0.3s) 必须整体落在其中 — 标定按 账本.at(t−lag) 查询
 //   (hid = 本对象, pad = 摇杆账本, 见 io/pad_output.h), 深度以拍计会随拍率
-//   缩水, 故按墙钟表达; 两个账本 (本对象与摇杆账本) 同窗口同结构
+//   缩水, 故按墙钟表达。深度是**每实例**的: hid 的 g_counts 用本值 (周期方波只需
+//   尾窗), pad 的摇杆账本要覆盖整段分级激励 (io/pad_output.h 的 PAD_LEDGER_TICKS)。
 const size_t COUNTS_HIST_TICKS = (size_t)3 * DEFAULT_FREQ;
 class CountsHistory {
 public:
+    explicit CountsHistory(size_t depth = COUNTS_HIST_TICKS) : depth_(depth) {}
     struct Sample { std::chrono::steady_clock::time_point t; long long cx, cy; };
     void add(std::chrono::steady_clock::time_point t, int dx, int dy) {
         std::lock_guard<std::mutex> lk(mtx);
         cum_x += dx; cum_y += dy;
         buf.push_back({t, cum_x, cum_y});
-        while (buf.size() > COUNTS_HIST_TICKS) buf.pop_front();
+        while (buf.size() > depth_) buf.pop_front();
     }
     std::pair<double,double> at(std::chrono::steady_clock::time_point t) const {
         std::lock_guard<std::mutex> lk(mtx);
@@ -116,6 +118,7 @@ public:
 private:
     mutable std::mutex mtx;
     std::deque<Sample> buf;
+    size_t depth_;
     long long cum_x = 0, cum_y = 0;
 };
 extern CountsHistory g_counts;
