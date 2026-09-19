@@ -1,7 +1,9 @@
 // ============================================================================
-//  calib.cu — calib.h 的实现: counts 历史上的最小二乘 s 估计与延迟粗/细双扫
-//    (run_calibration), S_EST/L_EST 写入脚本的临时文件原子替换
-//    (persist_calibration), /dev/v4l/by-id 采集卡名解析 (resolve_cam_device)。
+//  calib.cu — calib.h 的实现: 账本历史上的最小二乘灵敏度估计与延迟粗/细双扫
+//    (run_calibration), 标定值的脚本原子回写 (persist_calibration),
+//    /dev/v4l/by-id 采集卡名解析 (resolve_cam_device)。
+//    账本来源 = own_motion_ledger (hid 路由到 g_counts, pad 路由到摇杆账本),
+//    拟合数学与单位制无关 (px = 灵敏度 × 账本增量)。
 // ============================================================================
 
 #include "core/calib.h"
@@ -21,8 +23,10 @@
 #include <unistd.h>
 
 #include "core/state.h"
+#include "io/pad_output.h"     // own_motion_ledger: 账本来源随输出模式
 
-bool run_calibration(const std::deque<CalibSample>& hist, float& s_est, float& l_est) {
+bool run_calibration(const std::deque<CalibSample>& hist, float& s_est, float& l_est,
+                     const CalibBand& band) {
     const int n=(int)hist.size(); if (n<CALIB_WINDOW) return false;
     auto scan=[&](float lo,float hi,float step,float& out_s,float& out_dl)->float {
         float best=FLT_MAX;
@@ -30,8 +34,8 @@ bool run_calibration(const std::deque<CalibSample>& hist, float& s_est, float& l
             double lag=l_est+dl, sum_cc=0, sum_sc=0;
             std::vector<std::pair<float,float>> cs(n);
             for (int i=0;i<n;++i) { auto&r=hist[i];
-                auto c0=g_counts.at(shift_ms(r.t,-lag-r.dt_ms));
-                auto c1=g_counts.at(shift_ms(r.t,-lag));
+                auto c0=own_motion_ledger().at(shift_ms(r.t,-lag-r.dt_ms));
+                auto c1=own_motion_ledger().at(shift_ms(r.t,-lag));
                 float Cx=(float)(c1.first-c0.first), Cy=(float)(c1.second-c0.second);
                 cs[i]={Cx,Cy}; sum_cc+=(double)Cx*Cx+(double)Cy*Cy;
                 sum_sc+=(double)r.sx*Cx+(double)r.sy*Cy; }
@@ -47,18 +51,24 @@ bool run_calibration(const std::deque<CalibSample>& hist, float& s_est, float& l
     if (scan(-40.0f,96.0f,8.0f,s1,dl1)==FLT_MAX) return false;
     float s2=s1,dl2=dl1;
     if (scan(dl1-8.0f,dl1+8.0f,2.0f,s2,dl2)==FLT_MAX) { s2=s1; dl2=dl1; }
-    s_est=std::clamp(s2,S_MIN,S_MAX); l_est=std::clamp(l_est+dl2,L_MIN,L_MAX);
+    s_est=std::clamp(s2,band.s_min,band.s_max);
+    l_est=std::clamp(l_est+dl2,L_MIN,L_MAX);
     return true;
 }
-bool persist_calibration(const std::string& path, float s, float l) {
+bool persist_calibration(const std::string& path, const char* var_s, float s,
+                         const char* var_l, float l) {
     std::ifstream in(path); if (!in.good()) return false;
     std::vector<std::string> lines; std::string line;
     while (std::getline(in,line)) lines.push_back(line); in.close();
-    char sbuf[64],lbuf[64];
-    snprintf(sbuf,sizeof(sbuf),"S_EST=%.4f",s); snprintf(lbuf,sizeof(lbuf),"L_EST=%.1f",l);
+    // 值的书写格式与 VAR 名无关: 灵敏度/增益 %.4f (px/count 与 px/s 同精度口径),
+    //   L %.1f (ms)
+    std::string sline=std::string(var_s)+"=", lline=std::string(var_l)+"=";
+    char sbuf[80],lbuf[80];
+    snprintf(sbuf,sizeof(sbuf),"%s=%.4f",var_s,(double)s);
+    snprintf(lbuf,sizeof(lbuf),"%s=%.1f",var_l,(double)l);
     bool fs=false,fl=false;
-    for (auto& ln:lines) { if (ln.rfind("S_EST=",0)==0){ln=sbuf;fs=true;}
-                           else if (ln.rfind("L_EST=",0)==0){ln=lbuf;fl=true;} }
+    for (auto& ln:lines) { if (ln.rfind(sline,0)==0){ln=sbuf;fs=true;}
+                           else if (ln.rfind(lline,0)==0){ln=lbuf;fl=true;} }
     if (!fs) lines.push_back(sbuf); if (!fl) lines.push_back(lbuf);
     struct stat st{}; bool have=(stat(path.c_str(),&st)==0);
     std::string tmp=path+".tmp";

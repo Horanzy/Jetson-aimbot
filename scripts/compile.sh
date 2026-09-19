@@ -22,7 +22,7 @@ TRT="-lnvinfer -lnvinfer_plugin -lcudart -Xcompiler -pthread"
 
 MODULES="main \
          core/control core/estimator core/calib core/trt core/state \
-         io/capture io/hid_mouse io/usbraw io/pad_input io/pad_output io/pad_xinput io/hotctl"
+         io/capture io/hid_mouse io/usbraw io/pad_input io/pad_output io/pad_calib io/pad_xinput io/hotctl"
 
 OBJS=""
 for m in $MODULES; do

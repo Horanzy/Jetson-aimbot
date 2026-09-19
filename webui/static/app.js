@@ -112,6 +112,15 @@ const PARAM_DEFS = [
     info: "采集卡设备。Hagibis/Asus 是按 /dev/v4l/by-id 名字做唯一子串匹配的别名 (与固件同一规则); /dev/videoN 是具体节点。插拔设备后到设置页重新扫描。❄ 冷参数, 下次启动生效。" },
   { group: "瞄准", key: "preview", label: "预览窗口", type: "bool", hot: false,
     info: "在 Jetson 接屏幕/桌面会话时显示检测画面 (框选 + 瞄准点)。没有接屏时开启会导致启动报错 —— 日志会如实显示, 改回关闭再启动即可。❄ 冷参数, 下次启动生效。" },
+  { group: "手柄输出 (pad)", key: "output_mode", label: "输出模式", type: "select", options: ["hid", "pad"], hot: false,
+    labels: { hid: "hid — USB 鼠标 (鼠标标定)", pad: "pad — XInput 手柄 (手柄标定)" },
+    info: "输出通道二选一: 两模式互斥且各自独占 USB 设备控制器, 切换必须重启进程。hid: 真实鼠标 1:1 透传 + 注入鼠标位移, 标定量 s (px/count) 与 L_EST 由鼠标双侧键长按 5 秒标定。pad: 物理 Xbox 布局手柄 1:1 透传 + 注入右摇杆, 标定量 PAD_STICK_GAIN (满偏转屏速 px/s) 与 L_EST_PAD 由 L3+R3 长按 5 秒或顶部「开始标定」按钮标定。两套标定值互不覆盖。❄ 冷参数, 下次启动生效。" },
+  { group: "手柄输出 (pad)", key: "pad_keyword", label: "手柄匹配子串", type: "text", hot: false, showIf: { key: "output_mode", value: "pad" },
+    info: "按 /dev/input/by-id 设备名 (大小写不敏感子串) 选择物理手柄; 留空 = 任意 *-event-joystick 节点 (uinput 虚拟手柄与蓝牙手柄无 by-id 节点, 走设备名 + 摇杆能力回落匹配)。多个设备同时命中会启动失败并列出候选, 用子串收窄即可。❄ 冷参数, 下次启动生效。" },
+  { group: "手柄输出 (pad)", key: "pad_stick_gain", label: "满偏转屏速 (标定回写)", type: "calib", unit: "px/s", hot: false, showIf: { key: "output_mode", value: "pad" },
+    info: "右摇杆满偏 (±32767) 对应的准星屏速; 注入换算 v·1000/gain 与 pad 速度帽 min(-x, gain) 都由它给出。标定 (L3+R3 / 「开始标定」) 成功后由固件自动回写脚本的 PAD_STICK_GAIN, 本页只读显示 —— 与 S_EST/L_EST 同类, WebUI 不写。未标定时固件用设计缺省 3000 px/s。" },
+  { group: "手柄输出 (pad)", key: "pad_l_est", label: "手柄回路延迟 (标定回写)", type: "calib", unit: "ms", hot: false, showIf: { key: "output_mode", value: "pad" },
+    info: "pad 模式的环路延迟 L (注入 → 屏幕 → 采集 → 检测), 与鼠标模式同一物理含义但独立测量、独立存放 (脚本 VAR: L_EST_PAD)。控制律带宽 wn 由它自动导出, 故它偏大只会变慢、偏小才危险 (欠补偿)。未标定时固件用命令行 -l 或默认 60ms。" },
   { group: "训练数据采集", key: "capture_enabled", label: "开启采集", type: "bool", hot: false, captureSwitch: true,
     info: "开启后按三源自动截图: 开火瞬间 (fire) / 检测到目标 (det) / 定时 (auto), 分别写入输出目录的子目录, 每个源可单独开关。关闭 = 纯自瞄, 不写盘。❄ 冷参数, 下次启动生效。" },
   { group: "训练数据采集", key: "cap_fire", label: "开火源 fire", type: "bool", hot: true, showIf: "capture_enabled",
@@ -243,6 +252,23 @@ function pickDefaultProfile() {
 }
 function profsSafe() { return (S.state && S.state.scan.profiles) || []; }
 function curProfile() { return profsSafe().find(p => p.file === S.selected) || null; }
+function isPadMode(params) { return !!(params && params.output_mode === "pad"); }
+// 运行中的实例是不是 pad 模式 (按其 profile 的脚本参数判断)
+function runningPadMode() {
+  const inst = S.state && S.state.instance;
+  if (!inst) return false;
+  const p = profsSafe().find(x => x.file === inst.profile);
+  return !!(p && p.script_params && p.script_params.output_mode === "pad");
+}
+// 标定回写量 (只读): 运行中有固件回执优先, 否则脚本值 — 两套 (hid/pad) 分别存放
+function calibOf() {
+  const p = curProfile();
+  const c = Object.assign({ s: null, l: null, pad_gain: null, pad_l: null },
+                          p && p.calib ? p.calib : {});
+  const live = S.state && S.state.instance ? S.state.instance.calib_live : null;
+  if (live) Object.assign(c, live);
+  return c;
+}
 
 function selectProfile(stem, opts) {
   opts = opts || {};
@@ -264,6 +290,7 @@ function selectProfile(stem, opts) {
 function blankParams() {
   const o = {};
   PARAM_DEFS.forEach(d => {
+    if (d.type === "calib") return;               // 标定回写量: 固件写, 不进表单
     o[d.key] = d.type === "num" ? (d.step < 1 ? 0.5 : 0) : (d.type === "bool" ? false : "");
   });
   return o;
@@ -313,6 +340,13 @@ function renderTopbar() {
 
   $("#btnStart").disabled = RUNNING.includes(inst.state);
   $("#btnStop").disabled = !RUNNING.includes(inst.state);
+  // 手柄标定按钮: 只在「本 WebUI 启动 + 热参可用 + 运行中的 profile 是 pad」时可用
+  //   (鼠标标定不经按钮: 双侧键长按 5 秒, 保持现状)
+  $("#btnCalib").disabled = !(inst.state === "running" && !inst.adopted
+                              && inst.hot_capable && runningPadMode());
+  $("#btnCalib").title = runningPadMode()
+    ? "手柄标定 (pad 模式运行中): 对准有细节的静止背景后点按 — 固件独占右摇杆播放满偏方波 (约 11 秒), 成功点头/失败摇头, 结果回写脚本的 PAD_STICK_GAIN/L_EST_PAD"
+    : "手柄标定仅 pad 模式运行中可用 (hid 模式的鼠标标定是双侧键长按 5 秒, 无按钮)";
   $("#btnSave").classList.toggle("dirty", S.dirty);
   $("#btnSave2").classList.toggle("dirty", S.dirty);
   $("#dirtyHint").classList.toggle("hidden", !S.dirty);
@@ -358,7 +392,14 @@ function renderRunTab() {
   // 状态卡
   const tel = S.state.telemetry, p = curProfile();
   const model = S.params && S.params.model ? String(S.params.model).split("/").pop() : "（未选）";
-  const calib = inst.calib_live || (p ? p.calib : null);
+  const padMode = isPadMode(S.params);
+  // 标定卡随输出模式: hid = s(px/count)·L(ms), pad = 满偏转屏速(px/s)·L_EST_PAD(ms)
+  const cv = calibOf();
+  const calibCard = padMode
+    ? { k: "标定 摇杆增益 · L", v: cv.pad_gain != null ? cv.pad_gain + " · " + cv.pad_l : "—",
+        small: inst.calib_live && inst.calib_live.pad_gain != null ? "运行中回执" : "脚本值" }
+    : { k: "标定 s · L", v: cv.s != null ? (cv.s + " · " + cv.l) : "—",
+        small: inst.calib_live && inst.calib_live.s != null ? "运行中回执" : "脚本值" };
   const soc = tel && tel.soc_temp != null ? tel.soc_temp : null;
   const cap = inst.capture;
   const capTotal = cap ? cap.fire + cap.det + cap.auto : null;
@@ -376,7 +417,7 @@ function renderRunTab() {
     { k: "GPU", v: tel && tel.gpu != null ? tel.gpu : "—", small: "%" },
     { k: "内存", v: tel && tel.mem ? tel.mem.percent : "—", small: tel && tel.mem ? "· " + tel.mem.used_mb + "MB" : "" },
     { k: "SoC 温度", v: soc != null ? soc.toFixed(0) : "—", small: "°C", cls: soc >= 85 ? "err" : soc >= 70 ? "warn" : "" },
-    { k: "标定 s · L", v: calib && calib.s != null ? (calib.s + " · " + calib.l) : "—", small: inst.calib_live ? "运行中回执" : "脚本值" },
+    calibCard,
     { k: "热参数通道", v: inst.state === "running" ? (inst.hot_capable ? "已启用" : "不可用") : (S.state.scan.binary && S.state.scan.binary.hot_capable ? "固件支持" : "固件不支持"), small: inst.hot_port ? ":" + inst.hot_port : "", cls: (inst.state === "running" && !inst.hot_capable) ? "warn" : (inst.hot_capable ? "ok" : "") },
   ];
   $("#statusCards").innerHTML = cards.map(c =>
@@ -491,13 +532,23 @@ async function pollCapFolder() {
 }
 
 /* ================= 渲染: 参数页 ================= */
+// 显隐: showIf 是 key (真值即显示) 或 {key, value} (等值才显示, 如 output_mode=pad)
+function visibleField(d) {
+  if (!d.showIf) return true;
+  if (typeof d.showIf === "string") return !!S.params[d.showIf];
+  return String(S.params[d.showIf.key]) === String(d.showIf.value);
+}
+function fmtCalib(v) { return v == null ? null : Math.round(v * 10) / 10; }
+
 function paramRow(d) {
-  if (d.showIf && !S.params[d.showIf]) return "";
+  if (!visibleField(d)) return "";
   const v = S.params[d.key];
   // 运行中的固件不支持热参数 → 🔥 置灰并提示需重编译 (不盲发, 下次启动生效)
   const hotDead = d.hot && S.state.instance.state === "running" &&
                   !S.state.instance.hot_capable;
-  const badge = d.hot
+  const badge = d.type === "calib"
+    ? `<span class="badge" title="固件标定回写量: 只读 (脚本 VAR 由固件原子替换; WebUI 不写)">✎ 标定回写</span>`
+    : d.hot
     ? `<span class="badge hot${hotDead ? " off" : ""}" title="${hotDead
         ? "运行中的固件是旧版 (无热参数通道, 需重编译): 本项将在下次【启动】生效"
         : "热参数: 保存后即时下发运行中实例"}">🔥 热</span>`
@@ -507,6 +558,15 @@ function paramRow(d) {
     ctl = `<input type="number" data-pk="${d.key}" value="${esc(v)}" min="${d.min}" max="${d.max}" step="${d.step}">` +
           (d.unit ? `<span class="p-unit">${d.unit}</span>` : "") +
           `<span class="p-unit">范围 ${d.min}–${d.max}</span>`;
+  } else if (d.type === "text") {
+    ctl = `<input type="text" data-pk="${d.key}" value="${esc(v)}" placeholder="留空 = 任意手柄" spellcheck="false">` +
+          (d.unit ? `<span class="p-unit">${d.unit}</span>` : "");
+  } else if (d.type === "calib") {
+    const c = calibOf();
+    const cv = fmtCalib(d.key === "pad_stick_gain" ? c.pad_gain : c.pad_l);
+    ctl = cv == null
+      ? `<span class="p-unit" title="尚未标定: 固件用命令行值或内置默认">未标定 (固件默认)</span>`
+      : `<span class="p-unit"><b>${esc(cv)}</b> ${esc(d.unit || "")}</span>`;
   } else if (d.type === "select") {
     ctl = `<select data-pk="${d.key}">` + d.options.map(o =>
       `<option value="${esc(o)}"${String(v) === String(o) ? " selected" : ""}>${esc(d.labels ? d.labels[o] || o : o)}</option>`).join("") + `</select>`;
@@ -523,7 +583,7 @@ function paramRow(d) {
     dirs.unshift({ v: "dataset/" + (S.selected || "game"), t: "dataset/" + (S.selected || "game") + " (建议)" });
     ctl = dynSelect(d.key, v, dirs, "未设置");
   }
-  const changed = !sameVal(v, S.savedParams[d.key]);
+  const changed = d.type !== "calib" && !sameVal(v, S.savedParams[d.key]);
   return `<div class="prow${changed ? " changed" : ""}" data-row="${d.key}">
     <div class="p-label">${esc(d.label)}
       ${badge}
@@ -568,7 +628,8 @@ function renderParamsMeta() {
   $$("#paramGroups .prow").forEach(row => {
     const k = row.dataset.row;
     const d = PARAM_DEFS.find(x => x.key === k);
-    if (d) row.classList.toggle("changed", !sameVal(S.params[k], S.savedParams[k]));
+    if (d && d.type !== "calib")
+      row.classList.toggle("changed", !sameVal(S.params[k], S.savedParams[k]));
   });
 }
 
@@ -626,6 +687,21 @@ async function stopInstance() {
     await api("/api/instance/stop", { method: "POST" });
     toast("已发送停止 (SIGTERM → 超时 SIGKILL)", "ok");
   } catch (e) { toast("停止失败: " + e.message, "err"); }
+}
+
+// 手柄标定 (pad 模式): 经热参通道下发 padcalib=1 — 固件独占右摇杆播放满偏方波
+//   (画方 → 点头/摇头), 结果回写脚本 PAD_STICK_GAIN/L_EST_PAD。回执在日志 [标定] 行。
+async function requestPadCalib() {
+  if (!confirm("开始手柄标定?\n\n① 先对准有细节的静止背景 (游戏内 = 站定不动, 画面里要有纹理; " +
+               "按住的 L3+R3 会照常透传给游戏, 请挑不会误触的场合);\n" +
+               "② 点「确定」后请不要碰右摇杆, 固件会独占右摇杆播放满偏方波 (约 11 秒);\n" +
+               "③ 成功 = 准星纵向点头两下, 失败 = 横向摇头 (画面没动/没有游戏时必然失败)。\n\n" +
+               "继续?")) return;
+  try {
+    await api("/api/instance/padcalib", { method: "POST" });
+    toast("标定请求已下发 (padcalib=1); 回执看日志 [标定] 行, 成功后 PAD_STICK_GAIN/L_EST_PAD 自动回写脚本", "ok");
+    showTab("run");
+  } catch (e) { toast("标定请求失败: " + e.message, "err"); }
 }
 
 /* ================= 渲染: 模型与运维 ================= */
@@ -851,6 +927,7 @@ function bindEvents() {
   $("#profileSel").addEventListener("change", e => selectProfile(e.target.value));
   $("#btnStart").addEventListener("click", startInstance);
   $("#btnStop").addEventListener("click", stopInstance);
+  $("#btnCalib").addEventListener("click", requestPadCalib);
   $("#btnSave").addEventListener("click", () => saveProfile().catch(e2 => toast("保存失败: " + e2.message, "err")));
   $("#btnSave2").addEventListener("click", () => saveProfile().catch(e2 => toast("保存失败: " + e2.message, "err")));
   $("#btnRevert").addEventListener("click", () => selectProfile(S.selected, { force: true }));

@@ -2,7 +2,8 @@
 //  capture.cu — ai_thread 的实现: 引擎反序列化与张量绑定, GStreamer 管道搭建
 //    (整幅预览 / 居中裁剪两种管道), 逐帧采集 → 预处理 → 推理 → 输出解析 →
 //    NMS → FOV 目标筛选 → estimator_step; 标定采样 (半分辨率 3×3 块相位
-//    相关) 与 g_calib_request 驱动的标定计算/回写, 三源截图入队与预览叠加。
+//    相关) 与 g_calib_request 驱动的标定计算/回写 (hid: S_EST/L_EST, pad:
+//    PAD_STICK_GAIN/L_EST_PAD — 单位制与 VAR 名随输出模式), 三源截图入队与预览叠加。
 // ============================================================================
 
 #include "io/capture.h"
@@ -25,13 +26,14 @@
 #include "core/estimator.h"
 #include "core/state.h"
 #include "core/trt.h"
+#include "io/pad_calib.h"      // pad 标定: 钳制带/换算/回写 VAR 名与设计带判定
 
 // conf / y_off / fov 每帧从热参数原子取快照 (帧内一致), 未收热参时值与 CLI 一致
 void ai_thread(std::string model_path, int target_cls,
                std::string cam_dev, int cam_fps, bool preview,
                float init_s, float init_l, std::string persist_path,
                std::string out_dir, int fire_ms, double auto_s,
-               int cooldown_ms, int jpeg_quality) {
+               int cooldown_ms, int jpeg_quality, bool pad_mode) {
     const int cam_w=1920, cam_h=1080;
     const float nms_iou_thr=0.45f;
     const bool collecting_enabled = !out_dir.empty();
@@ -111,6 +113,9 @@ void ai_thread(std::string model_path, int target_cls,
     EstimatorState est;
 
     float s_est=init_s, l_est=init_l;
+    // 标定的灵敏度钳制带与回写 VAR 名随输出模式 (单位制不同, 机制同一); 账本
+    //   来源经 own_motion_ledger 路由, 与模式无关地走 run_calibration 同一段数学
+    const CalibBand calib_band = pad_mode ? CALIB_BAND_PAD : CALIB_BAND_COUNTS;
     std::deque<CalibSample> hist; bool was_collecting=false;
     int collect_frames=0;
     int bs_w=cap_w/6, bs_h=cap_h/6;
@@ -231,14 +236,38 @@ void ai_thread(std::string model_path, int target_cls,
 
         if (g_calib_request.exchange(false)) {
             bool ok=false;
-            for(int it=0;it<8;++it) ok|=run_calibration(hist,s_est,l_est);
+            for(int it=0;it<8;++it) ok|=run_calibration(hist,s_est,l_est,calib_band);
+            float gain=0; bool oob=false;
+            if (ok && pad_mode) {
+                // pad: 拟合出的是 px per (偏转·ms), 换算成满偏转屏速 px/s
+                //   (×32767×1000)。带外 = 激励/背景不可信 (钳制把拟合停在带边),
+                //   按失败收尾 — 带边垃圾值不回写。
+                gain=pad_gain_from_s_rp(s_est);
+                oob=!pad_calib_accept(gain);
+                if (oob) { ok=false;
+                    std::cout<<"[标定] 失败: 摇杆增益越界 (拟合钳到 "<<gain<<" px/s, 设计带 ["
+                             <<PAD_GAIN_MIN<<","<<PAD_GAIN_MAX<<"])\n"; }
+                else s_est=pad_s_rp_from_gain(gain);   // 与运行期增益同一来源
+            }
             g_calib_done=ok?1:2;
-            if (ok) { std::cout<<"[标定] s="<<s_est<<" px/count, L="<<l_est<<" ms\n";
-                if (!persist_path.empty()) {
-                    if (persist_calibration(persist_path,s_est,l_est))
-                        std::cout<<"[标定] 已回写 "<<persist_path<<"\n";
-                    else std::cerr<<"[标定] 回写失败\n"; }
-            } else { std::cout<<"[标定] 失败: 样本 "<<hist.size()<<"/"<<collect_frames<<"\n"; }
+            if (ok) {
+                if (pad_mode) {
+                    g_pad_stick_gain.store(gain);       // 立即对 pad 拍生效
+                    std::cout<<"[标定] stick_gain="<<gain<<" px/s, L="<<l_est<<" ms\n";
+                    if (!persist_path.empty()) {
+                        if (persist_calibration(persist_path,PAD_CAL_VAR_GAIN,gain,
+                                                PAD_CAL_VAR_L,l_est))
+                            std::cout<<"[标定] 已回写 "<<persist_path<<"\n";
+                        else std::cerr<<"[标定] 回写失败\n"; }
+                } else {
+                    std::cout<<"[标定] s="<<s_est<<" px/count, L="<<l_est<<" ms\n";
+                    if (!persist_path.empty()) {
+                        if (persist_calibration(persist_path,"S_EST",s_est,"L_EST",l_est))
+                            std::cout<<"[标定] 已回写 "<<persist_path<<"\n";
+                        else std::cerr<<"[标定] 回写失败\n"; }
+                }
+            } else if (!oob)
+                std::cout<<"[标定] 失败: 样本 "<<hist.size()<<"/"<<collect_frames<<"\n";
         }
 
         if (collecting_enabled) {

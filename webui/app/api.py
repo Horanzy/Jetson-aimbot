@@ -333,6 +333,33 @@ def api_instance_stop():
     return {"ok": True}
 
 
+@app.post("/api/instance/padcalib")
+def api_instance_padcalib():
+    """「开始标定」: 向运行中的 pad 实例发一条热参 `padcalib=1` (与其它热参同一
+    UDP 通道, fire-and-forget; 固件一次消费即清, 回执看日志 [标定] 行)。
+    只对「本 WebUI 启动 + 热参可用 + 运行中的 profile 是 pad 模式」的实例生效 —
+    不满足即如实拒绝, 不盲发 (鼠标标定是双侧键长按, 不经此处)。"""
+    inst = S.inst.snapshot()
+    if inst["state"] != "running":
+        raise HTTPException(409, "实例未在运行: 标定由固件执行")
+    if inst["adopted"]:
+        raise HTTPException(409, "认领实例 (非本 WebUI 启动): 不盲发热参; 按【启动】以当前设置接管")
+    if not inst["hot_capable"]:
+        raise HTTPException(409, "运行中的二进制不支持热参数通道 (旧版固件, 重编译后启动即可)")
+    mode = "hid"
+    for p in S.scan()["profiles"]:
+        if p["file"] == inst["profile"]:
+            mode = str(p["script_params"].get("output_mode") or "hid")
+            break
+    if mode != "pad":
+        raise HTTPException(409, "运行中的实例是 %s 模式: 手柄标定仅 pad 模式可用" % mode)
+    try:
+        proc.send_hot(inst["hot_port"] or S.cfg["hot_port"], {"padcalib": 1})
+    except OSError as e:
+        raise HTTPException(502, "热参发送失败: %s (实例可能刚好退出)" % e)
+    return {"ok": True, "hint": "回执看日志 [标定] 行"}
+
+
 @app.get("/api/logs/current")
 def api_logs_current():
     return PlainTextResponse(

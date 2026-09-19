@@ -9,6 +9,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <mutex>
@@ -22,7 +23,30 @@
 //   缺省取同一推导的上一档整值, 使控制律的正常速度指令不致打满摇杆。pad 有效
 //   速度帽 = min(-x, 本值) (law_tick 内强制)。pad 模式的 s = 本值/(32767·1000)
 //   px per (偏转·ms) — 摇杆账本单位制下的自身运动换算系数。
+// 运行期值经 -G 给出并被 pad 标定回写覆盖 (g_pad_stick_gain, 见 io/pad_calib.h);
+//   本常量只是缺省与设计点 (标定值带的中心)。
 const float PAD_STICK_GAIN_DEFAULT = 3000.0f;
+// 满偏屏速设计带 (px/s): 标定值的可信域 = 设计点的一个数量级。下界 300 = 物理
+//   必需屏速 (2000 px/s) 的 1/10 — 比"必须能跟上的下界"还慢十倍的全偏转屏速
+//   无法用于注入, 触发它只可能是测量失败; 上界 30000 = 设计点的 10 倍, 即
+//   120fps 下 250px/帧的屏移 — 超出块相位相关的测量量程 (半分辨率块 106px)。
+//   标定结果落带外按失败收尾, 不回写 (见 pad_calib_accept)。
+const float PAD_GAIN_MIN = 300.0f, PAD_GAIN_MAX = 30000.0f;
+
+// 运行期满偏转屏速 (px/s): 注入换算 (pad_merge) 与 pad 速度帽 (law_tick) 共用
+//   的唯一来源; 启动值 = -G 或 PAD_STICK_GAIN_DEFAULT (均经设计带钳制), pad
+//   标定成功后由 AI 线程 (io/capture.cu) 更新 — 立即对手柄拍生效。
+extern std::atomic<float> g_pad_stick_gain;
+
+float pad_gain_clamp(float gain);
+// 单位换算: 满偏屏速 (px/s) ↔ 摇杆账本单位制灵敏度 s_rp (px per 偏转·ms)。
+//   两者是同一物理量的两种单位, 恒等式: s_rp × 32767 × 1000 = 满偏屏速。
+inline float pad_s_rp_from_gain(float gain) {
+    return gain / ((float)PAD_AXIS_MAX * 1000.0f);
+}
+inline float pad_gain_from_s_rp(float s_rp) {
+    return s_rp * (float)PAD_AXIS_MAX * 1000.0f;
+}
 
 // 摇杆账本: 每 tick 游戏侧将收到的右摇杆合并偏转 (人类+注入, ±32767 钳制后)
 //   × 实际拍时长 (偏转·ms), 结构与窗口同 CountsHistory。g_counts 不变式 3
@@ -64,8 +88,15 @@ PadLogical pad_publish_snapshot(uint64_t* seq = nullptr);
 PadLogical pad_merge(const PadLogical& human, float aim_vx, float aim_vy,
                      float stick_gain, std::chrono::steady_clock::time_point now);
 
-// pad 控制拍 (main 主循环调用, 拍率 = DEFAULT_FREQ): 人类态快照 → RT/LT 触发
-//   键位字 (fire→LEFT_KEY, ads→RIGHT_KEY, 复用律的 -k 语义与 KEEP_ALIVE 窗)
-//   → control_apply_pad 取期望速度 → pad_merge 合并+账本 → 发布点覆盖写 →
-//   --pad-dump 节流打印。输出后端只消费发布点, 不进入本函数。
+// 标定激励的右摇杆注入 (pad 标定独占该轴, 见 io/pad_calib.h): 输出右摇杆 = 激励
+//   偏转 (±32767) 本身, 人类右摇杆被忽略 (人类若同时推杆会污染激励), 其余字段
+//   逐位直通人类态。与 pad_merge 同一入账路径 — 拟合的账本就是这条账本。
+PadLogical pad_excite(const PadLogical& human, int16_t dx, int16_t dy,
+                      std::chrono::steady_clock::time_point now);
+
+// pad 控制拍 (main 主循环调用, 拍率 = DEFAULT_FREQ): 人类态快照 → pad 标定拍
+//   (io/pad_calib.h: L3+R3 长按或热参触发; 标定期独占右摇杆并跳过律) → 否则
+//   RT/LT 触发键位字 (fire→LEFT_KEY, ads→RIGHT_KEY, 复用律的 -k 语义与
+//   KEEP_ALIVE 窗) → control_apply_pad 取期望速度 → pad_merge 合并+账本 →
+//   发布点覆盖写 → --pad-dump 节流打印。输出后端只消费发布点, 不进入本函数。
 void pad_tick(int cam_fps, PadState& in, bool dump);

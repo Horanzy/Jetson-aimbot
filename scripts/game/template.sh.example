@@ -9,14 +9,22 @@
 #  控制律带宽由标定延迟 L 自动导出, 无手调参数 —— 换游戏只需重标定, 不用调律。
 #  路径全部相对脚本自身解析 (realpath 向上找 ROOT), 整个目录可以随意移动/改名。
 #
-#  标定: 游戏内对准有细节的静止背景, 双侧键长按 5 秒 (画正方形 → 点头/摇头);
-#        成功后固件自动把 S_EST / L_EST 回写到本脚本 (原子替换), 无需手改。
+#  标定 (两套, 互不覆盖): 鼠标模式双侧键长按 5 秒, 手柄模式 L3+R3 长按 5 秒 —
+#        都是"对准有细节的静止背景 → 画正方形/满偏方波 → 点头(成功)/摇头(失败)";
+#        成功后固件自动把标定值回写到本脚本 (原子替换), 无需手改:
+#          鼠标 hid → S_EST / L_EST           (px/count, ms)
+#          手柄 pad → PAD_STICK_GAIN / L_EST_PAD (满偏转屏速 px/s, ms)
+#        手柄标定也可以从 WebUI 运行页的「开始标定」按钮触发 (热参 padcalib=1)。
 # ==============================================================================
 
 # ---- 路径 ----
 ROOT="$(cd "$(dirname "$(realpath "$0")")/../.." && pwd)"
 APP="$ROOT/bin/aimbot"
 MODEL_PATH="$ROOT/engine/example.engine"   # ← 改成 engine/ 下你实际转好的模型
+
+# ---- 输出模式 (hid = USB 鼠标 / pad = XInput 手柄; 互斥, 一次运行只居其一) ----
+OUTPUT_MODE="hid"   # hid / pad
+PAD_KEYWORD=""      # pad: 手柄 by-id 匹配子串 (空 = 任意 *-event-joystick 节点)
 
 # ---- 自瞄参数 ----
 CLASS_ID=0          # 目标类别 (依模型标签: 0=头 1=身)
@@ -47,16 +55,30 @@ COOLDOWN_MS=800             # 检测/定时截图冷却 ms (开火不受限)
 JPEG_Q=95                   # JPEG 质量
 
 # ---- 标定数据 [首次运行前为固件默认值; 标定成功后自动回写, 请勿手改] ----
-# 下面的 1.0 / 60.0 就是固件内置默认 (等价于命令行不给 -s/-l)。它们只是占位:
-# 没有标定过就直接跑, 准星跟随会明显偏慢或偏快。先标定, 再谈手感。
+# 下面四行都是占位 (行内留白是给回写值的; 固件回写整行替换): 没标定过就直接跑,
+# 准星跟随会明显偏慢或偏快 —— 先标定, 再谈手感。
+#   鼠标模式用 S_EST (灵敏度 px/count) / L_EST (回路延迟 ms), 双侧键长按 5s 标定;
+#   手柄模式用 PAD_STICK_GAIN (满偏转屏速 px/s) / L_EST_PAD (延迟 ms), L3+R3 长按 5s
+#   标定 — 两套独立存放, 互不覆盖。
+#   PAD_STICK_GAIN 的 3000px/s 缺省取值依据见固件头常量 (AGENTS.md 速度帽推导的
+#   上一档: 行为库最快屏速 ≈2000px/s 必须能跟上)。
 S_EST=1.0
 L_EST=60.0
+PAD_STICK_GAIN=3000.0
+L_EST_PAD=60.0
 
 # ==============================================================================
 sudo jetson_clocks
 sudo bash "$ROOT/scripts/setup_mouse.sh"
 
 SCRIPT_PATH="$(realpath "$0")"
+
+# 模式参数: hid 用鼠标标定值 (-s/-l), pad 用手柄标定值与手柄选择 (-M/-P/-G/-l)
+if [ "$OUTPUT_MODE" = "pad" ]; then
+  MODE_ARGS=(-M pad -P "$PAD_KEYWORD" -G "$PAD_STICK_GAIN" -l "$L_EST_PAD")
+else
+  MODE_ARGS=(-s "$S_EST" -l "$L_EST")
+fi
 
 CAPTURE_ARGS=()
 if [ "$CAPTURE" = "y" ]; then
@@ -76,8 +98,7 @@ sudo "$APP" \
   -d "$CAM_DEV" \
   -f "$CAM_FPS" \
   -x "$MAX_SPEED" \
-  -s "$S_EST" \
-  -l "$L_EST" \
+  "${MODE_ARGS[@]}" \
   -S "$SCRIPT_PATH" \
   -k "$AIM_KEY" \
   -a "$AIM_ENABLED" \

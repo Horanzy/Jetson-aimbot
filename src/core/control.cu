@@ -19,7 +19,7 @@
 
 #include "core/calib.h"
 #include "core/state.h"
-#include "io/pad_output.h"     // own_motion_ledger + PAD_STICK_GAIN_DEFAULT:
+#include "io/pad_output.h"     // own_motion_ledger + g_pad_stick_gain:
                                //   自身运动账本来源与 pad 速度帽随输出模式
 
 namespace {
@@ -92,7 +92,7 @@ void law_tick(int cam_fps, int16_t real_x, int16_t real_y, uint16_t btns, bool p
             double age=elapsed_ms(now,tp);
             if (valid&&age<TARGET_STALE_MS) {
                 float max_v=g_max_v.load(); const float fov_r=g_fov_radius.load();
-                if (pad) max_v=std::min(max_v,PAD_STICK_GAIN_DEFAULT/1000.0f);  // 注入通道满偏转屏速 = pad 物理速度帽
+                if (pad) max_v=std::min(max_v,g_pad_stick_gain.load()/1000.0f);  // 注入通道满偏转屏速 = pad 物理速度帽
                 float Lc=le*PRED_L_COMP;
                 auto cp=own_motion_ledger().at(shift_ms(tp,-(double)Lc));
                 auto cn=own_motion_ledger().cum();

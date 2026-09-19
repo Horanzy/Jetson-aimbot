@@ -17,8 +17,12 @@ VAR_RE = re.compile(r"^\s*([A-Z_][A-Z0-9_]*)\s*=\s*(.*?)\s*$")
 SCRIPT_STEM_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 # 参数定义: 类型/范围与服务端校验 (与 CLI/固件钳制一致, 双保险)
+#   output_mode: hid (USB raw_gadget 鼠标) / pad (XInput 手柄输出) — 两种模式
+#   互斥, 切换要重启进程, 故为冷参数; pad 组的其余项只在 pad 模式可见。
 PARAM_DEFS = {
     "model":           dict(kind="path",  default=None),
+    "output_mode":     dict(kind="enum",  choices=("hid", "pad"), default="hid"),
+    "pad_keyword":     dict(kind="str",   default=""),
     "class_id":        dict(kind="int",   lo=0, hi=255, default=0),
     "conf":            dict(kind="float", lo=0.0, hi=1.0, default=0.5),
     "y_offset":        dict(kind="float", lo=0.0, hi=100.0, default=65.0),
@@ -52,7 +56,13 @@ SCRIPT_VARS = {
     "CAP_AUTO": "cap_auto", "OUT_DIR": "capture_dir", "FIRE_MS": "fire_ms",
     "AUTO_S": "auto_s", "COOLDOWN_MS": "cooldown_ms", "JPEG_Q": "jpeg_q",
     "MODEL_PATH": "model", "FOV_R": "fov",
+    "OUTPUT_MODE": "output_mode", "PAD_KEYWORD": "pad_keyword",
 }
+
+# 标定回写量 (脚本 VAR → calib 键): 归固件写, WebUI 只读显示、从不写回 —
+#   hid 一套 (S_EST/L_EST), pad 一套 (PAD_STICK_GAIN px/s / L_EST_PAD ms),
+#   两套互不覆盖
+CALIB_VARS = {"S_EST": "s", "L_EST": "l", "PAD_STICK_GAIN": "pad_gain", "L_EST_PAD": "pad_l"}
 
 
 def root_status(root: Path):
@@ -105,7 +115,7 @@ def _coerce(key: str, val: str, root: Path):
 def parse_script(path: Path, root: Path):
     """只读解析 game 脚本顶部 VAR=value 块。返回 (params, calib)。"""
     params = {k: d["default"] for k, d in PARAM_DEFS.items()}
-    calib = {"s": None, "l": None}
+    calib = {v: None for v in CALIB_VARS.values()}
     try:
         text = path.read_text(encoding="utf-8-sig", errors="replace")   # 脚本带 BOM
     except OSError:
@@ -120,9 +130,9 @@ def parse_script(path: Path, root: Path):
         if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
             v = v[1:-1]
         v = v.replace("$ROOT", str(root))
-        if name in ("S_EST", "L_EST"):
+        if name in CALIB_VARS:                 # 固件回写量: 只读, 不进 params
             try:
-                calib["s" if name == "S_EST" else "l"] = float(v)
+                calib[CALIB_VARS[name]] = float(v)
             except ValueError:
                 pass
             continue

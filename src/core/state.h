@@ -43,6 +43,7 @@ void signal_handler(int);
 extern std::atomic<bool> g_calib_collect;
 extern std::atomic<bool> g_calib_request;
 extern std::atomic<int>  g_calib_done;               // 0=计算中 1=成功 2=失败
+extern std::atomic<bool> g_padcalib_request;         // pad 标定请求 (热参 padcalib=1): 一次消费即清
 
 extern std::atomic<bool> g_left_down;
 
@@ -84,8 +85,9 @@ extern TargetState g_target;
 
 // ---- counts 历史 ----
 // 回溯深度 = 3s 墙钟的拍数: 标定采样窗 (~300 帧 ≈ 2.5s @120fps) 加每样本的延迟
-//   回溯 (lag+dt, ≤ ~0.3s) 必须整体落在其中 — run_calibration 按 g_counts.at(t−lag)
-//   查询, 深度以拍计会随拍率缩水, 故按墙钟表达
+//   回溯 (lag+dt, ≤ ~0.3s) 必须整体落在其中 — 标定按 账本.at(t−lag) 查询
+//   (hid = 本对象, pad = 摇杆账本, 见 io/pad_output.h), 深度以拍计会随拍率
+//   缩水, 故按墙钟表达; 两个账本 (本对象与摇杆账本) 同窗口同结构
 const size_t COUNTS_HIST_TICKS = (size_t)3 * DEFAULT_FREQ;
 class CountsHistory {
 public:

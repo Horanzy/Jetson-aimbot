@@ -1,6 +1,7 @@
 // ============================================================================
 //  hotctl.cu — hotctl_thread 的实现: loopback-only UDP 套接字, 白名单外的
 //    key=value 整对忽略, 数值/枚举/布尔各自的钳制与拒绝, 应用即打印。
+//    白名单: t/y/x/fov (数值) · k (枚举) · aim/cap_*/padcalib (0/1)。
 // ============================================================================
 
 #include "io/hotctl.h"
@@ -28,7 +29,7 @@ void hotctl_thread() {
     if (bind(fd,(sockaddr*)&addr,sizeof(addr))<0) {
         std::cerr<<"⚠ 热参数通道绑定失败 (端口 "<<HOT_CTL_PORT<<" 被占), 热参不可用\n";
         close(fd); return; }
-    std::cout<<"✅ 热参数通道: 127.0.0.1:"<<HOT_CTL_PORT<<" (t/y/x/fov/k/aim/cap_*)\n";
+    std::cout<<"✅ 热参数通道: 127.0.0.1:"<<HOT_CTL_PORT<<" (t/y/x/fov/k/aim/cap_*/padcalib)\n";
     struct pollfd pfd{}; pfd.fd=fd; pfd.events=POLLIN;
     char buf[256];
     while (global_running) {
@@ -56,13 +57,17 @@ void hotctl_thread() {
                 if (m>=0) { g_aim_mode.store(m); std::cout<<"[热参] k="<<val<<"\n"; }
                 else std::cout<<"[热参] 忽略 k="<<val<<" (须 fire/ads/both)\n";
             } else if (!strcmp(key,"aim")||!strcmp(key,"cap_fire")
-                       ||!strcmp(key,"cap_det")||!strcmp(key,"cap_auto")) {
+                       ||!strcmp(key,"cap_det")||!strcmp(key,"cap_auto")
+                       ||!strcmp(key,"padcalib")) {
                 if (!strcmp(val,"0")||!strcmp(val,"1")) {
                     bool on=(val[0]=='1');
                     if      (!strcmp(key,"aim"))      g_aim_enabled.store(on);
                     else if (!strcmp(key,"cap_fire")) g_cap_fire.store(on);
                     else if (!strcmp(key,"cap_det"))  g_cap_det.store(on);
-                    else                              g_cap_auto.store(on);
+                    else if (!strcmp(key,"cap_auto")) g_cap_auto.store(on);
+                    // padcalib: 1 = 请求开始手柄标定 (pad 拍一次消费即清, 与
+                    //   g_calib_request 同一 exchange 语义); 0 = 无操作
+                    else                              g_padcalib_request.store(on);
                     std::cout<<"[热参] "<<key<<"="<<val<<"\n";
                 } else std::cout<<"[热参] 忽略 "<<key<<"="<<val<<" (须 0/1)\n";
             } else {

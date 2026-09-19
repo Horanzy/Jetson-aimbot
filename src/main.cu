@@ -22,13 +22,17 @@
 //    速度折算成右摇杆注入偏转与人类通道合并 (±满偏钳制), 账本 Σ(偏转·ms) 供
 //    估计器自身运动补偿; 合并后的最终逻辑态经发布点交给 XInput 输出后端
 //    (0x045E/0x028E 全速设备, 见 io/pad_xinput), --pad-dump 在此之上叠加打印
-//    合并逻辑态。
+//    合并逻辑态。手柄标定 (-G 满偏转屏速 + L_EST_PAD) 与鼠标标定完全独立:
+//    L3+R3 长按 5 秒或热参 padcalib=1 触发, 标定期固件独占右摇杆播放满偏方波,
+//    结果回写脚本的 PAD_STICK_GAIN/L_EST_PAD (见 io/pad_calib.h)。
 //
-//  热参数: UDP 127.0.0.1 上的极小本地控制通道 (白名单 t/y/x/fov/k/aim/cap_*, 固件侧强制
-//    钳制), webui 保存后即时生效不重启; 结构常量仍为编译期, 与"无手调魔法数字"哲学一致。
+//  热参数: UDP 127.0.0.1 上的极小本地控制通道 (白名单 t/y/x/fov/k/aim/cap_*/padcalib,
+//    固件侧强制钳制), webui 保存后即时生效不重启; 结构常量仍为编译期, 与"无手调魔法数字"哲学一致。
 //
-//  标定: 双侧键长按 5 秒, 程序自动生成激励轨迹 (画正方形), 块相位相关测背景位移,
-//    最小二乘估计灵敏度 s (px/count) + 环路延迟 L (ms); 经 -S 传入脚本路径时自动回写。
+//  标定: 鼠标模式双侧键长按 5 秒 (画正方形) 估 s (px/count) + L (ms),
+//    手柄模式 L3+R3 长按 5 秒 (满偏方波) 估满偏转屏速 + L (ms);
+//    块相位相关测背景位移, 最小二乘 + 延迟双扫; 经 -S 传入脚本路径时自动回写
+//    (hid → S_EST/L_EST, pad → PAD_STICK_GAIN/L_EST_PAD, 两套互不覆盖)。
 //
 //  本文件为程序入口: 参数解析, 设备打开, 线程孵化与 timerfd 控制主循环
 //    (拍率 = DEFAULT_FREQ, 见 core/state.h);
@@ -78,7 +82,7 @@ int main(int argc, char* argv[]) {
 
     std::string a_m,a_c,a_t,a_y,a_d,a_f,a_x,a_s,a_l,a_S,a_k,a_v,a_r;
     std::string a_o,a_a,a_e; bool have_e=false;
-    std::string a_M,a_P; bool pad_dump=false;
+    std::string a_M,a_P,a_G; bool pad_dump=false;
     int fire_ms=300; double auto_s=10;
     int cooldown_ms=500; int jpeg_q=95;
 
@@ -106,6 +110,7 @@ int main(int argc, char* argv[]) {
         else if (arg=="-r"&&i+1<argc) a_r=argv[++i];
         else if (arg=="-M"&&i+1<argc) a_M=argv[++i];
         else if (arg=="-P"&&i+1<argc) a_P=argv[++i];
+        else if (arg=="-G"&&i+1<argc) a_G=argv[++i];
         else if (arg=="--pad-dump") pad_dump=true;
         else if (arg=="-h"||arg=="--help") {
             std::cout<<"用法: "<<argv[0]<<" [自瞄选项] [采集选项]\n"
@@ -127,8 +132,10 @@ int main(int argc, char* argv[]) {
                 "\n手柄模式选项 (-M pad; 与鼠标 hid 模式互斥, 缺省 hid):\n"
                 "  -M <模式>  hid=USB raw_gadget 鼠标 / pad=XInput 手柄输出 + 物理手柄输入\n"
                 "  -P <子串>  手柄 /dev/input/by-id 匹配子串 (默认任意 *-event-joystick 节点)\n"
+                "  -G <px/s>  满偏转屏速 (pad 摇杆增益, 默认 3000; 手柄标定成功后自动回写)\n"
                 "  --pad-dump 叠加调试输出: ≥50ms 打印合并后逻辑态 (透传/注入验证)\n"
-                "             pad 有效速度帽 = min(-x, 满偏转屏速 3000px/s)\n";
+                "             pad 有效速度帽 = min(-x, 满偏转屏速)\n"
+                "             pad 标定: L3+R3 长按 5s, 或热参 padcalib=1\n";
             return 0;
         }
     }
@@ -167,11 +174,16 @@ int main(int argc, char* argv[]) {
     const bool pad_mode=(out_mode=="pad");
     const std::string pad_kw=a_P.empty()?DEFAULT_PAD_KEYWORD:a_P;
     if (pad_dump&&!pad_mode) std::cout<<"⚠ 忽略 --pad-dump (仅 pad 模式)\n";
-    // pad 模式的 s = s_rp (px per 偏转·ms = stick_gain/(32767·1000)): 摇杆账本
+    if (!a_G.empty()&&!pad_mode) std::cout<<"⚠ 忽略 -G (仅 pad 模式: 满偏转屏速)\n";
+    // 满偏转屏速 (pad 摇杆增益 px/s): -G 或设计缺省, 均经设计带钳制; pad 标定
+    //   成功后由 AI 线程回写并即时生效 (io/pad_calib.h)
+    const float pad_gain=pad_gain_clamp(a_G.empty()
+        ? PAD_STICK_GAIN_DEFAULT : std::stof(a_G));
+    // pad 模式的 s = s_rp (px per 偏转·ms = gain/(32767·1000)): 摇杆账本
     //   单位制下的自身运动换算系数, 估计器/控制律经 own_motion_ledger 路由消费;
     //   hid 模式的 s = px/count (标定/回写语义, [S_MIN,S_MAX] 钳制)
     float init_s=pad_mode
-        ? PAD_STICK_GAIN_DEFAULT/(PAD_AXIS_MAX*1000.0f)
+        ? pad_s_rp_from_gain(pad_gain)
         : std::clamp(std::stof(a_s.empty()?"1.0":a_s),S_MIN,S_MAX);
     float init_l=std::clamp(std::stof(a_l.empty()?"60":a_l),L_MIN,L_MAX);
 
@@ -198,6 +210,7 @@ int main(int argc, char* argv[]) {
     g_aim_mode.store(aim_mode); g_fov_radius.store(fov_r);
     g_aim_enabled.store(aim_on);
     g_cap_fire.store(fire_on); g_cap_det.store(det_on); g_cap_auto.store(auto_on);
+    if (pad_mode) g_pad_stick_gain.store(pad_gain);
 
     const bool do_collect=!a_o.empty();
     if (do_collect) { ensure_dir(a_o); ensure_dir(a_o+"/fire");
@@ -224,13 +237,15 @@ int main(int argc, char* argv[]) {
     own_motion_ledger_set(pad_mode);
 
     if (pad_mode)
-        std::cout<<"初始: stick_gain="<<PAD_STICK_GAIN_DEFAULT<<"px/s (s_rp="<<init_s
+        std::cout<<"初始: stick_gain="<<pad_gain<<"px/s (s_rp="<<init_s
                  <<") L="<<init_l<<" fov="<<fov_r<<"\n";
     else
         std::cout<<"初始: s="<<init_s<<" L="<<init_l<<" fov="<<fov_r<<"\n";
     if (pad_mode) {
         std::cout<<"模式: pad (XInput 手柄输出 0x045E/0x028E + 物理手柄全透传"
                  <<(pad_dump?", --pad-dump 叠加打印":"")<<")\n";
+        std::cout<<"标定: L3+R3 长按 5s, 或 webui「开始标定」(热参 padcalib=1) — "
+                    "标定期固件独占右摇杆播放满偏方波, 成功点头/失败摇头\n";
         std::cout<<"辅助瞄准注入: "<<(aim_on?"开":"关 (纯透传: 手柄原样, 检测/采集照常)")<<"\n";
     } else {
         std::cout<<"鼠标接管: "<<(aim_on?"开":"关 (纯透传: 不注入移动, 检测/采集照常)")<<"\n";
@@ -258,7 +273,7 @@ int main(int argc, char* argv[]) {
     std::thread hot(hotctl_thread);
     std::thread ai(ai_thread,model_path,cls,cam_dev,cam_fps,preview,
                    init_s,init_l,persist_path,
-                   a_o,fire_ms,auto_s,cooldown_ms,jpeg_q);
+                   a_o,fire_ms,auto_s,cooldown_ms,jpeg_q,pad_mode);
 
     int tfd=timerfd_create(CLOCK_MONOTONIC,0);
     struct itimerspec its{}; its.it_value.tv_nsec=1;

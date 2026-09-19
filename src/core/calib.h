@@ -1,9 +1,16 @@
 // ============================================================================
-//  calib.h — 灵敏度 s (px/count) 与环路延迟 L (ms) 的在线标定: 最小二乘估计 +
-//    延迟粗/细双扫 (run_calibration), S_EST/L_EST 脚本原子回写
-//    (persist_calibration), 采集卡设备名解析 (resolve_cam_device), 以及
-//    CalibSeg 激励轨迹表 — 轨迹由 core/control.cu 的标定状态机播放, 采样在
+//  calib.h — 灵敏度与环路延迟 L (ms) 的在线标定: 最小二乘估计 + 延迟粗/细双扫
+//    (run_calibration), 标定值脚本原子回写 (persist_calibration), 采集卡设备名
+//    解析 (resolve_cam_device), 以及 CalibSeg 激励轨迹表 — 轨迹由标定状态机
+//    播放 (hid: core/control.cu 的 law_tick, pad: io/pad_calib.cu), 采样在
 //    io/capture.cu (块相位相关, 不依赖 AI 检测)。
+//
+//  灵敏度单位制随输出模式, 拟合数学与回写机制两模式共用:
+//    hid: px/count, 账本 = g_counts (鼠标实际 counts)
+//    pad: px per (偏转·ms), 账本 = 摇杆账本 (合并偏转 × 拍时长), 满偏屏速 =
+//         灵敏度 × PAD_AXIS_MAX × 1000 (io/pad_calib.h)
+//  账本来源经 own_motion_ledger() 取 — 模式路由, 消费端数学逐字符一致;
+//  唯一随模式变的是灵敏度钳制带 (CalibBand)。
 // ============================================================================
 
 #pragma once
@@ -43,6 +50,18 @@ inline const CalibSeg CAL_END_FAIL_SEQ[] = {
 
 struct CalibSample { std::chrono::steady_clock::time_point t; float dt_ms,sx,sy; };
 
-bool run_calibration(const std::deque<CalibSample>& hist, float& s_est, float& l_est);
-bool persist_calibration(const std::string& path, float s, float l);
+// 灵敏度钳制带 (单位制随模式: hid = px/count, pad = px per 偏转·ms): 拟合结果
+//   落带外说明激励/背景不可信, 钳到带边是兜底。hid 侧就是既有的 S_MIN/S_MAX;
+//   pad 侧的带由满偏屏速设计带换算 (io/pad_calib.h)。
+struct CalibBand { float s_min, s_max; };
+inline const CalibBand CALIB_BAND_COUNTS{S_MIN, S_MAX};
+
+bool run_calibration(const std::deque<CalibSample>& hist, float& s_est, float& l_est,
+                     const CalibBand& band);
+
+// 标定回写: VAR 名由调用方给出 (hid: S_EST/L_EST, pad: PAD_STICK_GAIN/L_EST_PAD,
+//   见 io/pad_calib.h) — 只替换以该名开头的行为值 (缺行则追加到已知变量之后),
+//   临时文件 + rename 原子替换, 原文件权限/属主继承; 机制与名无关, 两套互不覆盖。
+bool persist_calibration(const std::string& path, const char* var_s, float s,
+                         const char* var_l, float l);
 std::string resolve_cam_device(const std::string& spec);
