@@ -12,23 +12,34 @@
 #include <deque>
 #include <string>
 
-// ========================= 标定 =========================
-const int   CALIB_TRIGGER_TICKS    = 2500;           // 双侧键长按 5s @500Hz
+#include "core/state.h"        // DEFAULT_FREQ / ms_to_ticks — 拍数一律按墙钟导出
+
+// ========================= 标定 (以拍计的时长由墙钟导出, 换拍率不改语义) =========================
+const int   CALIB_TRIGGER_TICKS    = ms_to_ticks(5000);   // 双侧键长按 5s
 const int   CALIB_WINDOW           = 90;             // 最少样本帧数
 const float CALIB_MIN_EXCITE       = 4000.0f;        // 最小 ΣC² 激发量
 const float S_MIN = 0.05f, S_MAX = 20.0f;
 const float L_MIN = 0.0f,  L_MAX = 200.0f;
-const int   CALIB_WAIT_TIMEOUT     = 1000;           // 等待计算超时 @500Hz
+const int   CALIB_WAIT_TIMEOUT     = ms_to_ticks(2000);   // 等待计算超时 2s
 
 struct CalibSeg { int dx, dy, ticks; };
-inline const CalibSeg CAL_START_SEQ[] = {{3,0,120},{0,3,120},{-3,0,120},{0,-3,120},{0,0,250}};
-inline const CalibSeg CAL_SETTLE_SEQ[] = {{0,0,150}};
+// 激励轨迹: 每拍位移 (counts) × 拍数; 拍数由段墙钟时长导出, 段速度为设计量 —
+//   激励方波 2px/拍 = 2000 counts/s (s=1 时即速度帽量级), 收尾甩动 4px/拍 =
+//   4000 counts/s。起始方块是纯视觉开始信号 (采样自激励段才开始): 3px→1.5px
+//   非整数, 取 2px/拍 与激励同速。
+inline const CalibSeg CAL_START_SEQ[] = {
+    {2,0,ms_to_ticks(240)},{0,2,ms_to_ticks(240)},{-2,0,ms_to_ticks(240)},{0,-2,ms_to_ticks(240)},
+    {0,0,ms_to_ticks(500)}};
+// 激励方波单圈基元: 每边 2px × 250ms = 500 counts (control.cu 重复 5 圈)
+inline const CalibSeg CAL_EXCITE_SEQ[] = {
+    {2,0,ms_to_ticks(250)},{0,2,ms_to_ticks(250)},{-2,0,ms_to_ticks(250)},{0,-2,ms_to_ticks(250)}};
+inline const CalibSeg CAL_SETTLE_SEQ[] = {{0,0,ms_to_ticks(300)}};
 inline const CalibSeg CAL_END_OK_SEQ[] = {
-    {0,8,30},{0,-8,30},{0,8,30},{0,-8,30},{0,8,30},{0,-8,30}
-};
+    {0,4,ms_to_ticks(60)},{0,-4,ms_to_ticks(60)},{0,4,ms_to_ticks(60)},
+    {0,-4,ms_to_ticks(60)},{0,4,ms_to_ticks(60)},{0,-4,ms_to_ticks(60)}};
 inline const CalibSeg CAL_END_FAIL_SEQ[] = {
-    {8,0,30},{-8,0,30},{8,0,30},{-8,0,30},{8,0,30},{-8,0,30}
-};
+    {4,0,ms_to_ticks(60)},{-4,0,ms_to_ticks(60)},{4,0,ms_to_ticks(60)},
+    {-4,0,ms_to_ticks(60)},{4,0,ms_to_ticks(60)},{-4,0,ms_to_ticks(60)}};
 
 struct CalibSample { std::chrono::steady_clock::time_point t; float dt_ms,sx,sy; };
 

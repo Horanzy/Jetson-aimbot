@@ -24,7 +24,8 @@
 //  标定: 双侧键长按 5 秒, 程序自动生成激励轨迹 (画正方形), 块相位相关测背景位移,
 //    最小二乘估计灵敏度 s (px/count) + 环路延迟 L (ms); 经 -S 传入脚本路径时自动回写。
 //
-//  本文件为程序入口: 参数解析, 设备打开, 线程孵化与 500Hz timerfd 主循环;
+//  本文件为程序入口: 参数解析, 设备打开, 线程孵化与 timerfd 控制主循环
+//    (拍率 = DEFAULT_FREQ, 见 core/state.h);
 //    模块划分 — core/ (控制律/估计器/标定/TRT 辅助/共享状态), io/ (采集/HID 鼠标/热参)。
 // ============================================================================
 
@@ -211,7 +212,7 @@ int main(int argc, char* argv[]) {
     struct epoll_event evt{}; evt.events=EPOLLIN; evt.data.fd=tfd;
     epoll_ctl(ep,EPOLL_CTL_ADD,tfd,&evt);
 
-    std::cout<<"✅ 500Hz 运行中, Ctrl+C 停止\n";
+    std::cout<<"✅ "<<DEFAULT_FREQ<<"Hz 运行中, Ctrl+C 停止\n";
     while (global_running) {
         struct epoll_event evs[1];
         int nf=epoll_wait(ep,evs,1,500);

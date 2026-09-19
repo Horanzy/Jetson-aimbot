@@ -35,4 +35,10 @@ done
 # shellcheck disable=SC2086
 $NVCC $OBJS $LIBS $OCV -lopencv_imgcodecs $TRT -o "$BIN/aimbot"
 
+# 标定墙钟单测: 仅 calib.h 头常数断言, 无需链接模块对象
+# shellcheck disable=SC2086
+$NVCC -c "$SRC/core/calib_test.cu" $NVCC_FLAGS $INCLUDES -o "$BUILD/calib_test.o"
+$NVCC "$BUILD/calib_test.o" $LIBS -o "$BUILD/calib_test"
+"$BUILD/calib_test"
+
 echo "✅ 编译完成 → $BIN"

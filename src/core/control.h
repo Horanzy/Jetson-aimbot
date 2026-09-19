@@ -2,8 +2,8 @@
 //  control.h — ff_pi_acc 控制律头常数区 (结构参数, 编译期, 无手调参数):
 //    收敛带宽 wn 由标定延迟 L 自动导出 (wn=(90°−PM)π/180/L), 阻尼比/前馈增益/
 //    CUSUM 与 â 通道参数均给出物理出处; 触发键位与接管保持窗。各常量的推导
-//    与调整指引见 AGENTS.md "Tuning" 与 arena/laws/ff_pi_acc.py; 500Hz 控制
-//    律执行 (control_apply) 在 control.cu。
+//    与调整指引见 AGENTS.md "Tuning" 与 arena/laws/ff_pi_acc.py; 控制律按拍
+//    执行 (control_apply, 拍率 = DEFAULT_FREQ) 在 control.cu。
 // ============================================================================
 
 #pragma once
@@ -48,7 +48,7 @@ const uint16_t BOTH_SIDE_KEYS = SIDE_KEY | SIDE_KEY2; // 双侧键: 标定触发
 
 const int KEEP_ALIVE_MS = 200;                       // 松开触发键后保持自瞄的时间
 
-// 500Hz 控制 tick: 把自瞄指令 (counts) 与标定激励序列合成进 HID 报文的位移字节;
+// 控制拍 (周期 TICK_MS): 把自瞄指令 (counts) 与标定激励序列合成进 HID 报文的位移字节;
 //  纯透传 (-a n / 热参 aim=0) 时不注入。cam_fps 用于丢帧期前馈衰减的时间尺度,
 //  rpt 为 HID_REPORT_LEN 字节报文缓冲 (只改写位移字节)。
 void control_apply(int cam_fps, uint8_t* rpt, int16_t real_x, int16_t real_y);

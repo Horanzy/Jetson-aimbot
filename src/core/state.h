@@ -24,7 +24,7 @@
 
 // ========================= 系统常量 =========================
 constexpr size_t HID_REPORT_LEN  = 9;
-constexpr int    DEFAULT_FREQ    = 500;              // 透传频率 Hz
+constexpr int    DEFAULT_FREQ    = 1000;             // 控制拍频率 Hz (透传与控制律同一节拍)
 constexpr const char* DEFAULT_KEYWORD  = "";         // 空 = 匹配任意 *-event-mouse 设备
 constexpr const char* DEFAULT_VIRT_DEV = "/dev/hidg0";
 constexpr const char* DEV_SEARCH_PATH  = "/dev/input/by-id/";
@@ -33,6 +33,9 @@ const float FOV_RADIUS   = 150.0f;                   // FOV 半径默认值 (px)
 const int   HOT_CTL_PORT = 47700;                    // 热参数通道端口 (UDP, 仅绑 127.0.0.1)
 const int   CAP_SIZE     = 640;                      // 最小采集边长 (px): 模型输入更小时也按此尺寸采集, 再居中裁到模型输入
 const float TICK_MS      = 1000.0f / DEFAULT_FREQ;   // 控制节拍周期 (ms)
+
+// 拍数表达: 一切以拍计的时长一律由墙钟导出 (ms→拍), 换拍率不改语义
+constexpr int ms_to_ticks(int ms) { return ms * DEFAULT_FREQ / 1000; }
 
 // ========================= 全局状态 =========================
 extern std::atomic<bool> global_running;
@@ -81,6 +84,10 @@ struct TargetState {
 extern TargetState g_target;
 
 // ---- counts 历史 ----
+// 回溯深度 = 3s 墙钟的拍数: 标定采样窗 (~300 帧 ≈ 2.5s @120fps) 加每样本的延迟
+//   回溯 (lag+dt, ≤ ~0.3s) 必须整体落在其中 — run_calibration 按 g_counts.at(t−lag)
+//   查询, 深度以拍计会随拍率缩水, 故按墙钟表达
+const size_t COUNTS_HIST_TICKS = (size_t)3 * DEFAULT_FREQ;
 class CountsHistory {
 public:
     struct Sample { std::chrono::steady_clock::time_point t; long long cx, cy; };
@@ -88,7 +95,7 @@ public:
         std::lock_guard<std::mutex> lk(mtx);
         cum_x += dx; cum_y += dy;
         buf.push_back({t, cum_x, cum_y});
-        while (buf.size() > 1500) buf.pop_front();
+        while (buf.size() > COUNTS_HIST_TICKS) buf.pop_front();
     }
     std::pair<double,double> at(std::chrono::steady_clock::time_point t) const {
         std::lock_guard<std::mutex> lk(mtx);

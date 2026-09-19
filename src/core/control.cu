@@ -1,5 +1,5 @@
 // ============================================================================
-//  control.cu — ff_pi_acc 的 500Hz 执行: Smith ê 组装 (含 â 的 ε 修正与 ½â·W²
+//  control.cu — ff_pi_acc 的控制拍执行 (拍率 = DEFAULT_FREQ): Smith ê 组装 (含 â 的 ε 修正与 ½â·W²
 //    外推) → 极点配置 PI (条件积分 + 距离门控) → type-2 速度前馈 (信任度插值
 //    门控 + 检测间隙衰减); 双侧键触发的标定状态机 (cal=0..6, 激励轨迹表见
 //    core/calib.h) 也在此驱动。跨帧控制状态 (积分器/状态机相位) 为函数内
@@ -52,8 +52,8 @@ void control_apply(int cam_fps, uint8_t* rpt, int16_t real_x, int16_t real_y) {
             if(++st>=sg.ticks){st=0;++si;} }
         if (si>=slen) {
             if (cal==1) { excite.clear();
-                for(int i=0;i<5;++i){excite.push_back({4,0,125});excite.push_back({0,4,125});
-                    excite.push_back({-4,0,125});excite.push_back({0,-4,125});}
+                constexpr int neseg=(int)(sizeof(CAL_EXCITE_SEQ)/sizeof(CalibSeg));
+                for(int i=0;i<5;++i) for(int j=0;j<neseg;++j) excite.push_back(CAL_EXCITE_SEQ[j]);
                 seq=excite.data();slen=(int)excite.size();si=st=0;
                 g_calib_collect=true;cal=2;
             } else if (cal==2) { seq=CAL_SETTLE_SEQ;slen=1;si=st=0;cal=6;fx=fy=0;
