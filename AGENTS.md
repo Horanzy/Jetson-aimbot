@@ -267,20 +267,22 @@ Collection uses raw NV12 (not MJPEG): NV12 is the only format both the Hagibis a
   - Input law→arena: `step(t, obs) -> (cx, cy)` integer counts. The law keeps its own detection and command history and does its own estimation/prediction/quantization.
 - **Pure timestamp-driven**: sensing uses the real `L_true`; the `L` a law believes internally is its own business (`cfg.L`). Testing delay mismatch is just setting the two differently — arena supports it natively.
 - **Observation cadence ≠ control cadence**: detections are published at framerate (120/60fps); control runs at 500Hz (2ms); the two are modeled separately (~4 ticks per frame). The firmware's control tick is 1kHz (`DEFAULT_FREQ=1000`), so the 2ms arena model remains the conservative time approximation — 1 arena tick ≈ 2 firmware ticks.
-- **Faithful plant/sensor**: pure delay (a frame reflects the world at t−L; target and crosshair are both sampled at that moment), framerate/control rate, command quantization and clamping (±120 counts), optional detection noise, per-frame detection dropout (`drop_p`), near-instant crosshair response to commands (delay only on the observation side).
+- **Faithful plant/sensor**: pure delay (a frame reflects the world at t−L; target and crosshair are both sampled at that moment), framerate/control rate, command quantization and clamping (±120 counts), optional detection noise, per-frame detection dropout (`drop_p`), near-instant crosshair response to commands (delay only on the observation side), optional **external disturbance** (`ArenaConfig.disturbance`: a `offset(t) -> (ox, oy)` px function of time — recoil/view-punch; a third world-motion source beside target motion and the law's own commands, applied on the aiming side so the law learns of it only through the error signal, exactly like on hardware).
 - **Self-test**: a conservative Smith+PI baseline law (`laws/reference.py`) with known behavior (stable convergence, visible ramp-up) validates the arena — if it fails to reproduce these behaviors, fix arena first. Currently passing.
 
 ### Files & running
 
 ```
 arena/
-├── core.py        neutral simulator (plant+sensor, Observation/LawConfig/ArenaConfig; drop_p = per-frame detection dropout)
+├── core.py        neutral simulator (plant+sensor, Observation/LawConfig/ArenaConfig; drop_p = per-frame detection dropout, disturbance = optional external view-punch offset(t))
 ├── scenarios.py   target motion (static/const-vel/const-accel/random maneuver/relock jump) + standard suite
 ├── fps.py         FPS behavior library in screen space (stop/jump-land/wall-bounce/strafe-switch/jiggle/bhop/slide/turn/approach/dash + near-range jumps at 5m/3m by 1/d scaling) + fps_suite
-├── metrics.py     metrics from ground truth (settle time/overshoot/RMSE/in-band fraction/divergence) + event_metrics (post-event overshoot/recovery) + phase_metrics (per-declared-phase rmse/mean/p95/max + on_body at the distance-scaled torso half-width) + pooled_phase
+├── recoil.py      recoil disturbance (camera kicked by each shot: periodic impulse train, step/ramp/recovery, 1/d-scaled kick) + 3-rpm × 3-kick grid and burst/ramp/recovery/near-range entries → recoil_suite
+├── metrics.py     metrics from ground truth (settle time/overshoot/RMSE/in-band fraction/divergence) + event_metrics (post-event overshoot/recovery) + phase_metrics (per-declared-phase rmse/mean/p95/max + on_body at the distance-scaled torso half-width) + recoil_metrics (per-shot response shape fill90/iqr, command steps/reversals, high-frequency content, per-shot overshoot, accuracy cost) + pooled_phase/pooled_recoil
 ├── runner.py      runs law × scenario, composite score, leaderboard
 ├── eval.py        standard test suite: multi-scenario + delay-mismatch sweep + 60/120fps
 ├── fps_eval.py    FPS behavior test suite: fps_suite × {clean, flaky drop_p=0.12}, per-event overshoot/recovery + per-phase tables
+├── recoil_eval.py recoil observation group: recoil_suite × {clean, flaky drop_p=0.12}, per-combination table of the recoil metrics (+ optional --png per-shot aligned response curves)
 ├── trace.py       per-tick process tracer: single law × scenario → terminal process summary + per-tick CSV (+PNG if matplotlib present); optional law debug() hook; pure observation
 ├── diag.py        error attribution: same law ± true delayed velocity → splits error into estimator-limited vs delay/loop/saturation-limited; pure observation
 ├── integrate.py   integration: all-law leaderboard + relock + wide-delay sweep + sensitivity mismatch
@@ -311,6 +313,8 @@ Dependencies: stdlib + numpy (Kalman/MPC) + scipy (DARE solve for MPC); see `req
 .venv\Scripts\python.exe -m arena.integrate ff_pi_acc mpc_osc # run only the given laws
 .venv\Scripts\python.exe -m arena.fps_eval            # FPS behavior test suite (default ff_pi_acc + reference)
 .venv\Scripts\python.exe -m arena.fps_eval ff_pi_acc ballistic_ff sliding_obs  # chosen laws only
+.venv\Scripts\python.exe -m arena.recoil_eval          # recoil group (default ff_pi_acc + reference)
+.venv\Scripts\python.exe -m arena.recoil_eval ff_pi_acc --png aligned.png  # + per-shot aligned response curves
 .venv\Scripts\python.exe -m arena.trace ff_pi_acc step_80px [--L-true 30] [--csv out.csv]  # per-tick process trace of one run (debug; see "Process tracing" below)
 .venv\Scripts\python.exe -m arena.diag ff_pi_acc [scenario ...]  # error attribution, per scenario/phase (debug; see "Error attribution" below)
 .venv\Scripts\python.exe -m arena.diag ff_pi_acc --suite         # same, at standard-suite composite level
@@ -324,7 +328,38 @@ Dependencies: stdlib + numpy (Kalman/MPC) + scipy (DARE solve for MPC); see `req
 
 ### Process tracing (`arena/trace.py`, debug-only)
 
-Aggregate finals alone do not show where a law breaks; `trace.py` replays **one** law × **one** scenario and shows where it breaks: per-tick CSV (`t/ex/ey/|e|/sent counts/new-frame/obs fields`), a compact terminal summary (band-entry ladder 10/5/3/1px, `event_metrics` event windows, worst-1s window, tail-oscillation verdict), event/auto window export, optional PNG. **Pure observation by construction** (law proxy; core/runner untouched) — the three default test suites are bit-identical with or without it (verified by diff). Optional law-side protocol: a law may implement `debug() -> dict[str, float]`; trace records it per tick as `dbg_*` columns — field names/semantics belong to the law's own docstring, arena never interprets them; `debug()` must be side-effect-free and is never called by eval/integrate/fps_eval. `laws/__init__.py` auto-imports `_wip_*.py` experiment copies (register as `wip_<name>`) so parallel debugging never touches the shared file; a broken WIP file is skipped with a stderr note, never blocks the real laws. Trace outputs live in gitignored `arena/trace_out/`.
+Aggregate finals alone do not show where a law breaks; `trace.py` replays **one** law × **one** scenario (the standard, FPS, recoil and relock suites are all addressable by name) and shows where it breaks: per-tick CSV (`t/ex/ey/|e|/sent counts/new-frame/obs fields`, plus a `shot` flag for recoil scenarios), a compact terminal summary (band-entry ladder 10/5/3/1px, `event_metrics` event windows, worst-1s window, tail-oscillation verdict, and the shot list/kick for a recoil scenario), event/auto window export, optional PNG. **Pure observation by construction** (law proxy; core/runner untouched) — the three default test suites are bit-identical with or without it (verified by diff). Optional law-side protocol: a law may implement `debug() -> dict[str, float]`; trace records it per tick as `dbg_*` columns — field names/semantics belong to the law's own docstring, arena never interprets them; `debug()` must be side-effect-free and is never called by eval/integrate/fps_eval. `laws/__init__.py` auto-imports `_wip_*.py` experiment copies (register as `wip_<name>`) so parallel debugging never touches the shared file; a broken WIP file is skipped with a stderr note, never blocks the real laws. Trace outputs live in gitignored `arena/trace_out/`.
+
+### Recoil disturbance & response shape (`arena/recoil.py`, `arena/recoil_eval.py`)
+
+Recoil is a third world-motion source: neither target motion nor the law's own output, but the **camera being kicked** by each shot. It enters the plant as `ArenaConfig.disturbance` (`offset(t) -> (ox, oy)` px, a pure function of time, no hidden state), applied on the aiming side so camera, history and `ex/ey` all see the displaced world while `self.cross_x/y` stays the law's own integration — the difference is exactly what the law must cancel. The law's interface is untouched: it cannot see the disturbance, only its consequence in the error. `disturbance=None` leaves every existing path bit-identical (verified: all four default suites identical by diff **and** sha256 over the raw `t/ex/ey/sent_*` arrays for 8 law × L/fps/drop configs × 15 scenarios × 3 seeds).
+
+Sign convention is fps.py's screen frame: **+y = world-up** (its jump arc is +y). A muzzle kick pushes the aiming axis +y, so the target's apparent position moves −y relative to the crosshair and the law must command **negative counts (pull down)** — the human compensation direction.
+
+Model and grid (`recoil.py`'s docstring carries the derivation): per-shot kick defined at the 10 m reference and scaled ∝ 1/d like every other amplitude in the library (a pure camera *rotation* would be distance-independent — that reading is untested, see limitations); shot shape step (default) or ramp (`rise_ms`), optional camera self-recovery (`recover_tau`); rpm grid 300/450/900 (shot intervals 200/133.3/66.7 ms = 4.0/2.7/1.3 × the nominal delay L=50), kick grid 6/20/60 px @10 m (0.36°/1.2°/3.6° of aiming-axis elevation, i.e. 2%→60% of the per-interval full-speed motion budget). `recoil_suite` = the 3×3 grid + 3-round bursts + a 12 ms ramp + 300 ms auto-recovery + a near-range entry (10 m 6 px → 3 m 20 px, a self-consistency check on the 1/d rule). The time axis is identical in every entry: 800 ms settle → 1600 ms fire (a common multiple of all three intervals: 8/12/24 shots) → 800 ms ceasefire; the target itself is static so the only varying channel is recoil.
+
+`metrics.recoil_metrics` reports the per-shot **response shape** — what standard RMSE cannot see. All of it is computed on the integer counts the game actually receives:
+
+- `fill90` / `iqr` — quantile times of the delivered displacement inside one shot interval (no threshold): a uniform pull spreads the same displacement over the whole interval (0.90 / 0.50), a pulse squeezes it into a fraction of it (both collapse). This is the direct quantification of "press, then wait for the next round".
+- `steps_per_s` / `steps_per_shot` — frame-rate command-velocity changes > θ = one count per frame (the frame-resolution expression floor, not a tuned threshold).
+- `rev_per_s` — direction reversals of the *exact* delivered displacement (counts sum, no quantization error) with legs ≥ 1 px (display quantum).
+- `acc_rms` — RMS of the command velocity's frame-to-frame change (px/ms²; the aim's acceleration = HF content). A second difference (jerk) is not reported: measured, its RMS sits only 1.1–1.7× above the quantization floor `acc_rms/frame_dt`, i.e. it adds noise rather than signal.
+- `over_y` (per-shot overshoot past the target), `on_body` (distance-scaled torso band), `rmse_y`, `rec_ms` (post-burst recovery, `step_metrics` convention).
+
+Measured (`python -m arena.recoil_eval`, ff_pi_acc, clean, seeds 1–3; neutral shape values are fill90 = 0.90, iqr = 0.50, rev/s = 0, st/shot = 0):
+
+| combo | rmse_y | over_y | on_body | steps/s | st/shot | rev/s | acc_rms | fill90 | iqr | rec_ms |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 300rpm 6px | 3.32 | 3.12 | 100% | 2.50 | 0.50 | 9.17 | 0.01 | 0.615 | 0.148 | 0 |
+| 300rpm 20px | 10.59 | 9.17 | 100% | 10.42 | 2.08 | 9.58 | 0.02 | 0.615 | 0.163 | 285 |
+| 300rpm 60px | 31.14 | 24.29 | 48% | 31.04 | 6.21 | 9.58 | 0.03 | 0.605 | 0.160 | 358 |
+| 450rpm 20px | 9.30 | 12.69 | 100% | 15.21 | 2.03 | 12.71 | 0.02 | 0.818 | 0.210 | 306 |
+| 900rpm 20px | 8.92 | 7.50 | 98% | 22.50 | 1.50 | 0.21 | 0.02 | 0.923 | 0.530 | 341 |
+| 900rpm 60px | 28.44 | 20.99 | 71% | 71.04 | 4.74 | 0.62 | 0.04 | 0.930 | 0.535 | 488 |
+
+Reading: the response is a **mid-interval pulse** — dead for the first ~40% (the shot is invisible until L), then a constant-velocity press for ~30%, then dead again for the rest of the interval with the aim sitting past the target (`over_y` ≈ 45% of the kick); the per-tick process is in `arena.trace ff_pi_acc rc_300rpm_20px --window 800:2400 --csv rc_300rpm_20px_burst.csv`. The shape is worst at slow fire (fill90 0.61 against 0.90, iqr 0.16 against 0.50) and large kicks; at 900 rpm the press no longer fits inside one interval, so it smears into a continuous pull (fill90 0.92, iqr 0.53, rev/s ≈ 0) whose price shows up as accuracy instead (rmse 28.4 px, on_body 71% at 60 px). The conservative `reference` law is measurably smoother (fill90 0.842 vs 0.782, acc_rms 0.013 vs 0.019, st/shot 1.12 vs 2.36) but pays in tracking and recovery (rec 436 vs 305 ms): the smoothness/aggression trade is real and now measurable.
+
+This group is an **observation** group: it is not merged into the three default suites (their results are bit-identical with and without these files), and it is not (yet) part of the shipping gate in requirement 4. The human-compensation channel is deliberately **not** modeled: a human sits inside the loop and needs the *total* command (own + injected) for its own-motion sensing, which would extend arena's minimal law interface — a separate decision.
 
 ### Error attribution: where a law's error actually lives (`arena/diag.py`, debug-only)
 

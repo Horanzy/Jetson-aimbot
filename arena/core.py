@@ -8,10 +8,20 @@ arena 只做三件事:
 
 arena 不含任何估计/预测/控制逻辑。law 是黑盒, 通过最小接口交互。
 单位: 时间 ms, 位置 px, 速度 px/ms, 灵敏度 px/count。
+
+外部扰动 (ArenaConfig.disturbance, 可选): 世界的第三种运动源 —— 除"目标自己动"
+(target) 与"律下发 counts"(crosshair) 之外, 还有"相机被外部推动"(后坐力/受击
+晃屏/载具颠簸)。物理上它是瞄准轴自身的角位移, 在屏幕空间的表现是**目标视位置
+相对准星发生位移**, 律只能靠自己的输出反向补偿, 因此它既不进 law 的接口也不给
+law 任何额外信息。扰动对象只须提供 offset(t) -> (ox, oy) px (任意时刻可求值),
+纯时间驱动、无隐藏状态: 世界在 t 时刻的真值 = 目标轨迹 ⊕ 扰动偏移, 与求解顺序
+无关。偏移加在**瞄准侧** (相机被推 → 瞄准轴动了, 准星指的那一点跟着动), 因此
+hist 与误差 ex/ey 看到的都是"被推过的世界", 而 self.cross_x/y 仍是律指令积分出来
+的准星 —— 二者之差正是律要消掉的量。
 """
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Optional
+from typing import Callable, Optional, Tuple
 import math
 
 
@@ -45,6 +55,9 @@ class ArenaConfig:
     count_limit: int = 120     # 被控对象侧 counts 限幅 (忠实复现硬件)
     fov_radius: float = 150.0
     drop_p: float = 0.0        # 每帧独立丢失概率 (检测闪烁; 0=不丢帧)
+    # 外部扰动 (可选): 提供 offset(t) -> (ox, oy) px 的对象 (见 arena/recoil.py)。
+    # None = 无扰动, 与历史行为逐位相同。
+    disturbance: Optional[Callable[[float], Tuple[float, float]]] = None
 
 
 class _StateHistory:
@@ -94,6 +107,7 @@ class Arena:
         self.frame_dt = 1000.0 / cfg.fps
         self.target = target
         self.rng = rng
+        self.dist = cfg.disturbance
         self.cross_x, self.cross_y = cross0
         self.hist = _StateHistory()
         self.rec_t: list[float] = []
@@ -105,7 +119,18 @@ class Arena:
         self._pending: list[Observation] = []
         self._last_det: Optional[Observation] = None
         self.diverged = False
-        self.hist.push(0.0, target.x, target.y, self.cross_x, self.cross_y)
+        ax, ay = self.aim(0.0)
+        self.hist.push(0.0, target.x, target.y, ax, ay)
+
+    def aim(self, t: float):
+        """瞄准点 (屏幕坐标) = 律指令积分出的准星 + 外部扰动偏移。
+
+        扰动是相机被外部推动造成的瞄准轴偏移, 与律的输出无关; 无扰动时
+        偏移恰为 0, 返回值与 self.cross_x/y 逐位相同。"""
+        if self.dist is None:
+            return self.cross_x, self.cross_y
+        ox, oy = self.dist.offset(t)
+        return self.cross_x + ox, self.cross_y + oy
 
     def law_config(self, s_belief: float, L_belief: float) -> LawConfig:
         return LawConfig(s=s_belief, L=L_belief, h=self.cfg.h,
@@ -169,13 +194,15 @@ class Arena:
             self.rec_sent_cy.append(cy)
 
             self.target.advance(h, t)
-            ex = self.target.x - self.cross_x
-            ey = self.target.y - self.cross_y
+            # 世界真值 = 目标轨迹 ⊕ 扰动偏移 (瞄准侧); 误差与传感器都看这一
+            # 结果 —— 扰动不进 law 的接口, 律只能靠自己的输出反向补偿。
+            ax, ay = self.aim(t + h)
+            ex = self.target.x - ax
+            ey = self.target.y - ay
             self.rec_t.append(t)
             self.rec_ex.append(ex)
             self.rec_ey.append(ey)
-            self.hist.push(t + h, self.target.x, self.target.y,
-                           self.cross_x, self.cross_y)
+            self.hist.push(t + h, self.target.x, self.target.y, ax, ay)
             if ex * ex + ey * ey > div_thr * div_thr:
                 self.diverged = True
                 break
@@ -187,4 +214,7 @@ class Arena:
             "t": self.rec_t, "ex": self.rec_ex, "ey": self.rec_ey,
             "diverged": self.diverged,
             "sent_cx": self.rec_sent_cx, "sent_cy": self.rec_sent_cy,
+            # 被控对象自身的采样事实 (供按拍/按帧重建指令信号的指标使用)
+            "h": self.cfg.h, "frame_dt": self.frame_dt,
+            "s_true": self.cfg.s_true,
         }

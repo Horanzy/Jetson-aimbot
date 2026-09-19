@@ -54,19 +54,23 @@ EVENT_SPAN_MS = 1000.0                 # --event 窗口长度
 AUTO_WINDOW_MS = 1000.0                # 自动截窗长度
 
 
-def find_scenario(name: str) -> Scenario:
-    """按名字找场景: 标准套件 + FPS 套件 + relock (integrate 用)。"""
+def _all_scenarios():
     from arena.integrate import relock_scenario
-    for sc in list(standard_suite()) + list(fps_suite()) + [relock_scenario()]:
+    from arena.recoil import recoil_suite
+    return (list(standard_suite()) + list(fps_suite())
+            + list(recoil_suite()) + [relock_scenario()])
+
+
+def find_scenario(name: str) -> Scenario:
+    """按名字找场景: 标准套件 + FPS 套件 + 后坐力套件 + relock (integrate 用)。"""
+    for sc in _all_scenarios():
         if sc.name == name:
             return sc
     raise SystemExit(f"未知场景: {name}\n可用: " + ", ".join(scenario_names()))
 
 
 def scenario_names():
-    from arena.integrate import relock_scenario
-    return ([sc.name for sc in standard_suite()]
-            + [sc.name for sc in fps_suite()] + [relock_scenario().name])
+    return [sc.name for sc in _all_scenarios()]
 
 
 class _TracingLaw:
@@ -127,7 +131,8 @@ def run_trace(law_name, scenario_name, *, L_belief=NOMINAL_L, L_true=NOMINAL_L,
     tgt = sc.make_target(rng)
     cfg = ArenaConfig(s_true=s_true, L_true=L_true, fps=fps, noise_std=noise,
                       duration=sc.duration if duration is None else duration,
-                      drop_p=drop_p)
+                      drop_p=drop_p,
+                      disturbance=getattr(sc, "recoil", None))
     ar = Arena(cfg, tgt, rng, cross0=sc.cross0)
     tl = _TracingLaw(law_cls())
     res = ar.run(tl, s_belief, L_belief, max_v)
@@ -198,6 +203,12 @@ def summarize(tr: TraceResult, tail_ms=TAIL_MS):
                + (f"  [截断于 {kw['duration']:.0f}ms]" if kw['duration'] else ""))
     if tr.diverged:
         out.append("  *** DIVERGED (发散, 以下数字仅示意) ***")
+    shots = tuple(getattr(sc, "shots", ()) or ())
+    if shots:
+        out.append(f"  后坐力: {len(shots)} 发 @ {sc.rpm:g}RPM "
+                   f"(发间隔 {sc.interval_ms:.1f}ms), 每发 "
+                   f"{sc.kick_eff_px:.1f}px @{sc.dist_m:g}m, 首/末发 "
+                   f"{shots[0]:.0f}/{shots[-1]:.0f}ms; 每发状态见 CSV 的 shot 列")
     # 全局
     pk = max(range(len(e)), key=lambda i: e[i])
     n_new = sum(1 for r in tr.rows if r[4])
@@ -247,18 +258,32 @@ def summarize(tr: TraceResult, tail_ms=TAIL_MS):
 
 def write_csv(tr: TraceResult, path, t0=None, t1=None):
     """逐拍 CSV。t0/t1 给定时只写窗口内行。列:
-    t, ex, ey, abs_e, sent_cx, sent_cy, obs_t, obs_dx, obs_dy, obs_new[, dbg_*]"""
+    t, ex, ey, abs_e, sent_cx, sent_cy, obs_t, obs_dx, obs_dy, obs_new
+    [, shot (后坐力场景: 本拍内开火 = 1)][, dbg_*]"""
     res, rows = tr.res, tr.rows
     dbg_keys = []
     for r in rows:
         for k in r[5]:
             if k not in dbg_keys:
                 dbg_keys.append(k)
-    header = (["t", "ex", "ey", "abs_e", "sent_cx", "sent_cy",
-               "obs_t", "obs_dx", "obs_dy", "obs_new"] + [f"dbg_{k}" for k in dbg_keys])
+    shots = tuple(getattr(tr.scenario, "shots", ()) or ())
     n = min(len(rows), len(res["t"]))
+    shot_at = [0] * n
+    if shots:
+        h = res.get("h", 2.0)
+        j = 0
+        for i in range(n):
+            tt = res["t"][i]
+            while j < len(shots) and shots[j] < tt:
+                j += 1
+            if j < len(shots) and shots[j] < tt + h:
+                shot_at[i] = 1
+    header = (["t", "ex", "ey", "abs_e", "sent_cx", "sent_cy",
+               "obs_t", "obs_dx", "obs_dy", "obs_new"]
+              + (["shot"] if shots else []) + [f"dbg_{k}" for k in dbg_keys])
     d = os.path.dirname(os.path.abspath(path))
     os.makedirs(d, exist_ok=True)
+    written = 0
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(header)
@@ -268,6 +293,7 @@ def write_csv(tr: TraceResult, path, t0=None, t1=None):
                 continue
             if t1 is not None and tt > t1:
                 continue
+            written += 1
             row_t, ot, odx, ody, onew, dbg = rows[i]
             e = math.hypot(res["ex"][i], res["ey"][i])
             w.writerow([f"{tt:.1f}", f"{res['ex'][i]:.3f}", f"{res['ey'][i]:.3f}",
@@ -275,8 +301,9 @@ def write_csv(tr: TraceResult, path, t0=None, t1=None):
                         "" if ot is None else f"{ot:.1f}",
                         "" if odx is None else f"{odx:.3f}",
                         "" if ody is None else f"{ody:.3f}", onew]
+                       + ([shot_at[i]] if shots else [])
                        + ["" if dbg.get(k) is None else f"{dbg[k]:.4g}" for k in dbg_keys])
-    return n
+    return written
 
 
 def write_png(tr: TraceResult, path):
