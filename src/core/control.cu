@@ -2,8 +2,11 @@
 //  control.cu — ff_pi_acc 的控制拍执行 (拍率 = DEFAULT_FREQ): Smith ê 组装 (含 â 的 ε 修正与 ½â·W²
 //    外推) → 极点配置 PI (条件积分 + 距离门控) → type-2 速度前馈 (信任度插值
 //    门控 + 检测间隙衰减); 双侧键触发的标定状态机 (cal=0..6, 激励轨迹表见
-//    core/calib.h) 也在此驱动。跨帧控制状态 (积分器/状态机相位) 为函数内
-//    static; counts 量化结果直接写入报文位移字节并记入 g_counts。
+//    core/calib.h) 也在此驱动。跨帧控制状态 (积分器/状态机相位/量化余量) 为
+//    law_tick 内 static。律输出在执行器缝合点分流: hid = counts 量化进报文位
+//    移字节并记 g_counts; pad = 交付期望速度 (px/ms), 量化/报文/counts 尾巴
+//    是 hid 专属。自身运动补偿账本来源随模式路由 (io/pad_output.h: hid=
+//    g_counts, pad=摇杆账本), 律数学两模式逐句一致。
 // ============================================================================
 
 #include "core/control.h"
@@ -16,8 +19,16 @@
 
 #include "core/calib.h"
 #include "core/state.h"
+#include "io/pad_output.h"     // own_motion_ledger + PAD_STICK_GAIN_DEFAULT:
+                               //   自身运动账本来源与 pad 速度帽随输出模式
 
-void control_apply(int cam_fps, uint8_t* rpt, int16_t real_x, int16_t real_y) {
+namespace {
+
+// 统一控制拍: hid 经 HID 执行 (量化 + 报文位移 + g_counts 记账), pad 交付期
+//   望速度并跳过 hid 专属尾巴 (鼠标侧键抑制/双侧键标定/报文写盘 — pad 键位
+//   字恒无 SIDE_KEY/BOTH_SIDE_KEYS 位, 侧键抑制恒过、标定分支自然不可达)。
+void law_tick(int cam_fps, int16_t real_x, int16_t real_y, uint16_t btns, bool pad,
+              uint8_t* rpt, float* out_vx, float* out_vy, bool* out_gate) {
     static auto last_press=std::chrono::steady_clock::now()-std::chrono::hours(1);
     static float rem_x=0,rem_y=0;
     static float int_x=0,int_y=0;
@@ -27,7 +38,6 @@ void control_apply(int cam_fps, uint8_t* rpt, int16_t real_x, int16_t real_y) {
     static std::vector<CalibSeg> excite;
 
     auto now=std::chrono::steady_clock::now();
-    uint16_t btns=rpt[1]|(rpt[2]<<8);
     bool left=btns&LEFT_KEY, right=btns&RIGHT_KEY, side=btns&SIDE_KEY;
     g_left_down.store(left);
 
@@ -67,6 +77,7 @@ void control_apply(int cam_fps, uint8_t* rpt, int16_t real_x, int16_t real_y) {
         if(trig&&!side)last_press=now;
         bool aiming=std::chrono::duration_cast<std::chrono::milliseconds>(
                         now-last_press).count()<=KEEP_ALIVE_MS;
+        if (pad) *out_gate=aiming;              // 注入门 = 触发保持窗 (接管开关已在上方分流)
         if (aiming) {
             float px,py,vx,vy,se,le,cs;bool valid;
             std::chrono::steady_clock::time_point tp;
@@ -80,10 +91,11 @@ void control_apply(int cam_fps, uint8_t* rpt, int16_t real_x, int16_t real_y) {
               last_beta=g_target.last_beta; }
             double age=elapsed_ms(now,tp);
             if (valid&&age<TARGET_STALE_MS) {
-                const float max_v=g_max_v.load(), fov_r=g_fov_radius.load();
+                float max_v=g_max_v.load(); const float fov_r=g_fov_radius.load();
+                if (pad) max_v=std::min(max_v,PAD_STICK_GAIN_DEFAULT/1000.0f);  // 注入通道满偏转屏速 = pad 物理速度帽
                 float Lc=le*PRED_L_COMP;
-                auto cp=g_counts.at(shift_ms(tp,-(double)Lc));
-                auto cn=g_counts.cum();
+                auto cp=own_motion_ledger().at(shift_ms(tp,-(double)Lc));
+                auto cn=own_motion_ledger().cum();
                 float ifx=se*(float)(cn.first-cp.first);
                 float ify=se*(float)(cn.second-cp.second);
                 // 加速度偏差补偿: ε = â·T·(α/β−½) 修 α-β 速度结构滞后,
@@ -130,11 +142,14 @@ void control_apply(int cam_fps, uint8_t* rpt, int16_t real_x, int16_t real_y) {
                 vy_u+=ff_eff*vffy;
                 float vcx=std::clamp(vx_u,-max_v,max_v);
                 float vcy=std::clamp(vy_u,-max_v,max_v);
-                float s=std::clamp(se,S_MIN,S_MAX);
-                rem_x+=vcx*TICK_MS/s; rem_y+=vcy*TICK_MS/s;
-                int sx=std::clamp((int)std::trunc(rem_x),-120,120);
-                int sy=std::clamp((int)std::trunc(rem_y),-120,120);
-                rem_x-=sx;rem_y-=sy; fx+=sx;fy+=sy;
+                if (pad) { *out_vx=vcx; *out_vy=vcy; }    // 缝合: pad 交付期望速度 (px/ms)
+                else {
+                    float s=std::clamp(se,S_MIN,S_MAX);
+                    rem_x+=vcx*TICK_MS/s; rem_y+=vcy*TICK_MS/s;
+                    int sx=std::clamp((int)std::trunc(rem_x),-120,120);
+                    int sy=std::clamp((int)std::trunc(rem_y),-120,120);
+                    rem_x-=sx;rem_y-=sy; fx+=sx;fy+=sy;
+                }
             } else { rem_x=rem_y=0; int_x=int_y=0; }
         } else { rem_x=rem_y=0; int_x=int_y=0; }
 
@@ -145,7 +160,24 @@ void control_apply(int cam_fps, uint8_t* rpt, int16_t real_x, int16_t real_y) {
         } else hold=0;
     }
 
-    fx=std::clamp(fx,-32768,32767); fy=std::clamp(fy,-32768,32767);
-    rpt[3]=fx&0xFF;rpt[4]=fx>>8; rpt[5]=fy&0xFF;rpt[6]=fy>>8;
-    g_counts.add(now,(int)fx,(int)fy);
+    if (pad) {
+        // pad: 无报文/counts 尾巴 — 注入偏转与摇杆账本由 io/pad_output.cu 的
+        //   pad_merge 按 合并偏转×实际拍时长 入账 (g_counts 不变式 3 的 pad 对应物)
+    } else {
+        fx=std::clamp(fx,-32768,32767); fy=std::clamp(fy,-32768,32767);
+        rpt[3]=fx&0xFF;rpt[4]=fx>>8; rpt[5]=fy&0xFF;rpt[6]=fy>>8;
+        g_counts.add(now,(int)fx,(int)fy);
+    }
+}
+
+} // namespace
+
+void control_apply(int cam_fps, uint8_t* rpt, int16_t real_x, int16_t real_y) {
+    law_tick(cam_fps,real_x,real_y,(uint16_t)(rpt[1]|(rpt[2]<<8)),false,rpt,nullptr,nullptr,nullptr);
+}
+
+bool control_apply_pad(int cam_fps, uint16_t btns, float& out_vx, float& out_vy) {
+    float vx=0,vy=0; bool gate=false;
+    law_tick(cam_fps,0,0,btns,true,nullptr,&vx,&vy,&gate);
+    out_vx=vx; out_vy=vy; return gate;
 }

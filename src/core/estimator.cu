@@ -11,6 +11,7 @@
 #include <mutex>
 
 #include "core/state.h"
+#include "io/pad_output.h"      // own_motion_ledger: 自身运动补偿账本来源随模式 (hid=g_counts / pad=摇杆账本)
 
 // â = ȳ·β/T² (创新均值自洽反演加速度, 任何帧率下都精确); ȳ 不过白噪声显著性地板
 //   (ACC_SNR·σ_noise·√(ρ/(2−ρ)), σ_noise² = m₂−ȳ² 精确分解) → â = 0 (硬门限)
@@ -34,8 +35,8 @@ float estimator_step(EstimatorState& st, std::chrono::steady_clock::time_point n
                               st.sig2rx=st.sig2ry=1;st.ybar_x=st.ybar_y=0;st.ax_e=st.ay_e=0; }
         else {
             float Lc=l_est*PRED_L_COMP;
-            auto c0=g_counts.at(shift_ms(now,-(double)Lc-dt));
-            auto c1=g_counts.at(shift_ms(now,-(double)Lc));
+            auto c0=own_motion_ledger().at(shift_ms(now,-(double)Lc-dt));
+            auto c1=own_motion_ledger().at(shift_ms(now,-(double)Lc));
             float cax=(float)(c1.first-c0.first), cay=(float)(c1.second-c0.second);
             float px_pred=st.fx+st.fvx*dt-s_est*cax, py_pred=st.fy+st.fvy*dt-s_est*cay;
             float inx=best_dx-px_pred, iny=best_dy-py_pred;
@@ -60,8 +61,8 @@ float estimator_step(EstimatorState& st, std::chrono::steady_clock::time_point n
                    float sry=std::max(std::sqrt(st.sig2ry),1e-6f);
                    // 清洗创新: 减掉自身已知的 Lc 过补偿伪迹 (matched 下恰好还原
                    //   真实目标创新; 失配残留 ∝ Δ·a_own, 瞬态成对, 由活动门吸收)
-                   auto c0n=g_counts.at(shift_ms(now,-(double)l_est-dt));
-                   auto c1n=g_counts.at(shift_ms(now,-(double)l_est));
+                   auto c0n=own_motion_ledger().at(shift_ms(now,-(double)l_est-dt));
+                   auto c1n=own_motion_ledger().at(shift_ms(now,-(double)l_est));
                    float inx_c=inx-s_est*((c1.first-c0.first)-(float)(c1n.first-c0n.first));
                    float iny_c=iny-s_est*((c1.second-c0.second)-(float)(c1n.second-c0n.second));
                    float clx=std::clamp(inx_c,-ACC_SIG_CLIP_K*srx,ACC_SIG_CLIP_K*srx);
@@ -71,10 +72,10 @@ float estimator_step(EstimatorState& st, std::chrono::steady_clock::time_point n
                    // 自身加速度活动门: 失配伪创新 ∝ a_own·Δ 与真签名 (∝a_t·T²/β)
                    //   物理可分 — 自身剧烈加减速期间 â 不采信
                    float w_own=std::max(1.0f,l_est);
-                   auto s0=g_counts.at(now);
-                   auto s1=g_counts.at(shift_ms(now,-(double)w_own));
-                   auto s2=g_counts.at(shift_ms(now,-(double)dt));
-                   auto s3=g_counts.at(shift_ms(now,-(double)dt-(double)w_own));
+                   auto s0=own_motion_ledger().at(now);
+                   auto s1=own_motion_ledger().at(shift_ms(now,-(double)w_own));
+                   auto s2=own_motion_ledger().at(shift_ms(now,-(double)dt));
+                   auto s3=own_motion_ledger().at(shift_ms(now,-(double)dt-(double)w_own));
                    float th_a=max_v/(ACC_OW_ACTIV_K*std::max(1.0f,l_est));
                    float aown_x=(s_est*((float)(s0.first-s1.first)
                                        -(float)(s2.first-s3.first))/w_own)/dt;

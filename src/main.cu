@@ -18,6 +18,12 @@
 //  鼠标接管: -a n (或热参 aim=0) 时固件纯透传真实鼠标 — 不注入任何移动, 检测/采集照常。
 //    模型未完善但需要采集数据的运行形态; aim=1 即恢复控制输出。
 //
+//  手柄模式: -M pad 与鼠标模式互斥 — 物理手柄 (Xbox 布局) 全透传, 控制律期望
+//    速度折算成右摇杆注入偏转与人类通道合并 (±满偏钳制), 账本 Σ(偏转·ms) 供
+//    估计器自身运动补偿; 合并后的最终逻辑态经发布点交给 XInput 输出后端
+//    (0x045E/0x028E 全速设备, 见 io/pad_xinput), --pad-dump 在此之上叠加打印
+//    合并逻辑态。
+//
 //  热参数: UDP 127.0.0.1 上的极小本地控制通道 (白名单 t/y/x/fov/k/aim/cap_*, 固件侧强制
 //    钳制), webui 保存后即时生效不重启; 结构常量仍为编译期, 与"无手调魔法数字"哲学一致。
 //
@@ -27,7 +33,7 @@
 //  本文件为程序入口: 参数解析, 设备打开, 线程孵化与 timerfd 控制主循环
 //    (拍率 = DEFAULT_FREQ, 见 core/state.h);
 //    模块划分 — core/ (控制律/估计器/标定/TRT 辅助/共享状态), io/ (采集/USB
-//    鼠标/raw_gadget 会话/热参)。
+//    鼠标/raw_gadget 会话/手柄输入与合并层/热参)。
 // ============================================================================
 
 #include <algorithm>
@@ -52,6 +58,9 @@
 #include "io/capture.h"
 #include "io/hid_mouse.h"
 #include "io/hotctl.h"
+#include "io/pad_input.h"
+#include "io/pad_output.h"
+#include "io/pad_xinput.h"
 #include "io/usbraw.h"
 
 // ========================= 命令行交互 =========================
@@ -69,6 +78,7 @@ int main(int argc, char* argv[]) {
 
     std::string a_m,a_c,a_t,a_y,a_d,a_f,a_x,a_s,a_l,a_S,a_k,a_v,a_r;
     std::string a_o,a_a,a_e; bool have_e=false;
+    std::string a_M,a_P; bool pad_dump=false;
     int fire_ms=300; double auto_s=10;
     int cooldown_ms=500; int jpeg_q=95;
 
@@ -94,6 +104,9 @@ int main(int argc, char* argv[]) {
         else if (arg=="-C"&&i+1<argc) cooldown_ms=std::stoi(argv[++i]);
         else if (arg=="-q"&&i+1<argc) jpeg_q=std::stoi(argv[++i]);
         else if (arg=="-r"&&i+1<argc) a_r=argv[++i];
+        else if (arg=="-M"&&i+1<argc) a_M=argv[++i];
+        else if (arg=="-P"&&i+1<argc) a_P=argv[++i];
+        else if (arg=="--pad-dump") pad_dump=true;
         else if (arg=="-h"||arg=="--help") {
             std::cout<<"用法: "<<argv[0]<<" [自瞄选项] [采集选项]\n"
                 "\n自瞄选项:\n"
@@ -110,7 +123,12 @@ int main(int argc, char* argv[]) {
                 "  -F <ms>    开火截图间隔 (默认 300)\n"
                 "  -A <秒>    定时截图间隔 (默认 10, 随机 0.5x~1.5x)\n"
                 "  -C <ms>    检测/定时截图冷却 (默认 500, 开火不受限)\n"
-                "  -q <1-100> JPEG 质量 (默认 95)\n";
+                "  -q <1-100> JPEG 质量 (默认 95)\n"
+                "\n手柄模式选项 (-M pad; 与鼠标 hid 模式互斥, 缺省 hid):\n"
+                "  -M <模式>  hid=USB raw_gadget 鼠标 / pad=XInput 手柄输出 + 物理手柄输入\n"
+                "  -P <子串>  手柄 /dev/input/by-id 匹配子串 (默认任意 *-event-joystick 节点)\n"
+                "  --pad-dump 叠加调试输出: ≥50ms 打印合并后逻辑态 (透传/注入验证)\n"
+                "             pad 有效速度帽 = min(-x, 满偏转屏速 3000px/s)\n";
             return 0;
         }
     }
@@ -129,8 +147,6 @@ int main(int argc, char* argv[]) {
     float max_spd =std::stof(!a_x.empty()?a_x:get_input_with_default("最大速度","1500"));
     max_spd=std::clamp(max_spd,100.0f,20000.0f);
     const float max_v=max_spd/1000.0f;
-    float init_s=std::clamp(std::stof(a_s.empty()?"1.0":a_s),S_MIN,S_MAX);
-    float init_l=std::clamp(std::stof(a_l.empty()?"60":a_l),L_MIN,L_MAX);
     const std::string persist_path=a_S;
     std::string aim_key=!a_k.empty()?a_k:get_input_with_default("触发键","fire");
     int aim_mode=0;
@@ -141,6 +157,23 @@ int main(int argc, char* argv[]) {
     if(!preview) unsetenv("DISPLAY");
     jpeg_q=std::clamp(jpeg_q,1,100);
     float fov_r=std::clamp(std::stof(a_r.empty()?"150":a_r),10.0f,1000.0f);
+
+    // 输出模式: hid (USB raw_gadget 鼠标) / pad (XInput 手柄输出 + 物理手柄输入) —
+    //   互斥, 缺省 hid; pad 模式鼠标完全不读、hid 鼠标会话完全不启动, hid 模式
+    //   手柄完全不被触碰
+    std::string out_mode=a_M.empty()?"hid":a_M;
+    if (out_mode!="hid"&&out_mode!="pad") {
+        std::cerr<<"❌ 未知模式 \""<<out_mode<<"\" (用 hid 或 pad)\n"; return 1; }
+    const bool pad_mode=(out_mode=="pad");
+    const std::string pad_kw=a_P.empty()?DEFAULT_PAD_KEYWORD:a_P;
+    if (pad_dump&&!pad_mode) std::cout<<"⚠ 忽略 --pad-dump (仅 pad 模式)\n";
+    // pad 模式的 s = s_rp (px per 偏转·ms = stick_gain/(32767·1000)): 摇杆账本
+    //   单位制下的自身运动换算系数, 估计器/控制律经 own_motion_ledger 路由消费;
+    //   hid 模式的 s = px/count (标定/回写语义, [S_MIN,S_MAX] 钳制)
+    float init_s=pad_mode
+        ? PAD_STICK_GAIN_DEFAULT/(PAD_AXIS_MAX*1000.0f)
+        : std::clamp(std::stof(a_s.empty()?"1.0":a_s),S_MIN,S_MAX);
+    float init_l=std::clamp(std::stof(a_l.empty()?"60":a_l),L_MIN,L_MAX);
 
     // 鼠标接管 (默认开) 与截图源 (默认全开; -e 给出时以该列表为准, 可为空 = 全关)
     bool aim_on=!(a_a=="n"||a_a=="N");
@@ -178,14 +211,30 @@ int main(int argc, char* argv[]) {
 
     MouseState state;
     UsbRawSession usb_session;
-    if (!hid_mouse_start(state,usb_session)) return 1;   // 可行动原因已打印 (设备/模块/UDC 占用)
+    PadState padst;
+    // 两种模式单次运行只居其一, 且各自独占 UDC: hid = USB raw_gadget 鼠标,
+    //   pad = XInput 有线手柄 (0x045E/0x028E)。设备/模块/UDC 不可用时各自打
+    //   可行动原因并退出。
+    if (!pad_mode && !hid_mouse_start(state,usb_session)) return 1;
+    if (pad_mode && !pad_xinput_start()) return 1;
 
     signal(SIGINT,signal_handler); signal(SIGTERM,signal_handler);
     { std::lock_guard<std::mutex> lk(g_target.mtx);
       g_target.s_est=init_s; g_target.l_est_ms=init_l; }
+    own_motion_ledger_set(pad_mode);
 
-    std::cout<<"初始: s="<<init_s<<" L="<<init_l<<" fov="<<fov_r<<"\n";
-    std::cout<<"鼠标接管: "<<(aim_on?"开":"关 (纯透传: 不注入移动, 检测/采集照常)")<<"\n";
+    if (pad_mode)
+        std::cout<<"初始: stick_gain="<<PAD_STICK_GAIN_DEFAULT<<"px/s (s_rp="<<init_s
+                 <<") L="<<init_l<<" fov="<<fov_r<<"\n";
+    else
+        std::cout<<"初始: s="<<init_s<<" L="<<init_l<<" fov="<<fov_r<<"\n";
+    if (pad_mode) {
+        std::cout<<"模式: pad (XInput 手柄输出 0x045E/0x028E + 物理手柄全透传"
+                 <<(pad_dump?", --pad-dump 叠加打印":"")<<")\n";
+        std::cout<<"辅助瞄准注入: "<<(aim_on?"开":"关 (纯透传: 手柄原样, 检测/采集照常)")<<"\n";
+    } else {
+        std::cout<<"鼠标接管: "<<(aim_on?"开":"关 (纯透传: 不注入移动, 检测/采集照常)")<<"\n";
+    }
     if (do_collect) {
         std::string srcs;
         auto add_src=[&](bool on,const char* n){ if(on){ if(!srcs.empty()) srcs+=","; srcs+=n; } };
@@ -194,6 +243,16 @@ int main(int argc, char* argv[]) {
                  <<"  开火="<<fire_ms<<"ms  定时="<<auto_s<<"s  冷却="<<cooldown_ms<<"ms\n";
     } else
         std::cout<<"采集: 关闭 (未传 -o)\n";
+
+    std::thread pad_reader;
+    if (pad_mode) {
+        // 启动一次性诊断: 手柄在位/节点提示 + -P 多匹配报错 (verbose); 读取
+        //   线程自带缺席重试与掉线自愈, 未在位不阻塞启动
+        std::string pd=find_pad_device(pad_kw,true);
+        if (pd.empty()) std::cout<<"⚠ 手柄当前不在位 (读取线程每秒重试)\n";
+        else std::cout<<"✅ 手柄节点: "<<pd<<"\n";
+        pad_reader=std::thread(pad_reader_thread,pad_kw,std::ref(padst));
+    }
 
     std::thread writer; if (do_collect) writer=std::thread(writer_thread,jpeg_q);
     std::thread hot(hotctl_thread);
@@ -215,16 +274,22 @@ int main(int argc, char* argv[]) {
         int nf=epoll_wait(ep,evs,1,500);
         if(nf<0&&errno==EINTR)continue; if(nf<=0)continue;
         uint64_t exp; read(tfd,&exp,sizeof(exp));
-        int16_t x,y;int8_t w,hw;uint16_t b;
-        extract_and_clear(state,x,y,w,hw,b);
-        hid_report_submit(usb_session,x,y,w,hw,b,[cam_fps](std::array<uint8_t,HID_REPORT_LEN>& rpt,
-                                                           int16_t rx, int16_t ry) {
-            control_apply(cam_fps,rpt.data(),rx,ry); });
+        if (pad_mode) {
+            pad_tick(cam_fps,padst,pad_dump);  // 手柄拍: 快照→律速度→合并+账本→发布
+        } else {
+            int16_t x,y;int8_t w,hw;uint16_t b;
+            extract_and_clear(state,x,y,w,hw,b);
+            hid_report_submit(usb_session,x,y,w,hw,b,[cam_fps](std::array<uint8_t,HID_REPORT_LEN>& rpt,
+                                                               int16_t rx, int16_t ry) {
+                control_apply(cam_fps,rpt.data(),rx,ry); });
+        }
     }
 
     global_running=false;
     g_save_cv.notify_all();
-    hid_mouse_stop(usb_session);
+    if (!pad_mode) hid_mouse_stop(usb_session);
+    else pad_xinput_stop();
+    if (pad_reader.joinable()) pad_reader.join();
     hot.join(); ai.join();
     if (do_collect) writer.join();
     close(tfd);close(ep);

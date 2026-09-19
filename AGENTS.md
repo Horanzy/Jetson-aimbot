@@ -10,6 +10,12 @@ Capture card (UVC 1080p NV12) → GStreamer nvvidconv → CUDA preprocess → Te
 → merged with the real mouse → USB raw_gadget userspace device stack (generic HID mouse) → game
 ```
 
+Two output modes, mutually exclusive (`-M`): **hid** emits the corrections on the generic USB
+mouse (path above); **pad** passes a physical Xbox-layout gamepad through and merges the law's
+desired velocity onto its right stick, presenting the emulated **wired Xbox 360 pad**
+(0x045E/0x028E) so the host's XInput stack reads it as a controller — see "Pad mode" and
+`io/pad_xinput`.
+
 No hand-tuned gains: a bilateral side-key trigger runs auto-calibration, estimating sensitivity s (px/count) and loop delay L (ms) online. Adapts to PC / PS5 / 60fps / 120fps.
 
 **Control law**: the single program `src/aimbot.cu` uses **ff_pi_acc** (pole-placement PI + type-2 velocity feedforward with direction-contradiction CUSUM velocity reset and detection-gap FF decay, plus an innovation-mean â channel that removes the α-β structural lag on accelerating targets) — the convergence bandwidth `wn` is derived from the calibrated delay `L` via phase margin (`wn=(90°−PM)π/180/L`, PM=50°), **no hand-tuned magic numbers**, good generalization. The same binary has **optional training-data collection** (enabled with `-o`, otherwise pure aimbot). All control-law exploration/comparison/tuning happens in the pure-Python `arena/` simulation (this machine cannot compile .cu).
@@ -103,7 +109,7 @@ never reported as verified from here.
 
 | File | Role |
 |---|---|
-| `src/main.cu` | **The program entry**: argument parsing, device open, thread spawn, the 1kHz timerfd loop (`DEFAULT_FREQ=1000`). Full aimbot + optional training-data collection (`-o`); without `-o` it is pure aimbot |
+| `src/main.cu` | **The program entry**: argument parsing (including the output mode `-M hid` mouse / `-M pad` XInput pad), device open, thread spawn, the 1kHz timerfd loop (`DEFAULT_FREQ=1000`). Full aimbot + optional training-data collection (`-o`); without `-o` it is pure aimbot |
 | `src/core/control.cu/.h` | ff_pi_acc header constants (PRED_*/FF_*/CUSUM_*/ACC_* — pole-placement PI + type-2 velocity feedforward with direction-contradiction CUSUM velocity reset, detection-gap FF decay, gated â acceleration-bias compensation; wn derived from L, no hand tuning) + the 1kHz control-law tick + calibration state machine |
 | `src/core/estimator.cu/.h` | α-β filter + direction-contradiction CUSUM + innovation-mean â sensor (`estimator_step`, driven per frame by the capture thread; publishes `g_target`) |
 | `src/core/calib.cu/.h` | `run_calibration` / `persist_calibration` / `resolve_cam_device` + CalibSeg excitation trajectory tables |
@@ -112,11 +118,17 @@ never reported as verified from here.
 | `src/core/state.cu/.h` | shared globals: system constants, TargetState/CountsHistory/MouseState, hot-param & calibration atomics, time helpers, async save queue, signal |
 | `src/io/capture.cu/.h` | GStreamer pipeline + `ai_thread` (capture → inference → publish; three-source collection and preview) |
 | `src/io/hid_mouse.cu/.h` | evdev mouse read (EVIOCGRAB) + the USB mouse device definition (device/config/report descriptors — the report descriptor's source of truth) + per-tick 9-byte HID report assembly submitted into the raw_gadget session's latest-report slot (control counts merged via the overlay callback) |
-| `src/io/usbraw.cu/.h` | raw_gadget 会话承载: sysfs UDC 两级名字发现 → INIT/RUN/VBUS_DRAW;ep0 标准请求表(描述符按 wLength 截断 / 状态 / 配置 / 接口 / feature;OUT 或零长 SETUP 经 EP0_READ 收尾),设备特有(类/vendor)请求仅经可选钩子应答、不设即 STALL;单发送线程把"最新报告槽"灌入中断 IN 端点,报告率 = min(拍率 1000Hz, 主机服务率 8kHz)。ep0 标准部分与具体 HID 报告无关 — 第二个设备(手柄)各自提供描述符与钩子 |
+| `src/io/usbraw.cu/.h` | raw_gadget 会话承载: sysfs UDC 两级名字发现 → INIT/RUN/VBUS_DRAW;ep0 标准请求表(描述符按 wLength 截断 / 状态 / 配置 / 接口 / feature;OUT 或零长 SETUP 经 EP0_READ 收尾),设备特有(类/vendor)请求仅经可选钩子应答、不设即 STALL;中断 IN 端点的"最新报告槽"发送线程(EP_WRITE 长度 = 提交长度 — 短包即包边界)与可选的中断 OUT 端点收取线程(EP_READ 阻塞, 包内容无消费方即丢)。会话参数由设备定义给定: 枚举速度(FULL/HIGH, 端点 bInterval 的时间单位随之定)、设备限定符(nullptr = 无限定符, 该 GET_DESCRIPTOR 走 STALL — 仅全速设备的规范行为)、VBUS 请求(取配置节 bMaxPower, uapi 单位 2mA, 与内核 `usb_gadget_vbus_draw(2 × value)` 对齐)。停机与重枚举把阻塞在端点 ioctl 里的线程以空操作信号唤醒(内核侧这些等待都是 interruptible, 且在途 ioctl 持有文件引用, 只 close 收不了尾)。报告率 = min(拍率, 主机服务率), 可按设备定义打速率行。ep0 标准部分与具体报告无关 — 各设备只提供描述符与端点集 |
+| `src/io/pad_input.cu/.h` | pad-mode gamepad input: evdev reader thread (by-id/name lookup, capability bitmap verified per device — no hardcoded ranges; axis family xpad RX/RY vs HID Z/RZ chosen per bitmap), Xbox-layout `PadLogical` state (unsigned ranges center-expanded per measured absinfo), disconnect self-heal (clear keys + 1 s reopen retry) |
+| `src/io/pad_output.cu/.h` | pad-mode merge layer: law velocity → right-stick injection conversion + human-channel merge clamp, stick ledger Σ(deflection·ms), `own_motion_ledger` mode routing, `--pad-dump` printing; the 1kHz pad tick publishes the merged logical state into `g_pad_publish` (latest-slot + seq — the output backend's polling contract; the XInput backend consumes it, never rewrites sticks) |
+| `src/io/pad_xinput.cu/.h` | pad-mode output backend: the wired Xbox 360 pad's device bytes (0x045E/0x028E, full speed, single vendor interface FF/5D/01, interrupt IN 0x81 + OUT 0x02, 48-byte config including the 16-byte 0x21 blob, no HID report descriptor, no device qualifier — Windows' xusb binds on VID/PID + that interface triple, no Microsoft signature involved) and the 20-byte input report encoder (explicit `u8[20]` hand-assembled: int16 LE sticks, 0–255 triggers, button bits; the wire's Y is up-positive, the logical state's Y is up-negative) plus the report loop consuming the publish point at the tick rate |
+| `src/io/pad_test.cu` | `build/pad_test` unit test (built and run by `compile.sh`): injection/clamp math, ledger, trigger gating, ledger routing, absent-device non-blocking, publish-point contract, XInput wire format (report header, button bits, trigger mapping, int16 LE assembly and the Y convention) and device bytes |
 | `src/io/hotctl.cu/.h` | UDP hot-parameter channel 127.0.0.1:47700 |
-| `scripts/compile.sh` | nvcc build of aimbot → `bin/` + `build/calib_test` unit test (run on the Jetson) |
+| `scripts/compile.sh` | nvcc build of aimbot → `bin/` + `build/calib_test` and `build/pad_test` unit tests (run on the Jetson) |
 | `scripts/convert.sh` | Batch ONNX → TensorRT engine conversion |
 | `scripts/setup_mouse.sh` | raw_gadget 模块加载 + UDC 独占腾空(解绑 configfs 遗留 gadget)+ `/dev/raw-gadget` 权限 |
+| `scripts/test/uinput_pad_test.py` | pad-mode e2e on the Jetson: synthesizes a virtual Xbox-layout gamepad via uinput (xpad-style axes, deliberately unlike the G7 Pro's HID-style bitmap) and asserts passthrough 1:1, trigger scaling, fire/ads gating, and unplug/recovery against `--pad-dump` output (pure stdlib, run under sudo) |
+| `scripts/test/xinput_probe.ps1` | Windows-side verdict probe for the emulated pad: P/Invoke `xinput1_4.dll!XInputGetState`, polls the four user slots printing rc / packet number / decoded buttons+sticks+triggers (rc=1167 = slot empty, rc=0 with a growing packet = live); exit code 0 when a slot is live, 1 otherwise (ASCII-only source so PowerShell 5.1 parses it without a BOM) |
 | `scripts/game/template.sh.example` | Per-game launcher template — copy to `<game>.sh` (`.example` keeps the webui from listing it as a launchable profile). Relative paths; mouse-takeover switch `AIM_ENABLED` and screenshot-collection switches (`CAPTURE` master + per-source `CAP_FIRE`/`CAP_DET`/`CAP_AUTO`); auto write-back of calibration values `S_EST`/`L_EST`; the `MAX_SPEED` rule and its derivation live in the file |
 | `arena/` | Pure-Python control-law simulation evaluator (neutral simulator + 10 laws + standard + FPS test suites); see dedicated section |
 
@@ -131,7 +143,15 @@ Linking note: `aimbot` needs `-lopencv_video` (calibration uses `phaseCorrelate`
 -f framerate (120/60)  -x speed cap px/s  -s initial s  -l initial L  -r FOV radius px (default 150)
 -a mouse takeover (default y; n = pure pass-through: no injected motion, detection/collection keep running)
 -S write-back script path  -k trigger key (fire/ads/both)  -v preview
+-M hid|pad output mode (default hid; mutually exclusive — pad reads no mouse and never starts
+   the USB mouse session, hid never touches the gamepad; both own the UDC, so one at a time)
+-P pad by-id substring (default any *-event-joystick node)  --pad-dump adds the merged
+   logical state to the log at ≥50ms intervals (debug output on top of the live output)
 ```
+
+**Pad mode** (`-M pad`): the physical Xbox-layout gamepad passes through 1:1 (buttons, sticks, analog triggers with no threshold); RT≠0 = fire and LT≠0 = ads feed the same `-k` trigger semantics as hid. The control law's desired velocity (px/ms) is injected on the right stick as `v·1000/stick_gain·32767` (`stick_gain` = full-deflection screen speed, default 3000 px/s — one notch above the AGENTS.md speed-cap derivation ≈2000 px/s), merged with the human stick and clamped to ±32767; the effective speed cap is `min(-x, stick_gain)`. A stick ledger records Σ(deflection·tick-ms) of what the game receives — the pad counterpart of the `g_counts` invariant — and the estimator/law own-motion compensation source is routed per mode (`own_motion_ledger`: hid = `g_counts`, pad = the stick ledger); the law math is shared verbatim. The merged logical state is published every tick into the `g_pad_publish` latest-slot (contract in `io/pad_output.h`) — the output backend (`io/pad_xinput`) polls it and must not rewrite the sticks (the ledger already accounts what the game receives). Disconnect/sleep self-heals: keys are cleared and the device is reopened on a 1 s retry cycle, non-blocking at startup.
+
+**Pad output** (`io/pad_xinput`): the pad mode's USB side is the emulated wired Xbox 360 pad — the host's own XInput stack sees a device (`XInputGetState` rc=0, packet number rising with the report stream) whose buttons/sticks/triggers are the merged logical state. Bytes and their provenance are the device definition in `io/pad_xinput.cu`; the wire's Y is up-positive while `PadLogical` is up-negative, so the two Y axes are negated at the encoder (the unit test pins both the assembly and the convention). Frame facts: full speed, 4 ms IN / 8 ms OUT `bInterval` (the reference firmware's own values — the verification host serves the endpoint every 1 ms regardless, so the terminal update rate there is the host's, not the descriptor's), 500 mA declared and requested, device qualifier deliberately absent. `usbraw` stays protocol-agnostic: a future pad protocol is a sibling file, not a change to the session layer.
 
 Hot params: the binary opens a localhost-only UDP control channel (127.0.0.1:47700, `key=value;...`); the webui pushes whitelisted params (`t`/`y`/`x`/`fov`/`k`/`aim`/`cap_fire`/`cap_det`/`cap_auto`, clamped firmware-side) into the running process without restart — protocol in `webui/README.md`. Structural constants stay compile-time.
 

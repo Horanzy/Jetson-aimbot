@@ -3,7 +3,8 @@
 //    收敛带宽 wn 由标定延迟 L 自动导出 (wn=(90°−PM)π/180/L), 阻尼比/前馈增益/
 //    CUSUM 与 â 通道参数均给出物理出处; 触发键位与接管保持窗。各常量的推导
 //    与调整指引见 AGENTS.md "Tuning" 与 arena/laws/ff_pi_acc.py; 控制律按拍
-//    执行 (control_apply, 拍率 = DEFAULT_FREQ) 在 control.cu。
+//    执行 (control_apply / control_apply_pad 两执行后端共用同一 law_tick,
+//    拍率 = DEFAULT_FREQ) 在 control.cu。
 // ============================================================================
 
 #pragma once
@@ -52,3 +53,10 @@ const int KEEP_ALIVE_MS = 200;                       // 松开触发键后保持
 //  纯透传 (-a n / 热参 aim=0) 时不注入。cam_fps 用于丢帧期前馈衰减的时间尺度,
 //  rpt 为 HID_REPORT_LEN 字节报文缓冲 (只改写位移字节)。
 void control_apply(int cam_fps, uint8_t* rpt, int16_t real_x, int16_t real_y);
+
+// pad 模式的律入口 (与 control_apply 同一 law_tick, 律数学逐句一致): btns 为
+//   触发键位字 (fire→LEFT_KEY, ads→RIGHT_KEY, 由 pad 侧 RT/LT 门控生成 — 侧键
+//   抑制与双侧键标定是 hid 键位语义, pad 键位字恒无那些位, 分支自然惰性)。
+//   输出期望速度 (px/ms) 与注入门 (接管开 × 触发保持窗内); 速度帽取
+//   min(热参 x, 满偏转屏速)。量化/报文/counts 尾巴是 hid 专属, pad 路径不含。
+bool control_apply_pad(int cam_fps, uint16_t btns, float& out_vx, float& out_vy);

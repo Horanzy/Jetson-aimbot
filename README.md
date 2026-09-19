@@ -2,12 +2,15 @@
 
 AI visual aimbot (mouse pass-through) running on an NVIDIA Jetson Orin. The Jetson receives the game picture through a capture card, detects targets with TensorRT YOLO, and computes mouse corrections with a delay-aware control law. Commands are merged with the real mouse and emitted through a user-space USB device stack (USB raw_gadget; the device identifies as a generic USB mouse), so it behaves like an ordinary mouse.
 
+A second output mode (`-M pad`) passes a physical Xbox-layout gamepad through, merges the same law's velocity onto its right stick, and presents the emulated **wired Xbox 360 pad** (0x045E/0x028E) — the host's XInput stack reads it as a controller (`XInputGetState` rc=0). The two modes are mutually exclusive.
+
 ## Pipeline
 
 ```
 Capture card (UVC 1080p NV12) → GStreamer nvvidconv → CUDA preprocess → TensorRT YOLO
 → alpha-beta tracking → control law (pole-placement PI + type-2 velocity feedforward)
-→ merged with the real mouse → USB raw_gadget device stack → game
+→ merged with the real mouse   → USB raw_gadget device stack (generic HID mouse) → game
+  merged with the real gamepad → USB raw_gadget device stack (XInput pad, -M pad) → game
 ```
 
 ## No hand-tuned gains
@@ -21,9 +24,13 @@ The single binary `bin/aimbot` runs **ff_pi**: pole-placement PI + type-2 veloci
 ## Repository layout
 
 ```
-src/       CUDA/C++ source (aimbot.cu — the ff_pi law)
+src/       CUDA/C++ source: main.cu (entry) + core/ (control law, estimator,
+           calibration) + io/ (capture, USB mouse output, pad input/merge,
+           XInput pad output, hot params)
 scripts/   compile.sh / convert.sh (ONNX→engine) / setup_mouse.sh (raw_gadget mouse channel)
            / game/template.sh.example
+           / test/uinput_pad_test.py (on-device pad-mode e2e)
+           / test/xinput_probe.ps1 (Windows-side XInput verdict probe, P/Invoke xinput1_4.dll)
 arena/     pure-Python control-law simulator + benchmark suite
 engine/    TensorRT engines (not committed)
 onnx/      ONNX models (not committed)
@@ -40,7 +47,18 @@ chmod +x scripts/game/<game>.sh
 scripts/game/<game>.sh        # calibrate once; S_EST/L_EST are written back into it
 ```
 
-Requires JetPack with TensorRT 10, CUDA, OpenCV 4, GStreamer, and a UVC capture card supporting 1080p NV12 @ 120 Hz. The USB output needs the kernel **`raw_gadget` module** — an external dependency to provide on the deployment machine (distro package, or built out-of-tree per the kernel doc `Documentation/usb/raw_gadget.rst`).
+Requires JetPack with TensorRT 10, CUDA, OpenCV 4, GStreamer, and a UVC capture card supporting 1080p NV12 @ 120 Hz. The USB output needs the kernel **`raw_gadget` module** — an external dependency to provide on the deployment machine (distro package, or built out-of-tree per the kernel doc `Documentation/usb/raw_gadget.rst`). Both output modes (`-M hid` mouse, `-M pad` XInput pad) own the UDC, so they run one at a time; `scripts/setup_mouse.sh` frees the UDC and sets `/dev/raw-gadget` permissions for either.
+
+Pad mode (`-M pad`, physical gamepad on `/dev/input/by-id`, `-P` to select it):
+
+```bash
+bin/aimbot -M pad -m engine/apex.engine -d /dev/video0 -f 120 -k fire   # XInput pad output
+scripts/test/xinput_probe.ps1 -Count 8                                  # on the Windows host
+```
+
+The Windows probe polls `xinput1_4.dll!XInputGetState` on all four user slots and prints the
+return code, the packet number and the decoded report: rc=1167 means the slot is empty,
+rc=0 with a rising packet number means the emulated pad is live.
 
 ## arena (control-law development)
 

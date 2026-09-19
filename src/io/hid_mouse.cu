@@ -71,7 +71,8 @@ void reader_thread(const std::string& dev, MouseState& st) {
 // ========================= USB 鼠标身份 =========================
 // VID/PID/bcdDevice = Linux Foundation 通用 gadget 身份 — 验收主机 Windows 侧
 //   已按此身份装好驱动, 身份不变; 引导协议接口 (subclass=1/protocol=2) 与
-//   100mA 上限同为主机侧既有事实。aarch64 小端, 描述符 __le16 字段直写数值。
+//   100mA 上限 (bMaxPower=50 单位 2mA; VBUS 请求由该字节导出, 见 usbraw) 同为主机侧既有事实。
+//   aarch64 小端, 描述符 __le16 字段直写数值。
 
 // 报告描述符 — 全库唯一事实源 (HID 类描述符的 wDescriptorLength 由本数组长度
 //   编译期导出): Report ID 0x02 + 16 键 (字节 1–2) + X/Y s16 相对位移 (3–6)
@@ -126,7 +127,7 @@ static constexpr uint8_t MOUSE_CONFIG[34] = {
     0x01,             //   bConfigurationValue = 1
     0x00,             //   iConfiguration (无配置串)
     0x80,             //   bmAttributes: 总线供电, 无远程唤醒
-    0x32,             //   bMaxPower = 50 (单位 2mA) = 100mA, 与 VBUS_DRAW(100) 一致
+    0x32,             //   bMaxPower = 50 (单位 2mA) = 100mA (VBUS 请求由本字节导出)
     0x09, USB_DT_INTERFACE,
     0x00,             //   bInterfaceNumber = 0
     0x00,             //   bAlternateSetting = 0
@@ -155,6 +156,12 @@ static const UsbRawStringDef MOUSE_STRINGS[] = {
     { 1, "Generic" }, { 2, "USB Mouse" }, { 3, "000000000001" },
 };
 
+// 设备限定符: 高速设备必答 (USB 2.0 §9.6.2) — bMaxPacketSize0 与设备描述符一致
+static const usb_qualifier_descriptor MOUSE_QUALIFIER = {
+    (uint8_t)sizeof(usb_qualifier_descriptor), USB_DT_DEVICE_QUALIFIER,
+    0x0200, 0, 0, 0, 64, 1, 0,
+};
+
 static UsbRawDeviceDef build_mouse_usb() {
     UsbRawDeviceDef d{};
     usb_device_descriptor& dev = d.device;
@@ -173,16 +180,7 @@ static UsbRawDeviceDef build_mouse_usb() {
     dev.iSerialNumber    = 3;
     dev.bNumConfigurations = 1;
 
-    usb_qualifier_descriptor& q = d.qualifier;
-    q.bLength            = (uint8_t)sizeof(usb_qualifier_descriptor);
-    q.bDescriptorType    = USB_DT_DEVICE_QUALIFIER;
-    q.bcdUSB             = 0x0200;
-    q.bDeviceClass       = 0;
-    q.bDeviceSubClass    = 0;
-    q.bDeviceProtocol    = 0;
-    q.bMaxPacketSize0    = 64;
-    q.bNumConfigurations = 1;
-    q.bRESERVED          = 0;
+    d.qualifier          = &MOUSE_QUALIFIER;
 
     usb_endpoint_descriptor& ep = d.ep_in;
     ep.bLength           = USB_DT_ENDPOINT_SIZE;
@@ -196,9 +194,12 @@ static UsbRawDeviceDef build_mouse_usb() {
     d.config_len        = sizeof(MOUSE_CONFIG);
     d.report_desc       = MOUSE_REPORT_DESC;
     d.report_desc_len   = REPORT_DESC_LEN;
+    d.speed             = USB_SPEED_HIGH;     // 端点 bInterval=1 按高速微帧解释 (见配置节注)
+    d.has_ep_out        = false;              // 鼠标只有中断 IN 端点
     d.strings           = MOUSE_STRINGS;
     d.string_count      = (uint8_t)(sizeof(MOUSE_STRINGS) / sizeof(MOUSE_STRINGS[0]));
     d.vendor_request    = nullptr;            // 鼠标无设备特有请求 → 一切非标准请求 STALL
+    d.rate_trace        = false;              // HID 鼠标不发速率行 (报告率非其验收项)
     return d;
 }
 
