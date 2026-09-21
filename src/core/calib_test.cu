@@ -9,7 +9,8 @@
 //    [4] 状态机: 计划/相位推进, 到位即停, 超时与不响应轴的跳过, 回执路径, 成功/失败
 //        收尾, 纯透传复位, 上一轮判定复位, padcalib 重入丢弃
 //    [5] 合成闭环 e2e (核心验收): 虚拟游戏 (已知 L; 可选一阶滞后; 可选噪声与丢帧;
-//        60/120fps) 跑完整一轮, 报出 L 的偏差与散度
+//        60/120fps; 逐轴可给不同的 L) 跑完整一轮, 报出 L 的偏差与散度; 两轴延迟不同的
+//        两条链钉住"逐轴并列报出、回写取全轮中位" (大差被散度门拦下, 小差照常成功)
 //    [6] 不可测的诚实性: 画面不响应 / 只有噪声 / 尾迹被停顿截断 → 整轮失败、不写回
 //  全部断言通过输出 ALL PASS 并返回 0。
 // ============================================================================
@@ -117,6 +118,7 @@ struct Plant {
     double sigma = 0.03;   // 逐帧位移噪声 (px; 真机数字采集 0.03–0.1)
     double drop_p = 0;     // 逐帧样本丢失概率
     double move = 1.0;     // 屏幕响应比例 (0 = 完全不动)
+    double L_y = -1;       // Y 轴自己的延迟 (ms; <0 = 与 L 相同) —— 逐轴策略不同的合成
 };
 
 struct E2E {
@@ -197,7 +199,9 @@ E2E run_e2e(CalMode mode, const Plant& plant, int cam_fps, unsigned seed, bool f
                 // 观测: 画面在上一有效样本到本样本之间走过的距离 (丢帧即间隔变大 —
                 //   与真机相邻有效帧的相关口径一致)
                 const double ts_prev = (last_ts < 0) ? (ts - dt) : last_ts;
-                const double disp = Dof(ts - plant.L) - Dof(ts_prev - plant.L);
+                // 逐轴延迟: Y 轴可以有自己的 L (两轴平滑策略不同的合成链)
+                const double L_ax = (ex_axis == 1 && plant.L_y >= 0) ? plant.L_y : plant.L;
+                const double disp = Dof(ts - L_ax) - Dof(ts_prev - L_ax);
                 CalibSample s;
                 s.t = at_ms(ts);
                 s.dt_ms = (float)((last_ts < 0) ? dt : (ts - last_ts));
@@ -376,6 +380,15 @@ int main() {
         CHECK(cal_plan_worst_ms(CAL_MODE_HID) < 20000
               && cal_plan_worst_ms(CAL_MODE_PAD) < 20000,
               "整轮最坏时长有界 (每轴连续 N 段超时即跳过该轴)");
+        CHECK(cal_plan_worst_ms(CAL_MODE_HID) - cal_plan_span_ms(CAL_MODE_HID) == CAL_TRIGGER_MS
+              && cal_plan_worst_ms(CAL_MODE_PAD) - cal_plan_span_ms(CAL_MODE_PAD) == CAL_TRIGGER_MS,
+              "触发时打印的是计划时长 (不含触发长按窗): 两个数恰好差一个 CALIB_TRIGGER_TICKS");
+        printf("     计划 ≤%.1fs (hid) / ≤%.1fs (pad) — 触发后还要多久; "
+               "含触发长按 %ds 的整轮上限 ≤%.1fs / ≤%.1fs (采样窗深度的出处)\n",
+               (double)cal_plan_span_ms(CAL_MODE_HID) / 1000.0,
+               (double)cal_plan_span_ms(CAL_MODE_PAD) / 1000.0, CAL_TRIGGER_MS / 1000,
+               (double)cal_plan_worst_ms(CAL_MODE_HID) / 1000.0,
+               (double)cal_plan_worst_ms(CAL_MODE_PAD) / 1000.0);
         CHECK(cal_hist_frames(CAL_MODE_HID, 120) >= 1000, "采样窗深度覆盖整轮最坏时长");
         // 触发: 双侧键长按 5s (hid) → 起始十字 → 激励相位; 松手不中断
         g_aim_enabled.store(true);
@@ -469,6 +482,36 @@ int main() {
         printf("     (一阶滞后用例的真值 = L + τ: 尾迹读的是画面全部残余运动的等效滞后,\n"
                "      这正是控制律要补偿的那个量; 边沿读数因平滑磨圆而略偏)\n");
         CHECK(n_ok == (int)cases.size(), "全部用例整轮成功 (无一失败)");
+
+        // 两轴延迟不同的两条合成链 (hid 两轴各是一份独立读数; 逐轴中位并列报出, 回写取
+        //   全轮中位 —— 见 calib_run.h 的聚合段, 那里没有逐轴一致性判定: 4 条读数不足以
+        //   再分一层, 而两轴真分得开时先被尾迹族的散度门拦下)
+        {
+            Plant p{40, 1.5, 0, 0.03, 0, 1};
+            p.L_y = 70;                                     // 两轴差 30ms = 3.6 个采样间隔
+            const E2E e = run_e2e(CAL_MODE_HID, p, 120, 11u, false);
+            CHECK(!e.ok && std::string(e.r.err).find("离散") != std::string::npos,
+                  "两轴延迟相差 30ms → 尾迹族散度门拦下整轮 (读数不是同一次物理测量的重复)");
+            CHECK(e.r.l_axis_n[0] > 0 && e.r.l_axis_n[1] > 0 && e.r.l_axis[1] > e.r.l_axis[0],
+                  "逐轴中位仍并列报出 (现场证据), 且 Y 轴高在真实的那一侧");
+            printf("     两轴差异大: X %.1fms / Y %.1fms → %s\n",
+                   (double)e.r.l_axis[0], (double)e.r.l_axis[1], e.r.err);
+        }
+        {
+            Plant p{40, 1.5, 0, 0.03, 0, 1};
+            p.L_y = 44;                                     // 小差 (4ms < 半个采样间隔)
+            const E2E e = run_e2e(CAL_MODE_HID, p, 120, 13u, false);
+            CHECK(e.ok, "两轴小差 (4ms) 整轮成功 (同一次物理测量的两半)");
+            CHECK(std::fabs((double)e.r.l_axis[0] - 40.0) <= 1.5
+                  && std::fabs((double)e.r.l_axis[1] - 44.0) <= 1.5,
+                  "逐轴中位各自落在本轴的真值上 (并列诊断读得出这个差)");
+            CHECK(std::fabs((double)e.r.l_est - 42.0) <= 2.5
+                  && (double)e.r.l_est >= (double)e.r.l_axis[0] - 1.0
+                  && (double)e.r.l_est <= (double)e.r.l_axis[1] + 1.0,
+                  "回写值 = 全轮 (两轴合并) 中位: 落在两轴中位之间, 不是某一轴的数");
+            printf("     两轴差异小: X %.1fms / Y %.1fms → 回写 %.1fms (全轮中位)\n",
+                   (double)e.r.l_axis[0], (double)e.r.l_axis[1], (double)e.r.l_est);
+        }
     }
 
     std::cout << "[6] 不可测的诚实性: 失败 + 不写回\n";
@@ -504,6 +547,9 @@ int main() {
                    cal_plan_worst_ms(CAL_MODE_HID));
             CHECK(e.ticks <= cal_plan_worst_ms(CAL_MODE_HID),
                   "不响应轴被跳过 → 整轮时长不超过上限 (不会跑满最坏时长)");
+            CHECK(e.ticks >= CALIB_TRIGGER_TICKS
+                  && cal_plan_worst_ms(CAL_MODE_HID) > cal_plan_span_ms(CAL_MODE_HID),
+                  "整轮拍数含触发长按窗 (故历史上限含它), 打印的计划时长不含它");
             CHECK(!cal_writeback(CAL_VAR_HID, e.r, path), "失败路径不写回");
         }
         // 尾迹被停顿截断: L 远超静止参考窗起点 → 失败而不是给一个偏小的数

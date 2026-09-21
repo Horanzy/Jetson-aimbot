@@ -31,7 +31,7 @@ PARAM_DEFS = {
     "y_offset":        dict(kind="float", lo=0.0, hi=100.0, default=65.0),
     "cam_dev":         dict(kind="str",   default="Asus"),
     "cam_fps":         dict(kind="int",   lo=1, hi=240, default=120),
-    "max_speed":       dict(kind="float", lo=100.0, hi=20000.0, default=1500.0),
+    "max_speed":       dict(kind="float", lo=100.0, hi=20000.0, default=2000.0),
     # 输出模式 (冷: 它决定整条输出后端, 运行中不可换) 与各模式的设备选择
     "output_mode":     dict(kind="enum",  choices=OUTPUT_MODES, default="hid"),
     "mouse_keyword":   dict(kind="str",   default=""),

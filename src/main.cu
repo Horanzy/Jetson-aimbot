@@ -174,11 +174,14 @@ int main(int argc, char* argv[]) {
              if (std::ifstream(model_path).good()) break; std::cerr<<"文件不存在\n"; } }
 
     int   cls     =std::stoi(!a_c.empty()?a_c:get_input_with_default("类别ID","0"));
-    float conf    =std::stof(!a_t.empty()?a_t:get_input_with_default("置信度","0.4"));
+    // 交互默认与启动模板/文档同值 (置信度 0.5; 速度上限 2000 = scripts/game/
+    //   template.sh.example 里 MAX_SPEED 的成文推导的落点) — 只交互式跑固件的人与经
+    //   webui/模板启动的人落在同一个工作点上。
+    float conf    =std::stof(!a_t.empty()?a_t:get_input_with_default("置信度","0.5"));
     float y_off   =std::stof(!a_y.empty()?a_y:get_input_with_default("Y偏移","65"));
     int   cam_fps =std::stoi(!a_f.empty()?a_f:get_input_with_default("帧率","120"));
     cam_fps=std::clamp(cam_fps,1,240);
-    float max_spd =std::stof(!a_x.empty()?a_x:get_input_with_default("最大速度","1500"));
+    float max_spd =std::stof(!a_x.empty()?a_x:get_input_with_default("最大速度","2000"));
     max_spd=std::clamp(max_spd,100.0f,20000.0f);
     const float max_v=max_spd/1000.0f;
     float init_l=std::clamp(std::stof(a_l.empty()?"60":a_l),L_MIN,L_MAX);

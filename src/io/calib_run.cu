@@ -61,12 +61,18 @@ std::vector<CalPlanSeg> cal_plan(CalMode m) {
     return p;
 }
 
-int cal_plan_worst_ms(CalMode m) {
-    // 全程上限 = 触发长按窗 (5s) + 每轴一次不响应中止 (CAL_ABORT_N 段超时后跳过其余段)
+int cal_plan_span_ms(CalMode m) {
+    // 计划播放上限 = 每轴一次不响应中止 (CAL_ABORT_N 段超时后跳过该轴其余激励段)
     //   + 动画/静置/回执窗 (起始十字 1460 + 收尾静置 300 + 回执超时 2000 + 点头/摇头 720)
+    //   触发前的长按窗不属于计划 (见 cal_plan_worst_ms / calib_run.h)
     const int axes = (m == CAL_MODE_PAD) ? 1 : 2;
     const int pauses = 2 * cal_pairs(m);        // 每轴段后停顿数 (不响应时照旧播放 — σ 的来源)
-    return 5000 + axes * (CAL_ABORT_N * CAL_SEG_TIMEOUT_MS + pauses * CAL_PAUSE_MS) + 4480;
+    return axes * (CAL_ABORT_N * CAL_SEG_TIMEOUT_MS + pauses * CAL_PAUSE_MS) + 4480;
+}
+
+int cal_plan_worst_ms(CalMode m) {
+    // 整轮历史上限 = 计划 + 触发长按窗 (长按期间采集线程照常出样本, 采样窗要装下它)
+    return CAL_TRIGGER_MS + cal_plan_span_ms(m);
 }
 
 int cal_hist_frames(CalMode m, int cam_fps) {
@@ -429,12 +435,9 @@ CalResult cal_fit(CalMode mode, const std::deque<CalibSample>& hist,
     r.used_edges = !tail_ok;
     r.l_est = prim.med;
 
-    // 两轴一致度 (hid): 一致 → 合并; 不一致 → 如实并列, 结论写进日志
-    r.axes_agree = true;
-    if (r.l_axis_n[0] >= CAL_MIN_READINGS && r.l_axis_n[1] >= CAL_MIN_READINGS) {
-        const Stat s0 = stat_of(tail[0], 0.0), s1 = stat_of(tail[1], 0.0);
-        r.axes_agree = std::fabs((double)s0.med - (double)s1.med) <= agree_tol(s0, s1, frame);
-    }
+    // 逐轴尾迹中位并列报出 (诊断): 每模式有自己的逐轴平滑策略, 两个数并排放在日志里;
+    //   回写取全轮中位 —— 这里没有逐轴一致性判定 (见 calib_run.h 的聚合段: 4 条读数
+    //   不足以再分一层, 两轴真分得开时先被尾迹族的散度门拦下, 且两条路的落点同为一个数)
     if (r.l_est < L_MIN || r.l_est > L_MAX) {
         r.err = "实测延迟超出物理带 (测量无效, 不硬钳制)";
         return r;
@@ -498,12 +501,10 @@ void cal_print_diag(CalMode mode, const CalResult& r, size_t hist_n) {
     printf("[标定] 尾迹−起始沿 = %+.1fms (容差 ±%.1fms = 3·SE + max(一个采样间隔, 0.3·L))\n",
            (double)r.consist_diff, (double)r.consist_tol);
     if (r.l_axis_n[0] || r.l_axis_n[1])
-        printf("[标定] 逐轴 (尾迹族): X %d 条 中位 %.1fms | Y %d 条 中位 %.1fms → %s\n",
+        printf("[标定] 逐轴 (尾迹族, 并列诊断): X %d 条 中位 %.1fms | Y %d 条 中位 %.1fms%s "
+               "→ 回写取全轮中位 (逐轴差异由尾迹族散度门兜住)\n",
                r.l_axis_n[0], (double)r.l_axis[0], r.l_axis_n[1], (double)r.l_axis[1],
-               (r.l_axis_n[0] && r.l_axis_n[1])
-                   ? (r.axes_agree ? "两轴一致, 合并取全轮中位"
-                                   : "两轴不一致 (逐轴平滑策略不同? 延迟仍是一个量), 取全轮中位")
-                   : (r.l_axis_n[0] ? "仅 X 轴出读数" : "仅 Y 轴出读数"));
+               (r.l_axis_n[0] && r.l_axis_n[1]) ? "" : " (只一轴出读数)");
     if (r.err[0]) printf("[标定] 无法测量: %s (样本 %zu)\n", r.err, hist_n);
     else if (r.used_edges)
         printf("[标定] L=%.1f ms (尾迹族不可用, 取停止沿族中位) — 只标延迟; 速度不回写 "
@@ -645,12 +646,13 @@ CalStep cal_step(CalMode mode, uint16_t btns, int cam_fps,
         if ((btns & mask) == mask) ++s.hold; else s.hold = 0;
         if (req || s.hold >= CALIB_TRIGGER_TICKS) {
             s.hold = 0;
-            printf("[标定] 触发 (%s): %s, 段间停顿 %dms, 到位即停; 只标延迟; 全程 ≤%.1fs "
-                   "— 请双手离开控制器\n",
+            printf("[标定] 触发 (%s): %s, 段间停顿 %dms, 到位即停; 只标延迟; 触发后计划 ≤%.1fs "
+                   "(触发前那 %ds 长按不计; 整轮历史上限 ≤%.1fs) — 请双手离开控制器\n",
                    mode == CAL_MODE_PAD ? "手柄 L3+R3 / webui" : "鼠标双侧键",
                    mode == CAL_MODE_PAD ? "水平轴分级激励 (摇杆偏转)"
                                         : "X/Y 两轴速率激励 (鼠标 counts)",
-                   CAL_PAUSE_MS, (double)cal_plan_worst_ms(mode) / 1000.0);
+                   CAL_PAUSE_MS, (double)cal_plan_span_ms(mode) / 1000.0,
+                   CAL_TRIGGER_MS / 1000, (double)cal_plan_worst_ms(mode) / 1000.0);
             fflush(stdout);
             enter(s, mode == CAL_MODE_PAD ? CAL_PAD_START_SEQ : CAL_HID_START_SEQ, CP_START);
             out.active = true;                       // 触发拍不播激励

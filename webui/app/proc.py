@@ -76,7 +76,7 @@ def build_argv(root: Path, params: dict, script_path: Path) -> list:
             "-y", fmt_num(params.get("y_offset", 65.0)),
             "-d", str(params.get("cam_dev", "Asus")),
             "-f", fmt_num(params.get("cam_fps", 120)),
-            "-x", fmt_num(params.get("max_speed", 1500.0)),
+            "-x", fmt_num(params.get("max_speed", 2000.0)),
             "-S", str(script_path),
             # 拉枪速度倍率 (逐轴, 100 = 基线) — 与脚本同构地显式给出, 缺省即脚本值
             "--spd", "%d,%d" % (slot("spd_x"), slot("spd_y")),
