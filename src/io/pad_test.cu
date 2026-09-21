@@ -23,6 +23,18 @@
 //   [12] 附属接口键翻译表 (KEY_SYSRQ → 触摸板位) 与 8/16 位分辨率对照
 //   [13] pad 后端会话启动参数: 设备定义自洽 (报告长 ≤ 单包, EP_ENABLE 描述符与
 //        配置节逐字节一致)
+//   [13] P5G 线格式 (PS5): 8 位线上码 ↔ 16 位逻辑域的**往返恒等** (256 个码值逐个
+//        断言: 码 → pad_axis_to_logical → p5g_stick8 == 码), 注入的落点 (16 位注入
+//        量按 258 的台阶折算进 8 位字段, 取整方向 = floor/算术右移; 线上一步 =
+//        258 个 16 位计数, 手算期望值逐条比对), 64B 报告的逐字节编码 (摇杆/扳机
+//        直映与数字位抗抖带/按键位表/十字 hat/触摸板常态/0x001A 特征字/hash 零)
+//   [14] P5G 设备字节: 加密狗身份/配置节/双端点/165B 报告描述符/字符串/全速无限定符/
+//        类请求钩子/报告率标签 — 上线外观的逐项断言
+//   [15] P5G 认证状态机 (合成加密狗 I/O): 质询原样转发与类型分派 (F1 配额 4/1/0)、
+//        滞后一次取数、F2 的 ACK+500ms 自动取回、非 idle 丢弃、失败弃回合可恢复、
+//        reset 与加密狗缺席语义
+//   [16] P5G 签名流水线: 变化驱动 + 4 次重复 + 单份在途 + 单槽背压丢弃 + 未就绪
+//        静默 + pending 看门狗
 //  全部断言通过输出 ALL PASS 并返回 0。
 // ============================================================================
 
@@ -34,6 +46,7 @@
 #include <iostream>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include <unistd.h>
 #include <linux/input.h>          // KEY_SYSRQ/KEY_A/KEY_ENTER (附属接口翻译表的用例)
@@ -42,6 +55,7 @@
 #include "core/state.h"
 #include "io/pad_input.h"
 #include "io/pad_output.h"
+#include "io/pad_p5g.h"
 #include "io/pad_xinput.h"
 
 static int g_fail = 0;
@@ -533,6 +547,387 @@ int main() {
         CHECK(d16 == 164 && d8 == 1,
               "0.5% 满偏命令: 16 位域 = 164 counts (台阶 0.003%), 8 位域只剩 1 count "
               "(台阶 0.39%, 量化误差 ≈22%)");
+    }
+
+    std::cout << "[13] P5G 线格式: 8 位线上码 ↔ 16 位逻辑域的往返恒等与注入落点\n";
+    {
+        // 位宽三方核对 (docs/p5general §2/§4.1 与参考固件 P5GeneralDriver.cpp:156):
+        //   描述符声明 6 个 8 位绝对轴 (0..255) → 线上是 8 位; 参考固件把 16 位内部
+        //   状态右移 8 位放进该字段。本库的逻辑域是 pad_input 的 step-258 展开域,
+        //   所以逆映射必须是**那张表的精确逆**, 而不是 >>8 (算术右移) 或
+        //   (v+32768)>>8 (DualSense 口径) —— 后两者与 258 的负半程不整除, 256 个
+        //   码值里有 127 个差一 (码 c → 线上 c−1), 即人手通道被系统性缩小一档。
+        int bad_rt = -1, bad_shift = 0;
+        for (int c = 0; c <= 255; ++c) {
+            const int16_t v = pad_axis_to_logical(c, 0, 0xFF);
+            if (p5g_stick8(v) != c && bad_rt < 0) bad_rt = c;
+            // 对照: 两个被否决的式子在这 256 个码值上的失败计数 (负半程各差一)
+            if ((uint8_t)(((int)v + 32768) >> 8) != c) ++bad_shift;
+        }
+        CHECK(bad_rt < 0, "256 个码值逐个往返恒等: 码 → pad_axis_to_logical → p5g_stick8 == 码");
+        CHECK(bad_shift == 127,
+              "对照: (v+32768)>>8 口径在 256 个码值里错 127 个 (码 1..127 各少一档)");
+        CHECK(p5g_stick8(-32767) == 0 && p5g_stick8(-32766) == 1
+              && p5g_stick8(0) == 128 && p5g_stick8(32766) == 255
+              && p5g_stick8(32767) == 255,
+              "两端与中点: −32767→0 (端点吸收的逆), −32766→1, 0→128, +32766/+32767→255");
+        bool mono = true;
+        for (int v = -32767; v < 32767; ++v)
+            if (p5g_stick8((int16_t)v) > p5g_stick8((int16_t)(v + 1))) mono = false;
+        CHECK(mono, "单调不减 (整条 ±32767 域, 含取整边界)");
+        // 注入落点: 16 位域算完折算进 8 位字段, 一步 = 258 个 16 位计数 (该轴一个
+        //   线上台阶的 16 位长度), 取整方向 floor (向 −∞) = 算术右移的方向。
+        //   人手码对应的逻辑量都是 258 的整数倍, 故线上码 = 人手码 + floor(注入/258),
+        //   即"人手原样透传 + 注入按同一台阶折算"的加法分解。
+        struct IC { int code; int inj; int wire; };
+        const IC injs[] = {
+            { 128,     0, 128 },   // 无注入: 原样
+            { 128,   258, 129 },   // +1 步
+            { 128,   257, 128 },   // 不足一步 (线上无变化) — 一步 = 258 个 16 位计数
+            { 128,  -258, 127 },   // −1 步
+            { 128,  -257, 127 },   // 不足一步但 floor 已落下一档 (算术右移的取整方向)
+            { 128,  1290, 133 },   // +5 步 (1290 = 5×258)
+            { 128, -1290, 123 },   // −5 步
+            { 200,  1290, 205 },   // 非中位人手码 (逻辑 18576) 上叠 +5 步
+            {  60,  -516,  58 },   // 负半程非中位 (逻辑 −17544) 上叠 −2 步
+            { 128, 32767, 255 },   // 满量注入 → 线上满偏 (钳制)
+            { 128,-32767,   0 },   // 反向满量 → 线上 0
+        };
+        bool inj_ok = true;
+        int inj_bad = 0;
+        for (const IC& t : injs) {
+            const int16_t h = pad_axis_to_logical(t.code, 0, 0xFF);
+            const int m = std::clamp((int)h + t.inj, -PAD_AXIS_MAX, PAD_AXIS_MAX);
+            if (p5g_stick8((int16_t)m) != t.wire) { inj_ok = false; inj_bad = t.code; }
+        }
+        CHECK(inj_ok, "注入落点 = 人手码 + floor(注入/258) (手算期望值逐条相符, 含合并钳制两端)");
+        if (!inj_ok) std::printf("      首个不符: code %d\n", inj_bad);
+
+        uint8_t r[PAD_P5G_REPORT_LEN];
+        pad_p5g_report(PadLogical{}, r);          // 全零逻辑态 = 中性手柄
+        bool zero = true;
+        for (size_t i = 11; i <= 29; ++i) zero &= r[i] == 0;
+        for (size_t i = 40; i <= 55; ++i) zero &= r[i] == 0;
+        for (size_t i = 56; i <= 63; ++i) zero &= r[i] == 0;
+        CHECK(r[0] == 0x01 && zero, "报告 ID 0x01; 计数器/序列号/陀螺/加速度计/hash 恒零");
+        CHECK(r[1] == 0x80 && r[2] == 0x80 && r[3] == 0x80 && r[4] == 0x80,
+              "四摇杆轴中位 0x80 (零逻辑态)");
+        CHECK(r[5] == 0 && r[6] == 0 && r[7] == 0 && r[8] == 0x0F && r[9] == 0 && r[10] == 0,
+              "扳机 0 / reportCounter 0 / hat 中性 0x0F / 按键全零 / home+触摸板零");
+        CHECK(r[30] == 0x1A && r[31] == 0x00, "特征字 0x001A (字节 30..31, 小端)");
+        CHECK(r[32] == 0x80 && r[33] == 0xC0 && r[34] == 0x73 && r[35] == 0x1D
+              && r[36] == 0x80 && r[37] == 0xC0 && r[38] == 0x73 && r[39] == 0x1D,
+              "触摸板双触点常态: 未按下 (0x80) 于中心 (960, 471) — 12bit 打包");
+        {   // 摇杆线序: 逻辑态上/左为负 ↔ 线上 0 / 上为正 ↔ 线上 255 (DualSense 线序,
+            //   与 XInput 后端的 Y 取反相反 — 不取反)
+            PadLogical s; s.lx = -32767; s.ly = 32767; s.rx = -256; s.ry = 100;
+            pad_p5g_report(s, r);
+            CHECK(r[1] == 0x00 && r[2] == 0xFF && r[3] == 0x7F && r[4] == 0x80,
+                  "摇杆: lx−满→0x00, ly+满→0xFF, rx−256→0x7F, ry=+100→0x80");
+        }
+        {   // 扳机: 模拟量 1:1 直映; 数字位 = 出实测抗抖带 (15) 才置位
+            PadLogical t; t.lt = 15; t.rt = 16;
+            pad_p5g_report(t, r);
+            CHECK(r[5] == 15 && r[6] == 16 && !(r[9] & 0x04) && (r[9] & 0x08),
+                  "扳机模拟量直映; lt=15 (带内) 无数字位, rt=16 (带外) 置 r2 位");
+            t.lt = 255; t.rt = 0;
+            pad_p5g_report(t, r);
+            CHECK(r[5] == 255 && (r[9] & 0x04) && !(r[9] & 0x08), "lt 满偏 → l2 数字位置位");
+        }
+        {   // 按键位表: 线上 west(X)/south(A)/east(B)/north(Y) + 字节 9 位序
+            PadLogical b;
+            b.btns = PADBTN_A | PADBTN_B | PADBTN_X | PADBTN_Y;
+            pad_p5g_report(b, r);
+            CHECK((r[8] & 0xF0) == 0xF0 && (r[8] & 0x0F) == 0x0F,
+                  "面键: A→south(bit5) B→east(bit6) X→west(bit4) Y→north(bit7)");
+            b.btns = PADBTN_LB | PADBTN_RB | PADBTN_BACK | PADBTN_START
+                     | PADBTN_L3 | PADBTN_R3 | PADBTN_GUIDE;
+            pad_p5g_report(b, r);
+            CHECK(r[9] == 0xF3 && r[10] == 0x01,
+                  "LB/RB/BACK/START/L3/R3 → 字节 9 位 0/1/4/5/6/7, GUIDE(PS) → 字节 10 bit0");
+            b.btns = PADBTN_TOUCH;
+            pad_p5g_report(b, r);
+            CHECK(r[10] == 0x02 && r[9] == 0,
+                  "触摸板按下 → 字节 10 bit1 (与 home bit0 互不串扰)");
+        }
+        {   // 十字键 → hat (0=上 顺时针, 组合方向 = 斜向, 中性 0x0F)
+            struct HC { uint16_t b; uint8_t hat; };
+            const HC tcs[] = {{PADBTN_DPAD_UP,0},{(uint16_t)(PADBTN_DPAD_UP|PADBTN_DPAD_RIGHT),1},
+                              {PADBTN_DPAD_RIGHT,2},{(uint16_t)(PADBTN_DPAD_DOWN|PADBTN_DPAD_RIGHT),3},
+                              {PADBTN_DPAD_DOWN,4},{(uint16_t)(PADBTN_DPAD_DOWN|PADBTN_DPAD_LEFT),5},
+                              {PADBTN_DPAD_LEFT,6},{(uint16_t)(PADBTN_DPAD_UP|PADBTN_DPAD_LEFT),7}};
+            bool ok = true;
+            for (const HC& tc : tcs) {
+                PadLogical d; d.btns = tc.b;
+                pad_p5g_report(d, r);
+                ok &= (r[8] & 0x0F) == tc.hat;
+            }
+            CHECK(ok, "十字键 8 向 hat 值 0..7 顺时针");
+        }
+    }
+
+    std::cout << "[14] P5G 设备字节与类请求钩子 (加密狗身份的上线外观)\n";
+    {
+        const UsbRawDeviceDef& d = pad_p5g_usb_def();
+        CHECK(d.device.idVendor == 0x2B81 && d.device.idProduct == 0x0101
+              && d.device.bcdUSB == 0x0200 && d.device.bDeviceClass == 0
+              && d.device.iSerialNumber == 0,
+              "设备描述符: VID 0x2B81 / PID 0x0101, USB 2.0, 类在接口, 无序列号");
+        CHECK(d.speed == USB_SPEED_FULL && d.qualifier == nullptr,
+              "全速枚举 (bInterval 按 1ms 帧), 无设备限定符 (该请求 STALL)");
+        CHECK(d.config_len == 41 && d.config[2] == 41 && d.config[3] == 0
+              && d.config[7] == 0x80 && d.config[8] == 0xFA,
+              "配置节 41B 单配置单接口, 总线供电 500mA");
+        CHECK(d.config[13] == 2 && d.config[14] == 0x03 && d.config[15] == 0 && d.config[16] == 0,
+              "接口 = HID 无子类/协议 (非 boot 接口) + 双端点");
+        CHECK(d.config[18] == 0x09 && d.config[19] == 0x21 && d.config[20] == 0x11
+              && d.config[21] == 0x01 && d.config[25] == 0xA5 && d.config[26] == 0x00,
+              "配置节内 HID 描述符: bcdHID 1.11, 报告描述符长度 165");
+        CHECK(d.ep_in.bEndpointAddress == 0x82 && d.ep_in.wMaxPacketSize == 64
+              && d.ep_in.bmAttributes == USB_ENDPOINT_XFER_INT && d.ep_in.bInterval == 1,
+              "中断 IN 0x82 / 64B / bInterval=1 (全速 1ms → 1000Hz 轮询上限)");
+        CHECK(d.has_ep_out && d.ep_out.bEndpointAddress == 0x01
+              && d.ep_out.wMaxPacketSize == 64 && d.ep_out.bInterval == 6,
+              "中断 OUT 0x01 / 64B / bInterval=6 (PS5 输出报告收下即丢)");
+        CHECK(d.report_desc != nullptr && d.report_desc_len == 165
+              && d.report_desc[0] == 0x05 && d.report_desc[1] == 0x01
+              && d.report_desc[2] == 0x09 && d.report_desc[3] == 0x05
+              && d.report_desc[4] == 0xA1 && d.report_desc[5] == 0x01,
+              "报告描述符 165B, 开头 Game Pad Application Collection");
+        {   // 位宽的结构性锚定: 6 个 8 位轴的声明必须就在描述符开头 (Report Size 8 ×
+            //   Report Count 6, 逻辑 0..255) — 线格式 8 位的唯一依据
+            int i8 = -1, cnt6 = -1;
+            for (int i = 0; i + 1 < 165; ++i) {
+                if (d.report_desc[i] == 0x75 && d.report_desc[i + 1] == 0x08 && i8 < 0) i8 = i;
+                if (d.report_desc[i] == 0x95 && d.report_desc[i + 1] == 0x06 && cnt6 < 0) cnt6 = i;
+            }
+            CHECK(i8 == 25 && cnt6 == 27 && d.report_desc[22] == 0x26
+                  && d.report_desc[23] == 0xFF && d.report_desc[24] == 0x00,
+                  "描述符声明 6 个 8 位绝对轴: 逻辑上限 255 @22, Report Size 8 @25 × "
+                  "Report Count 6 @27 — 线上摇杆字段是 8 位");
+        }
+        {   // 报告描述符含认证 Collection (0xFFF0) 与 0xF0/0xF1/0xF2 特征报告 ID
+            bool auth = false;
+            for (int i = 0; i + 1 < (int)d.report_desc_len; ++i)
+                if (d.report_desc[i] == 0x06 && d.report_desc[i+1] == 0xF0
+                    && i + 2 < (int)d.report_desc_len && d.report_desc[i+2] == 0xFF)
+                    auth = true;
+            CHECK(auth, "报告描述符含认证专用 vendor 页 0xFFF0 Collection");
+            // 结构性锚定 (防"初始化列表写短了被零填充仍通过": 那种情况下 sizeof
+            //   仍是 165、开头几字节也不变, 只有跨全长的锚点能暴露)。偏移取自
+            //   参考固件数组本身: 认证页在 133、0xE0 报告在 124、结尾在 160。
+            const uint8_t* rd = d.report_desc;
+            CHECK(rd[133] == 0x06 && rd[134] == 0xF0 && rd[135] == 0xFF
+                  && rd[140] == 0x85 && rd[141] == 0xF0
+                  && rd[148] == 0x85 && rd[149] == 0xF1
+                  && rd[156] == 0x85 && rd[157] == 0xF2,
+                  "描述符中后段锚定: 认证页 0xFFF0 @133 与 0xF0/0xF1/0xF2 报告声明 @140/148/156");
+            CHECK(rd[114] == 0x0A && rd[115] == 0x21 && rd[116] == 0x28
+                  && rd[124] == 0x85 && rd[125] == 0xE0 && rd[31] == 0x06 && rd[32] == 0x00
+                  && rd[33] == 0xFF,
+                  "描述符中段锚定: 0x2821 定义报告 @114、0xE0 特征报告 @124、厂商页 0xFF00 @31");
+            CHECK(rd[160] == 0x95 && rd[161] == 0x0F && rd[162] == 0xB1 && rd[163] == 0x02
+                  && rd[164] == 0xC0 && rd[159] == 0x49,
+                  "描述符尾部锚定: F2 的 Report Count 15 → Feature → End Collection @164");
+            int nonzero = 0;                      // 合法零字节 = 参数零 (Logical/Physical
+            for (int i = 0; i < 165; ++i)         //   Minimum, Usage Minimum 等), 共 11 个
+                nonzero += rd[i] != 0;
+            CHECK(nonzero == 165 - 11, "描述符 165 字节的零字节恰为 11 个 (参数零, 无填充空洞)");
+        }
+        CHECK(d.vendor_request != nullptr && d.string_count == 3
+              && !strcmp(d.strings[0].utf8, "Activtor") && !strcmp(d.strings[1].utf8, "P5General")
+              && !strcmp(d.strings[2].utf8, "0.1"),
+              "类请求钩子已定义 (整个类段归它, 见 usbraw 的路由约定); 字符串 = 参考固件取值");
+        CHECK(d.rate_trace && d.rate_tag && !strcmp(d.rate_tag, "PAD-USB"),
+              "报告率观测开启, 标签 PAD-USB (与 XInput 后端同一行格式, webui 日志流隐藏)");
+        CHECK(PAD_P5G_REPORT_LEN == 64 && PAD_P5G_REPORT_LEN == d.ep_in.wMaxPacketSize
+              && (int)d.config[25] == 165 && d.config[26] == 0,
+              "报告长 64B = 端点单包 (短包即包边界) 且等于配置节声明的描述符长度");
+    }
+
+    std::cout << "[15] P5G 认证状态机 (合成加密狗 I/O): 转发/分派/滞后取数/恢复\n";
+    {
+        struct Fake {
+            std::vector<std::vector<uint8_t>> f0_seen, f1_give, f2_give;
+            size_t f1_at = 0, f2_at = 0;
+            size_t f1_calls = 0, f2_calls = 0;    // 调用计数 (与"取走几份"区分开:
+            int set_fails = 0;                    //   供给耗尽时 get_* 也返回 false)
+            static bool set_f0(void* ctx, const uint8_t* b) {
+                Fake* f = (Fake*)ctx;
+                if (f->set_fails) { f->set_fails--; return false; }
+                f->f0_seen.push_back(std::vector<uint8_t>(b, b + 64));
+                return true;
+            }
+            static bool get_f1(void* ctx, uint8_t* b) {
+                Fake* f = (Fake*)ctx;
+                f->f1_calls++;
+                if (f->f1_at >= f->f1_give.size()) return false;
+                memcpy(b, f->f1_give[f->f1_at++].data(), 64);
+                return true;
+            }
+            static bool get_f2(void* ctx, uint8_t* b) {
+                Fake* f = (Fake*)ctx;
+                f->f2_calls++;
+                if (f->f2_at >= f->f2_give.size()) return false;
+                memcpy(b, f->f2_give[f->f2_at++].data(), 16);
+                return true;
+            }
+            P5gAuthIo io() { return P5gAuthIo{ this, set_f0, get_f1, get_f2 }; }
+        };
+        const uint64_t MS = 1000;                 // 测试钟: tick 参数 = µs
+        auto tickn = [](P5gAuth& a, Fake& f, uint64_t t_us) { a.tick(t_us, f.io()); };
+        uint8_t r1[64], r2[16];
+
+        // ① 质询接受与原样转发 + 类型分派 (0x01 且 [3]==3 → 配额 4 + 自动 F2)
+        {
+            P5gAuth a; Fake f; a.set_dongle_ready(true);
+            uint8_t f0[64] = { 0xF0 };
+            for (int i = 2; i < 64; ++i) f0[i] = (uint8_t)(i ^ 0x5A);   // 载荷随机化
+            f0[1] = 0x01; f0[3] = 3;            // 类型 0x01, [3]==3 (自动 F2 判据)
+            a.reply_f1(r1);
+            CHECK(r1[0] == 0xF1 && r1[1] == 0,
+                  "首次 GET(F1): byte0 = 本次报告 ID 0xF1; 净荷 = 开机全零缓冲 (滞后一次取数的起点)");
+            a.reset();                          // 该次 GET 已按参考行为武装了状态机, 清回干净态
+            a.accept_f0(f0);
+            tickn(a, f, 1 * MS);
+            CHECK(f.f0_seen.size() == 1 && f.f0_seen[0][0] == 0xF0
+                  && f.f0_seen[0][1] == 0x01 && f.f0_seen[0][3] == 3
+                  && f.f0_seen[0][10] == (uint8_t)(10 ^ 0x5A),
+                  "质询原样转发 (含 ID 字节, 不校验不改写)");
+            tickn(a, f, 300 * MS);              // ACK+500ms 未到
+            CHECK(f.f2_at == 0, "F2 未到时不取");
+            f.f2_give.push_back(std::vector<uint8_t>(16, 0xAB)); f.f2_give[0][0] = 0xF2;
+            tickn(a, f, 600 * MS);              // 过 ACK+500ms
+            CHECK(f.f2_at == 1, "F2 在 ACK+500ms 自动取回一次");
+            a.reply_f2(r2);
+            CHECK(r2[0] == 0xF2 && r2[1] == 0xAB, "GET(F2) 应答 = [0xF2]+取回的 15B 状态");
+            // 报告 ID 字节与缓冲内容解耦: F2 取回把缓冲整份覆盖 (其 byte0 = 0xF2),
+            //   紧随其后的 GET(F1) 仍须以 0xF1 开头 (参考固件由 USB 栈预置该字节)
+            a.reply_f1(r1);
+            CHECK(r1[0] == 0xF1 && r1[1] == 0xAB,
+                  "F2 取回后 GET(F1): byte0 仍是 0xF1 (缓冲 byte0 为 0xF2 也不外泄)");
+            for (int i = 0; i < 4; ++i)         // 配额 4: 4 次武装各取一份
+                f.f1_give.push_back(std::vector<uint8_t>(64, (uint8_t)(0x10 + i)));
+            for (int i = 0; i < 4; ++i) {
+                a.reply_f1(r1);
+                tickn(a, f, (700 + i) * MS);
+            }
+            CHECK(f.f1_at == 4, "f1_num=4 → 恰好 4 次 F1 取回");
+            a.reply_f1(r1);                     // 配额耗尽: 武装后不得发起任何取数
+            tickn(a, f, 710 * MS);
+            CHECK(f.f1_at == 4 && f.f1_calls == 4, "配额耗尽后的武装不再取数 (回 idle)");
+            a.reply_f1(r1);
+            CHECK(r1[0] == 0xF1 && r1[1] == 0x13,
+                  "滞后一次取数: 第 N 次 GET 的净荷是第 N−1 次取回的数据 (byte0 仍恒 0xF1)");
+        }
+        // ② 分派表其余行: 0x01/[3]≠3 → 配额 4 无 F2; 0x03 → 1 + F2; 0x02 → 0 + F2
+        //   (参考固件同序: F1 的取回在 F2 完成回到 idle 后才被武装触发)
+        {
+            P5gAuth a; Fake f; a.set_dongle_ready(true);
+            uint8_t f0a[64] = { 0xF0 }; f0a[1] = 0x01; f0a[3] = 7;
+            for (int i = 0; i < 4; ++i)
+                f.f1_give.push_back(std::vector<uint8_t>(64, 0x20));
+            a.accept_f0(f0a); tickn(a, f, 1 * MS);
+            for (int i = 0; i < 4; ++i) { a.reply_f1(r1); tickn(a, f, (2 + i) * MS); }
+            CHECK(f.f2_at == 0 && f.f1_at == 4, "0x01 且 [3]≠3 → 配额 4、无自动 F2");
+            uint8_t f0b[64] = { 0xF0 }; f0b[1] = 0x03;
+            a.accept_f0(f0b); tickn(a, f, 10 * MS);            // f1_num=1 + F2 @+500ms
+            f.f2_give.push_back(std::vector<uint8_t>(16, 0));
+            tickn(a, f, 600 * MS);                              // F2 完成 → idle
+            f.f1_give.push_back(std::vector<uint8_t>(64, 0x77));
+            a.reply_f1(r1); tickn(a, f, 601 * MS);
+            CHECK(f.f1_at == 5, "类型 0x03 → 配额 1");
+            CHECK(f.f2_at == 1, "类型 0x03 → 自动 F2");
+            uint8_t f0c[64] = { 0xF0 }; f0c[1] = 0x02;
+            a.accept_f0(f0c); tickn(a, f, 602 * MS);           // f1_num=0 + F2 @+500ms
+            f.f2_give.push_back(std::vector<uint8_t>(16, 0));
+            tickn(a, f, 1200 * MS);
+            CHECK(f.f1_at == 5 && f.f2_at == 2, "类型 0x02 → 配额 0 (不取 F1) + 自动 F2");
+        }
+        // ③ 非 idle 的质询静默丢弃; 传输失败弃回合且可恢复; reset/缺席语义
+        {
+            P5gAuth a; Fake f; a.set_dongle_ready(true);
+            f.f2_give.push_back(std::vector<uint8_t>(16, 0));
+            uint8_t f0[64] = { 0xF0 }; f0[1] = 0x02;
+            a.accept_f0(f0); tickn(a, f, 1 * MS);
+            a.accept_f0(f0);                    // F2Delay 中再来一份 → 丢弃
+            tickn(a, f, 600 * MS);
+            CHECK(f.f0_seen.size() == 1, "非 idle 收到的质询静默忽略 (不转发)");
+            P5gAuth b; Fake fb; b.set_dongle_ready(true);
+            fb.set_fails = 1;
+            uint8_t f0d[64] = { 0xF0 }; f0d[1] = 0x01;
+            b.accept_f0(f0d); tickn(b, fb, 1 * MS);
+            CHECK(fb.f0_seen.empty(), "传输失败: 转发未到达加密狗");
+            fb.set_fails = 0;
+            b.accept_f0(f0d);                   // 参考固件此处会因状态卡死而拒收
+            tickn(b, fb, 2 * MS);
+            CHECK(fb.f0_seen.size() == 1, "失败弃回合 → PS5 重发的新质询可接受 (不复制挂死)");
+            P5gAuth c; Fake fc; c.set_dongle_ready(true);
+            uint8_t f0e[64] = { 0xF0 }; f0e[1] = 0x01;
+            c.accept_f0(f0e);
+            c.reset();
+            tickn(c, fc, 1 * MS);
+            CHECK(fc.f0_seen.empty(), "reset (重枚举/加密狗重插) 清武装 → 不转发");
+            // 加密狗不在位: 武装态保持 (不计时、不发 I/O), 插上后继续
+            P5gAuth d; Fake fd;
+            uint8_t f0f[64] = { 0xF0 }; f0f[1] = 0x01;
+            d.accept_f0(f0f);
+            tickn(d, fd, 3600ULL * 60 * 1000 * MS);   // 缺席"一小时"不发 I/O、不弃回合
+            CHECK(fd.f0_seen.empty(), "加密狗缺席: 不发 I/O");
+            d.set_dongle_ready(true);
+            tickn(d, fd, 3600ULL * 60 * 1000 * MS + 1);
+            CHECK(fd.f0_seen.size() == 1, "插上后继续完成转发 (缺席不消耗回合)");
+        }
+    }
+
+    std::cout << "[16] P5G 签名流水线: 变化驱动/重复配额/单份在途/单槽背压/看门狗\n";
+    {
+        P5gFlow f;
+        const uint64_t MS = 1000;                 // 测试钟: 时间参数 = µs
+        uint8_t r[PAD_P5G_REPORT_LEN] = {}, out[PAD_P5G_REPORT_LEN];
+        r[0] = 0x01;
+        CHECK(!p5g_flow_submit(r, false, f, 0, out),
+              "加密狗未就绪: 不产生任何报告 (参考固件同规则)");
+        CHECK(p5g_flow_submit(r, true, f, 1 * MS, out) && memcmp(out, r, 64) == 0
+              && f.pending && f.repeat == 4,
+              "首份提交: 变化 → 提交 + 重复配额 4");
+        CHECK(!p5g_flow_submit(r, true, f, 2 * MS, out),
+              "单份在途 (pending): 不再产生新报告");
+        p5g_flow_sent(f);
+        CHECK(f.pending == false && f.ready == false, "回合完成: 在途与回读槽清空");
+        bool repeats_ok = true; int n = 0;
+        for (n = 0; n < 4; ++n) {
+            repeats_ok &= p5g_flow_submit(r, true, f, (10 + n) * MS, out);
+            p5g_flow_sent(f);
+        }
+        CHECK(repeats_ok && n == 4, "内容不变 → 同一份重发直至配额耗尽 (4 次)");
+        CHECK(!p5g_flow_submit(r, true, f, 20 * MS, out), "配额耗尽且无变化 → 线上静默");
+        r[3] = 0x7F;                              // 右摇杆动了
+        CHECK(p5g_flow_submit(r, true, f, 21 * MS, out) && f.repeat == 4
+              && out[3] == 0x7F, "内容变化 → 立即提交并重置配额");
+        uint8_t sig[64]; memcpy(sig, out, 64);
+        sig[63] = 0xEE;                           // 加密狗填了 hash
+        CHECK(p5g_flow_signed(sig, f), "签名回填入槽");
+        uint8_t sig2[64]; memcpy(sig2, sig, 64); sig2[63] = 0xFF;
+        CHECK(!p5g_flow_signed(sig2, f), "上一份未发走: 新到签名丢弃 (单槽背压)");
+        CHECK(f.finish[63] == 0xEE, "槽内仍是第一份 (丢弃规则保留旧份)");
+        p5g_flow_sent(f);
+        bool drained = true;                      // 耗尽变化后重置的配额 (每份都是完整回合)
+        for (n = 0; n < 4; ++n) {
+            drained &= p5g_flow_submit(r, true, f, (30 + n) * MS, out);
+            p5g_flow_sent(f);
+        }
+        CHECK(drained, "配额内继续重发");
+        CHECK(!p5g_flow_submit(r, true, f, 40 * MS, out), "回合已闭, 静默 (配额已尽)");
+        // pending 看门狗: 签名超时未回 → 放弃该份, 报告流不卡死
+        P5gFlow g;
+        uint8_t r0[PAD_P5G_REPORT_LEN] = {}; r0[0] = 0x01;
+        CHECK(p5g_flow_submit(r0, true, g, 0, out), "看门狗场景: 提交后签名永不到达");
+        p5g_flow_tick(g, 499 * MS - 1);
+        CHECK(g.pending, "预算内 (500ms): 继续等待");
+        p5g_flow_tick(g, 500 * MS);
+        CHECK(!g.pending && p5g_flow_submit(r0, true, g, 500 * MS + 1, out),
+              "超时放弃该份 → 下一份可正常提交 (报告流不卡死)");
     }
 
     std::cout << (g_fail ? "FAILED" : "ALL PASS") << " (" << g_fail << " 失败)\n";

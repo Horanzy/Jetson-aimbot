@@ -22,7 +22,8 @@ TRT="-lnvinfer -lnvinfer_plugin -lcudart -Xcompiler -pthread"
 # 模块清单 = src/ 下的全部编译单元 (main.cu 与 core/io 各 .cu 逐一对应)
 MODULES="main \
          core/control core/estimator core/calib core/trt core/state \
-         io/capture io/hid_mouse io/usbraw io/hotctl io/calib_run io/pad_input io/pad_output io/pad_xinput"
+         io/capture io/hid_mouse io/usbraw io/hotctl io/calib_run io/pad_input io/pad_output \
+         io/pad_xinput io/pad_p5g"
 
 OBJS=""
 for m in $MODULES; do
@@ -49,9 +50,9 @@ $NVCC "$BUILD/control_test.o" $CONTROL_TEST_OBJS $LIBS $OCV -lopencv_imgcodecs $
     -o "$BUILD/control_test"
 "$BUILD/control_test"
 
-# 手柄模式单测 (输入映射 8→16 位 / 注入合并几何 / 账本与发布点契约 / XInput 线格式
-#   与设备字节): 与控制拍单测同一链接方式 (除 main.o 外的模块对象), 断言失败即
-#   set -e 终止整个编译。
+# 手柄模式单测 (输入映射 8→16 位 / 注入合并几何 / 账本与发布点契约 / XInput 与
+#   P5G 两条线格式及设备字节 / P5G 认证状态机与签名流水线): 与控制拍单测同一链接
+#   方式 (除 main.o 外的模块对象), 断言失败即 set -e 终止整个编译。
 # shellcheck disable=SC2086
 $NVCC -c "$SRC/io/pad_test.cu" $NVCC_FLAGS $INCLUDES -o "$BUILD/pad_test.o"
 # shellcheck disable=SC2086

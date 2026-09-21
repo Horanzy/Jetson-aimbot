@@ -18,12 +18,15 @@
 //  鼠标接管: -a n (或热参 aim=0) 时固件纯透传真实鼠标 — 不注入任何移动, 检测/采集照常。
 //    模型未完善但需要采集数据时的运行形态; aim=1 即恢复控制输出。
 //
-//  手柄模式 (-M pad, 与鼠标模式互斥): 物理手柄 (Xbox 布局) 全透传 (按键/摇杆/扳机
-//    模拟量 1:1, 扳机只有"是否触发自瞄"的判定过阈值), 控制律期望速度按**逐轴有效
-//    满偏屏速**折算成右摇杆注入偏转, 与人类通道径向合并 (±满偏钳制); 摇杆账本
-//    Σ(偏转·ms) 供估计器/律的自身运动补偿 (按轴换算回像素)。合并后的最终逻辑态经
-//    发布点交给输出后端, 以 raw_gadget 呈现微软有线 360 手柄 (0x045E/0x028E) 给
-//    宿主 — 宿主侧即 XInput 手柄 (见 io/pad_xinput)。
+//  手柄模式 (-M pad / -M p5g, 与鼠标模式互斥): 物理手柄 (Xbox 布局) 全透传 (按键/
+//    摇杆/扳机模拟量 1:1, 扳机只有"是否触发自瞄"的判定过阈值), 控制律期望速度按
+//    **逐轴有效满偏屏速**折算成右摇杆注入偏转, 与人类通道径向合并 (±满偏钳制);
+//    摇杆账本 Σ(偏转·ms) 供估计器/律的自身运动补偿 (按轴换算回像素)。合并后的最终
+//    逻辑态经发布点交给输出后端 —— 两种手柄模式共用整条输入/合并/标定链, 只有后端
+//    不同: pad 以 raw_gadget 呈现微软有线 360 手柄 (0x045E/0x028E) 给宿主 (宿主侧即
+//    XInput 手柄, 见 io/pad_xinput); p5g 面向 PS5, 呈现 P5 General 加密狗形态的 HID
+//    手柄 (0x2B81/0x0101) 并把一枚真加密狗插在本机口上作签名协处理器 — 每份报告
+//    先交它签名, 只把它返回的字节发上线 (见 io/pad_p5g)。
 //
 //  热参数: UDP 127.0.0.1 上的极小本地控制通道 (白名单 t/y/x/fov/padthr/spdx/spdy/
 //    adsspdx/adsspdy/k/aim/cap_*, 固件侧强制钳制), webui 保存后即时生效不重启;
@@ -71,6 +74,7 @@
 #include "io/hotctl.h"
 #include "io/pad_input.h"
 #include "io/pad_output.h"
+#include "io/pad_p5g.h"
 #include "io/pad_xinput.h"
 #include "io/usbraw.h"
 
@@ -128,7 +132,7 @@ int main(int argc, char* argv[]) {
                 "  -y <偏移>  部位       -d <采集卡> 名字或 /dev/videoN\n"
                 "  -f <帧率>  120/60     -x <速度> 最大px/s\n"
                 "  -l <L>     初始延迟\n"
-                "  -S <脚本>  回写路径 (标定只写延迟: hid → L_EST, pad → L_EST_PAD)\n"
+                "  -S <脚本>  回写路径 (标定只写延迟: hid → L_EST, pad/p5g → L_EST_PAD)\n"
                 "  -k <键>   fire/ads/both  -v <y/n> 预览\n"
                 "  --spd <x>[,<y>]      拉枪速度倍率逐轴 (默认 100 = 基线; 调大=更快; 热参 spdx/spdy)\n"
                 "  --ads-spd <x>[,<y>]  ADS 键按住时的同一对 (默认 100; 热参 adsspdx/adsspdy)\n"
@@ -138,6 +142,9 @@ int main(int argc, char* argv[]) {
                 "  -M <模式>  hid=USB raw_gadget 鼠标 (游戏内鼠标灵敏度生效)\n"
                 "             pad=XInput 手柄输出: 物理手柄全透传 + 控制律注入右摇杆,\n"
                 "                 以 raw_gadget 呈现微软有线 360 手柄 (0x045E/0x028E) 给宿主\n"
+                "             p5g=PS5 手柄输出: 同一输入/合并/标定链, 对 PS5 呈现 P5 General\n"
+                "                 加密狗 (0x2B81/0x0101), 真加密狗插本机 USB 口作签名协处理器\n"
+                "                 (每份报告经它签名后才上线; 缺席时不产生任何报告)\n"
                 "  -P <子串>  手柄 /dev/input/by-id 匹配子串 (默认空 = 任一 *-event-joystick\n"
                 "             节点; P5 General 加密狗自身的节点已被排除)\n"
                 "  -T <百分比> 手柄触发阈值 (默认 6 = 该手柄扳机实测 flat 15/255; RT/LT\n"
@@ -195,18 +202,20 @@ int main(int argc, char* argv[]) {
     if (!parse_spd(a_spd,spd_x,spd_y,"--spd")) return 1;
     if (!parse_spd(a_adsspd,ads_spd_x,ads_spd_y,"--ads-spd")) return 1;
 
-    // 输出模式: hid (USB raw_gadget 鼠标) / pad (XInput 手柄输出) — 互斥, 缺省 hid。
-    //   pad 模式读手柄、不读鼠标, 两模式各自独占 UDC 的 raw_gadget 会话。
+    // 输出模式: hid (USB raw_gadget 鼠标) / pad (XInput 手柄输出) / p5g (PS5 手柄
+    //   输出) — 互斥, 缺省 hid。三者的参数展开一致 (pad 与 p5g 只换输出后端,
+    //   输入/合并/标定链与逐轴 spd 倍率完全共用), 各自独占 UDC 的 raw_gadget 会话。
     const std::string out_mode=a_M.empty()?"hid":a_M;
-    if (out_mode!="hid"&&out_mode!="pad") {
-        std::cerr<<"❌ 未知模式 \""<<out_mode<<"\" (用 hid / pad)\n"; return 1;
+    if (out_mode!="hid"&&out_mode!="pad"&&out_mode!="p5g") {
+        std::cerr<<"❌ 未知模式 \""<<out_mode<<"\" (用 hid / pad / p5g)\n"; return 1;
     }
-    const bool pad_mode=(out_mode=="pad");
-    const std::string pad_kw=a_P.empty()?DEFAULT_PAD_KEYWORD:a_P;
-    if (!a_P.empty()&&!pad_mode) std::cout<<"⚠ 忽略 -P (仅 pad 模式: 手柄选择)\n";
-    if (!a_T.empty()&&!pad_mode) std::cout<<"⚠ 忽略 -T (仅 pad 模式: 扳机触发阈值)\n";
-    if (pad_dump&&!pad_mode) std::cout<<"⚠ 忽略 --pad-dump (仅 pad 模式)\n";
+    const bool p5g_mode=(out_mode=="p5g");
+    const bool pad_mode=(out_mode!="hid");        // 手柄通道: 输入/合并/标定/账本路由
+    if (!a_P.empty()&&!pad_mode) std::cout<<"⚠ 忽略 -P (仅手柄模式: 手柄选择)\n";
+    if (!a_T.empty()&&!pad_mode) std::cout<<"⚠ 忽略 -T (仅手柄模式: 扳机触发阈值)\n";
+    if (pad_dump&&!pad_mode) std::cout<<"⚠ 忽略 --pad-dump (仅手柄模式)\n";
     if (!a_D.empty()&&pad_mode) std::cout<<"⚠ 忽略 -D (仅 hid 模式: 鼠标选择)\n";
+    const std::string pad_kw=a_P.empty()?DEFAULT_PAD_KEYWORD:a_P;
     // pad 触发阈值 (% 满量程): -T 或设计缺省 (出处见 io/pad_output.h) — 两键共享,
     //   热参 padthr 运行中可调, 只影响触发判定 (扳机模拟量不受影响)
     float pad_trig_thr=PAD_TRIG_THR_PCT;
@@ -265,10 +274,12 @@ int main(int argc, char* argv[]) {
     MouseState state;
     UsbRawSession usb;
     PadState padst;
-    // 两模式单次运行只居其一, 且各自独占 UDC: hid = USB raw_gadget 鼠标,
-    //   pad = XInput 有线手柄 (0x045E/0x028E)
-    if (pad_mode) { if (!pad_xinput_start()) return 1; }
-    else          { if (!hid_mouse_start(state,usb,a_D)) return 1; }
+    // 三模式单次运行只居其一, 且各自独占 UDC: hid = USB raw_gadget 鼠标,
+    //   pad = XInput 有线手柄 (0x045E/0x028E), p5g = P5G 加密狗形态 HID 手柄
+    //   (0x2B81/0x0101; 真加密狗经 hidraw 作签名协处理器, 缺席不阻塞启动)
+    if      (p5g_mode) { if (!pad_p5g_start())   return 1; }
+    else if (pad_mode) { if (!pad_xinput_start()) return 1; }
+    else               { if (!hid_mouse_start(state,usb,a_D)) return 1; }
 
     signal(SIGINT,signal_handler); signal(SIGTERM,signal_handler);
     { std::lock_guard<std::mutex> lk(g_target.mtx); g_target.l_est_ms=init_l; }
@@ -277,7 +288,11 @@ int main(int argc, char* argv[]) {
 
     std::cout<<"初始: L="<<init_l<<" spd_x="<<spd_x<<" spd_y="<<spd_y
              <<" ads_spd_x="<<ads_spd_x<<" ads_spd_y="<<ads_spd_y<<" fov="<<fov_r<<"\n";
-    if (pad_mode)
+    if (p5g_mode)
+        std::cout<<"模式: p5g (对 PS5 呈现 P5 General 手柄 0x2B81/0x0101, 真加密狗"
+                    "经 hidraw 签名; 物理手柄全透传"
+                 <<(pad_dump?", --pad-dump 叠加打印":"")<<")  触发阈值="<<pad_trig_thr<<"%\n";
+    else if (pad_mode)
         std::cout<<"模式: pad (XInput 手柄 0x045E/0x028E 呈现给宿主, 物理手柄全透传"
                  <<(pad_dump?", --pad-dump 叠加打印":"")<<")  触发阈值="<<pad_trig_thr<<"%\n";
     std::cout<<(pad_mode?"辅助瞄准注入: ":"鼠标接管: ")
@@ -336,7 +351,9 @@ int main(int argc, char* argv[]) {
     global_running=false;
     g_save_cv.notify_all();
     // 输出后端先停 (它持有 UDC 的 raw_gadget 会话), 再停输入读取线程与其它线程
-    if (pad_mode) pad_xinput_stop(); else hid_mouse_stop(usb);
+    if (p5g_mode) pad_p5g_stop();
+    else if (pad_mode) pad_xinput_stop();
+    else hid_mouse_stop(usb);
     if (pad_reader.joinable()) pad_reader.join();
     hot.join(); ai.join();
     if (do_collect) writer.join();

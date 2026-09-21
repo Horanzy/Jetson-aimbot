@@ -22,19 +22,22 @@ ROOT="$(cd "$(dirname "$(realpath "$0")")/../.." && pwd)"
 APP="$ROOT/bin/aimbot"
 MODEL_PATH="$ROOT/engine/example.engine"   # ← 改成 engine/ 下你实际转好的模型
 
-# ---- 输出模式 (hid = USB 鼠标 (PC 游戏内灵敏度生效) / pad = XInput 手柄 (PC);
-#      互斥, 一次运行只居其一) ----
-# pad 模式: 物理手柄全透传 (按键/摇杆/扳机模拟量 1:1, 扳机只有"是否触发"过阈值),
-#      控制律期望速度按逐轴有效满偏屏速折算成右摇杆注入偏转与人类通道合并;
-#      固件以 raw_gadget 呈现微软有线 360 手柄 (0x045E/0x028E) 给宿主, 宿主侧
-#      即 XInput 手柄。速度帽逐轴 = min(-x, 该轴有效满偏屏速)。
-OUTPUT_MODE="hid"   # hid / pad
-PAD_KEYWORD=""      # pad: 手柄 by-id 匹配子串 (空 = 任意 *-event-joystick 节点)
-PAD_TRIG_THR=6      # pad: 触发阈值 % (RT/LT 两键共享; 默认 6 = 该手柄扳机实测 flat
+# ---- 输出模式 (hid = USB 鼠标 (PC 游戏内灵敏度生效) / pad = XInput 手柄 (PC) /
+#      p5g = P5General 加密狗 (PS5); 互斥, 一次运行只居其一) ----
+# 手柄模式 (pad / p5g): 物理手柄全透传 (按键/摇杆/扳机模拟量 1:1, 扳机只有"是否
+#      触发"过阈值), 控制律期望速度按逐轴有效满偏屏速折算成右摇杆注入偏转与人类
+#      通道合并; 速度帽逐轴 = min(-x, 该轴有效满偏屏速)。pad 以 raw_gadget 呈现
+#      微软有线 360 手柄 (0x045E/0x028E) 给宿主, 宿主侧即 XInput 手柄。
+# p5g 面向 PS5: 同一输入/合并/标定链, 设备口呈现 P5 General 手柄 (0x2B81/0x0101),
+#      真加密狗插 Jetson 的普通 USB 口作签名协处理器 —— 每份报告先交它签名, 只有
+#      它返回的字节才发上线; 加密狗不在位时线上不产生任何报告。
+OUTPUT_MODE="hid"   # hid / pad / p5g
+PAD_KEYWORD=""      # pad/p5g: 手柄 by-id 匹配子串 (空 = 任意 *-event-joystick 节点)
+PAD_TRIG_THR=6      # pad/p5g: 触发阈值 % (RT/LT 两键共享; 默认 6 = 该手柄扳机实测 flat
                     #      15/255 的上取整; 只作用于触发判定, 扳机模拟量仍 1:1 透传)
 MOUSE_KEYWORD=""    # hid: 鼠标 by-id 匹配子串 (空 = 任意 *-event-mouse 取字典序首个;
                     #      手柄插着时建议指定, 否则可能选中手柄的附属鼠标接口)
-PAD_DUMP="n"        # pad: y = 每 ≥50ms 打一行合并逻辑态 [PAD] lx/ly/rx/ry/lt/rt/
+PAD_DUMP="n"        # pad/p5g: y = 每 ≥50ms 打一行合并逻辑态 [PAD] lx/ly/rx/ry/lt/rt/
                     #      fire/ads/aim_gate — 现场诊断注入用 (看命令波形, 不影响行为)
 
 # ---- 自瞄参数 ----
@@ -92,13 +95,14 @@ sudo bash "$ROOT/scripts/setup_mouse.sh"
 
 SCRIPT_PATH="$(realpath "$0")"
 
-# 模式参数: hid 用鼠标选择 (-D), pad 用手柄选择与触发阈值 (-M/-P/-T) — 两模式的标定量
-#   各写各的 VAR (L_EST / L_EST_PAD), 这里按模式取对应的那条喂给 -l。
+# 模式参数: hid 用鼠标选择 (-D); pad/p5g 用手柄选择与触发阈值 (-M/-P/-T, 两者参数
+#   展开一致, 只换 -M 的值) — 两模式的标定量各写各的 VAR (L_EST / L_EST_PAD),
+#   这里按模式取对应的那条喂给 -l。
 PAD_KW_V="${PAD_KEYWORD:-}"
 PAD_THR_V="${PAD_TRIG_THR:-6}"
 MOUSE_KW_V="${MOUSE_KEYWORD:-}"
-if [ "${OUTPUT_MODE:-hid}" = "pad" ]; then
-  MODE_ARGS=(-M pad -P "$PAD_KW_V" -T "$PAD_THR_V")
+if [ "${OUTPUT_MODE:-hid}" = "pad" ] || [ "${OUTPUT_MODE:-hid}" = "p5g" ]; then
+  MODE_ARGS=(-M "${OUTPUT_MODE}" -P "$PAD_KW_V" -T "$PAD_THR_V")
   L_V="${L_EST_PAD:-60.0}"
   [ "${PAD_DUMP:-n}" = "y" ] && MODE_ARGS+=(--pad-dump)
 else
