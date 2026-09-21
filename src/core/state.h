@@ -24,9 +24,12 @@
 
 // ========================= 系统常量 =========================
 constexpr size_t HID_REPORT_LEN  = 9;
-constexpr int    DEFAULT_FREQ    = 500;              // 控制拍频率 Hz (透传与标定状态机同一节拍)
-constexpr const char* DEFAULT_KEYWORD  = "";         // 空 = 匹配任意 *-event-mouse 设备
-constexpr const char* DEFAULT_VIRT_DEV = "/dev/hidg0";
+// 控制拍频率 Hz: 透传、控制律与标定状态机共用一个节拍。1kHz 是"拍率不再是精度
+//   瓶颈"的选择 — 控制律按实测 dt 归一 (不变量 1), 提高拍率只把同一连续律采样
+//   得更细, 不改变手感; 报告率 = min(拍率, 主机服务率), 端点 bInterval=1 (高速
+//   125µs 微帧 → 服务能力 8kHz) 高于拍率, 故实际报告率 = 拍率。
+constexpr int    DEFAULT_FREQ    = 1000;
+constexpr const char* DEFAULT_KEYWORD  = "";         // 空 = 任一 *-event-mouse 中字典序首个
 constexpr const char* DEV_SEARCH_PATH  = "/dev/input/by-id/";
 
 const float FOV_RADIUS   = 150.0f;                   // FOV 半径默认值 (px): 目标筛选圈兼积分器边界; 经 -r 或热参 fov 覆盖 (运行时 g_fov_radius)

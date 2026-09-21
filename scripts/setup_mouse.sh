@@ -1,71 +1,50 @@
 #!/bin/bash
+# ==============================================================================
+#  setup_mouse.sh — 鼠标通道就绪 (Jetson, sudo):
+#    ① 载入 raw_gadget 模块 (内核须已具备该模块 — 发行版包或按内核文档
+#      Documentation/usb/raw_gadget.rst 出树编译, 各机自行部署)
+#    ② UDC 独占腾空: usb_gadget 目录下仍绑着 UDC 的遗留 gadget 实例解绑
+#      (raw_gadget 会话要求 UDC 空闲; 占用 /dev/raw-gadget 的进程须先停)
+#    ③ /dev/raw-gadget 权限 (666, 非 root 直跑 aimbot 也可打开)
+#
+#  UDC 两级名字由固件从 sysfs 发现, 会话 open 即绑定 UDC、close 即解绑 —
+#  本脚本只保证 UDC 空闲、节点可用, 设备栈本身在 src/io/usbraw.cu。
+#  路径相对脚本自身解析 (realpath 向上找 ROOT), 与部署位置无关。
+# ==============================================================================
 
-# setup_mouse.sh
-# USB Gadget HID 鼠标配置 - 创建 /dev/hidg0
-
-modprobe libcomposite
-modprobe usb_f_hid
-
-CONFIGFS="/sys/kernel/config/usb_gadget"
-GADGET="$CONFIGFS/g_mouse"
-
-# 清理旧配置
-if [ -d "$GADGET" ]; then
-    echo "" > "$GADGET/UDC" 2>/dev/null || true
-    rm -f $GADGET/configs/c.1/hid.usb* 2>/dev/null
-    rmdir $GADGET/configs/c.1/strings/0x409 2>/dev/null
-    rmdir $GADGET/configs/c.1 2>/dev/null
-    rmdir $GADGET/functions/hid.usb* 2>/dev/null
-    rmdir $GADGET/strings/0x409 2>/dev/null
-    rmdir $GADGET 2>/dev/null
-fi
-
-mkdir -p $GADGET
-cd $GADGET || exit
-
-# 通用单一 HID 鼠标，无任何额外功能
-echo 0x1d6b > idVendor     # Linux Foundation VID
-echo 0x0104 > idProduct    # 通用 gadget PID
-echo 0x0300 > bcdDevice
-echo 0x0200 > bcdUSB       # USB 2.0
-
-# 标准单一HID设备
-echo 0x00 > bDeviceClass
-echo 0x00 > bDeviceSubClass
-echo 0x00 > bDeviceProtocol
-
-mkdir -p strings/0x409
-echo "000000000001" > strings/0x409/serialnumber
-echo "Generic" > strings/0x409/manufacturer
-echo "USB Mouse" > strings/0x409/product
-
-mkdir -p configs/c.1/strings/0x409
-echo "HID Mouse" > configs/c.1/strings/0x409/configuration
-echo 100 > configs/c.1/MaxPower
-
-# 标准引导鼠标接口
-mkdir -p functions/hid.usb0
-echo 1 > functions/hid.usb0/subclass  # Boot Interface Subclass
-echo 2 > functions/hid.usb0/protocol  # Mouse Protocol
-echo 9 > functions/hid.usb0/report_length
-
-# 16 键高精度鼠标报告描述符
-python3 -c "open('functions/hid.usb0/report_desc', 'wb').write(bytes.fromhex('05010902a10185020901a1000509190129101500250175019510810205010930093116008026ff7f75109502810609381581257f750895018106050c0a38021581257f750895018106c0c0'))"
-
-ln -s functions/hid.usb0 configs/c.1/
-
-echo "绑定 UDC..."
-UDC_NAME=$(ls /sys/class/udc | head -n 1)
-if [ -z "$UDC_NAME" ]; then
-    echo "❌ 找不到 UDC 控制器"
+# ① raw_gadget 模块
+if ! modprobe raw_gadget 2>/dev/null; then
+    echo "❌ raw_gadget 模块不可用 — 本机内核须先具备该模块 (modprobe raw_gadget;"
+    echo "   缺失时按内核文档 Documentation/usb/raw_gadget.rst 自行构建安装)"
     exit 1
 fi
-echo "$UDC_NAME" > UDC
+if [ ! -e /dev/raw-gadget ]; then
+    echo "❌ /dev/raw-gadget 未出现 (模块已载入但设备节点缺失)"
+    exit 1
+fi
 
-sleep 1
-chmod 666 /dev/hidg0 2>/dev/null || true
+# ② UDC 独占腾空 — 遗留 gadget 写空 UDC 文件即解绑 (无 gadget 则整段跳过;
+#    模块未载时该目录不存在, 循环自然空转)
+for g in /sys/kernel/config/usb_gadget/*; do
+    [ -e "$g/UDC" ] || continue
+    if echo "" > "$g/UDC" 2>/dev/null; then
+        echo "✅ 已解绑遗留 gadget: $(basename "$g")"
+    else
+        echo "⚠ 解绑 $g 失败 (手动: echo \"\" | sudo tee $g/UDC)"
+    fi
+done
+echo "ℹ 若 UDC 仍被占 (aimbot 报 EBUSY): 先停占用 /dev/raw-gadget 的进程 (如另一 aimbot 实例)"
+
+# ③ 节点权限
+chmod 666 /dev/raw-gadget 2>/dev/null || echo "⚠ chmod 666 /dev/raw-gadget 失败 (非 root?)"
+
+UDC_NAME=$(ls /sys/class/udc 2>/dev/null | head -n 1)
+if [ -z "$UDC_NAME" ]; then
+    echo "❌ 找不到 UDC 控制器 (/sys/class/udc 为空)"
+    exit 1
+fi
 
 echo "================================================="
-echo "✅ USB Gadget 虚拟鼠标已就绪: /dev/hidg0"
-echo "✅ 标准 HID 引导协议接口"
+echo "✅ raw_gadget 鼠标通道就绪: /dev/raw-gadget (UDC: $UDC_NAME)"
+echo "✅ UDC 已腾空, 会话由固件自行绑定/解绑"
 echo "================================================="

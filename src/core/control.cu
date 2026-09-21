@@ -21,6 +21,7 @@
 void control_apply(int cam_fps, uint8_t* rpt, int16_t real_x, int16_t real_y) {
     static auto last_press=std::chrono::steady_clock::now()-std::chrono::hours(1);
     static float rem_x=0,rem_y=0;
+    static float exrem_x=0,exrem_y=0;                  // 标定激励的每拍位移余量
     static float int_x=0,int_y=0;
     static int cal=0,hold=0;
     static const CalibSeg* seq=nullptr;
@@ -49,7 +50,14 @@ void control_apply(int cam_fps, uint8_t* rpt, int16_t real_x, int16_t real_y) {
                        :(int)(sizeof(CAL_END_FAIL_SEQ)/sizeof(CalibSeg));
             cal=done==1?4:5; si=st=0; }
     } else if (cal!=0) {
-        if (si<slen) { auto& sg=seq[si]; fx=sg.dx;fy=sg.dy;
+        if (si<slen) { auto& sg=seq[si];
+            // 激励段的每拍位移 = v·TICK_MS 的余量量化 (与瞄准的 rem += v·TICK_MS/s
+            //   同一手法): 段首余量清零, 段的总位移恒为 v×段毫秒数 — 拍率只决定
+            //   这条速度曲线被采样得多细, 屏幕上的激励速度不随拍率改变
+            if (st==0) { exrem_x=exrem_y=0; }
+            exrem_x+=sg.vx*TICK_MS; exrem_y+=sg.vy*TICK_MS;
+            fx=(int32_t)std::trunc(exrem_x); fy=(int32_t)std::trunc(exrem_y);
+            exrem_x-=(float)fx; exrem_y-=(float)fy;
             if(++st>=sg.ticks){st=0;++si;} }
         if (si>=slen) {
             if (cal==1) { excite.clear();

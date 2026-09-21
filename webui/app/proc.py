@@ -36,7 +36,7 @@ FPS_HIST_MAX = 720                     # 60s 一读 → 12h 会话覆盖
 
 RUNNING_STATES = ("starting", "running", "stopping")
 
-STEP_NAMES = ("jetson_clocks 频率锁定", "USB Gadget 鼠标", "aimbot 进程")
+STEP_NAMES = ("jetson_clocks 频率锁定", "raw_gadget 鼠标通道", "aimbot 进程")
 
 
 def sudo_prefix():
@@ -271,7 +271,7 @@ class InstanceManager:
         self.steps[0]["detail"] = out[-200:] if rc == 0 else ("jetson_clocks 失败 (rc=%s), 已跳过: %s" % (rc, out[-160:]))
         if rc != 0:
             self._append_log("⚠ jetson_clocks 失败 (rc=%s): %s" % (rc, out))
-        # ② setup_mouse.sh —— 失败则中止 (没有 hidg0 起进程必然失败)
+        # ② setup_mouse.sh —— 失败则中止 (UDC 未腾空/节点缺失时起进程必然失败)
         self.steps[1]["status"] = "running"
         t0 = time.time()
         if self._check_user_stop():

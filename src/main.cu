@@ -3,7 +3,7 @@
 //
 //  链路: 采集卡 (UVC 1080p NV12, -d 按名字选择) → GStreamer nvvidconv
 //        → CUDA 预处理 → TensorRT YOLO 检测 → alpha-beta 目标跟踪
-//        → 控制律 (极点配置 PI + type-2 速度前馈) → USB Gadget 透传
+//        → 控制律 (极点配置 PI + type-2 速度前馈) → USB raw_gadget 鼠标透传
 //
 //  控制律: 收敛带宽 wn 由标定延迟 L 自动导出 (wn=(90°−PM)π/180/L, PM=50°, 免手调),
 //    ζ=1 临界阻尼; type-2 速度前馈 (FF_GAIN_VAL=1) 补匀速跟踪零拖尾; 创新均值反演 â
@@ -26,7 +26,7 @@
 //
 //  本文件为程序入口: 参数解析, 设备打开, 线程孵化与 timerfd 控制主循环 (拍率 =
 //    DEFAULT_FREQ, core/state.h); 其余按归属分模块 — core/ (共享状态/控制律/
-//    估计器/标定/TRT 辅助), io/ (采集/HID 鼠标/热参)。
+//    估计器/标定/TRT 辅助), io/ (采集/鼠标输入与 USB 输出/热参)。
 // ============================================================================
 
 #include <algorithm>
@@ -40,7 +40,6 @@
 #include <string>
 #include <thread>
 
-#include <fcntl.h>
 #include <signal.h>
 #include <sys/epoll.h>
 #include <sys/timerfd.h>
@@ -52,6 +51,7 @@
 #include "io/capture.h"
 #include "io/hid_mouse.h"
 #include "io/hotctl.h"
+#include "io/usbraw.h"
 
 // ========================= 命令行交互 =========================
 static std::string get_input_with_default(const std::string& prompt, const std::string& def) {
@@ -66,7 +66,7 @@ int main(int argc, char* argv[]) {
              <<"  AI 视觉自瞄 (ff_pi_acc 控制律)\n"
              <<"========================================\n";
 
-    std::string a_m,a_c,a_t,a_y,a_d,a_f,a_x,a_s,a_l,a_S,a_k,a_v,a_r;
+    std::string a_m,a_c,a_t,a_y,a_d,a_f,a_x,a_s,a_l,a_S,a_k,a_v,a_r,a_D;
     std::string a_o,a_a,a_e; bool have_e=false;
     int fire_ms=300; double auto_s=10;
     int cooldown_ms=500; int jpeg_q=95;
@@ -93,6 +93,7 @@ int main(int argc, char* argv[]) {
         else if (arg=="-C"&&i+1<argc) cooldown_ms=std::stoi(argv[++i]);
         else if (arg=="-q"&&i+1<argc) jpeg_q=std::stoi(argv[++i]);
         else if (arg=="-r"&&i+1<argc) a_r=argv[++i];
+        else if (arg=="-D"&&i+1<argc) a_D=argv[++i];
         else if (arg=="-h"||arg=="--help") {
             std::cout<<"用法: "<<argv[0]<<" [自瞄选项] [采集选项]\n"
                 "\n自瞄选项:\n"
@@ -103,6 +104,7 @@ int main(int argc, char* argv[]) {
                 "  -S <脚本>  回写路径   -k <键>   fire/ads/both  -v <y/n> 预览\n"
                 "  -r <半径>  FOV 半径 px (默认 150, 10–1000)\n"
                 "  -a <y/n>   鼠标接管 (默认 y; n=纯透传: 不动鼠标, 检测/采集照常)\n"
+                "  -D <子串>  鼠标 by-id 匹配子串 (默认空 = 任一 *-event-mouse 字典序首个)\n"
                 "\n采集选项 (不传 -o 则纯自瞄不截图):\n"
                 "  -o <目录>  输出目录 (自动建 fire/ det/ auto/ 子目录)\n"
                 "  -e <列表>  启用的截图源 fire/det/auto 逗号分隔 (默认全部; 也可运行中热切)\n"
@@ -175,11 +177,9 @@ int main(int argc, char* argv[]) {
         std::cerr<<"❌ 采集卡设备不存在: "<<cam_dev<<"\n"; return 1; }
     std::cout<<"✅ 采集卡: "<<cam_dev<<"\n";
 
-    std::string real_dev=find_mouse_device(DEFAULT_KEYWORD);
-    if (real_dev.empty()) { std::cerr<<"❌ 未找到鼠标\n"; return 1; }
-    std::cout<<"✅ 鼠标: "<<real_dev<<"\n";
-    int virt_fd=open(DEFAULT_VIRT_DEV,O_WRONLY);
-    if (virt_fd<0) { std::cerr<<"❌ 无法打开 "<<DEFAULT_VIRT_DEV<<"\n"; return 1; }
+    MouseState state;
+    UsbRawSession usb;
+    if (!hid_mouse_start(state,usb,a_D)) return 1;
 
     signal(SIGINT,signal_handler); signal(SIGTERM,signal_handler);
     { std::lock_guard<std::mutex> lk(g_target.mtx);
@@ -196,8 +196,6 @@ int main(int argc, char* argv[]) {
     } else
         std::cout<<"采集: 关闭 (未传 -o)\n";
 
-    MouseState state;
-    std::thread reader(reader_thread,real_dev,std::ref(state));
     std::thread writer; if (do_collect) writer=std::thread(writer_thread,jpeg_q);
     std::thread hot(hotctl_thread);
     std::thread ai(ai_thread,model_path,cls,cam_dev,cam_fps,preview,
@@ -220,16 +218,17 @@ int main(int argc, char* argv[]) {
         uint64_t exp; read(tfd,&exp,sizeof(exp));
         int16_t x,y;int8_t w,hw;uint16_t b;
         extract_and_clear(state,x,y,w,hw,b);
-        send_report(virt_fd,x,y,w,hw,b,[cam_fps](std::array<uint8_t,HID_REPORT_LEN>& rpt,
-                                                 int16_t rx, int16_t ry) {
+        hid_report_submit(usb,x,y,w,hw,b,[cam_fps](std::array<uint8_t,HID_REPORT_LEN>& rpt,
+                                                   int16_t rx, int16_t ry) {
             control_apply(cam_fps,rpt.data(),rx,ry); });
     }
 
     global_running=false;
     g_save_cv.notify_all();
-    reader.join(); hot.join(); ai.join();
+    hot.join(); ai.join();
     if (do_collect) writer.join();
-    close(virt_fd);close(tfd);close(ep);
+    hid_mouse_stop(usb);
+    close(tfd);close(ep);
     std::cout<<"已停止\n";
     return 0;
 }

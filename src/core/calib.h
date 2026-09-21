@@ -23,31 +23,34 @@ const float S_MIN = 0.05f, S_MAX = 20.0f;
 const float L_MIN = 0.0f,  L_MAX = 200.0f;
 const int   CALIB_WAIT_TIMEOUT     = ms_to_ticks(2000);   // 等待标定计算回执超时 2s
 
-// 轨迹段 = 每拍位移 (counts) × 拍数; 段速度为设计量 (counts/拍, s=1 时即屏幕
-//   px/拍), 段时长由墙钟毫秒导出 —— 激励段的速度与默认速度帽同量级
-//   (2 counts/ms = 2000 px/s, 帽默认 1500–2000), 即被测的正是瞄准会用到的速度段。
-struct CalibSeg { int dx, dy, ticks; };
-// 起始方块: 纯视觉开始信号 (采样自激励段才开始, 本段不参与估计), 1500 px/s
+// 轨迹段 = 每毫秒位移 (counts/ms) × 拍数 (由墙钟毫秒导出); 每拍实际注入的整数
+//   counts 由余量量化得到 (与律自身的 rem += v·TICK_MS/s 同一套手法, 见
+//   control.cu)。速度与段时长是两个物理量, 拍率只决定这条曲线被采样得多细:
+//   段的总位移恒为 v×段毫秒数, 与拍率无关。段速度为设计量 (s=1 时 1 counts/ms
+//   = 1 px/ms = 1000 px/s), 激励段取 2 counts/ms = 2000 px/s — 与默认速度帽同
+//   量级, 即被测的正是瞄准会用到的速度段。
+struct CalibSeg { float vx, vy; int ticks; };
+// 起始方块: 纯视觉开始信号 (采样自激励段才开始, 本段不参与估计), 1.5 counts/ms
 inline const CalibSeg CAL_START_SEQ[] = {
-    {3,0,ms_to_ticks(240)},{0,3,ms_to_ticks(240)},
-    {-3,0,ms_to_ticks(240)},{0,-3,ms_to_ticks(240)},{0,0,ms_to_ticks(500)}};
+    {1.5f,0,ms_to_ticks(240)},{0,1.5f,ms_to_ticks(240)},
+    {-1.5f,0,ms_to_ticks(240)},{0,-1.5f,ms_to_ticks(240)},{0,0,ms_to_ticks(500)}};
 // 激励方波单圈基元: 每边 2 counts/ms × 250ms = 500 counts (control.cu 重复
 //   CAL_EXCITE_LOOPS 圈) — 5 圈 ≈ 5s 激励, 120fps 下 ≈600 帧, 同时盖过直方图
 //   的 300 帧容量与 CALIB_WINDOW 的最小窗口
 inline const CalibSeg CAL_EXCITE_SEQ[] = {
-    {4,0,ms_to_ticks(250)},{0,4,ms_to_ticks(250)},
-    {-4,0,ms_to_ticks(250)},{0,-4,ms_to_ticks(250)}};
+    {2,0,ms_to_ticks(250)},{0,2,ms_to_ticks(250)},
+    {-2,0,ms_to_ticks(250)},{0,-2,ms_to_ticks(250)}};
 constexpr int CAL_EXCITE_LOOPS = 5;
 // 静置段: 激励结束到回执之间留出的干净窗口
 inline const CalibSeg CAL_SETTLE_SEQ[] = {{0,0,ms_to_ticks(300)}};
-// 回执: 成功 = 点头, 失败 = 摇头 (8 counts/拍 = 每程 240 counts 的短促甩动)
+// 回执: 成功 = 点头, 失败 = 摇头 (4 counts/ms = 每程 240 counts 的短促甩动)
 inline const CalibSeg CAL_END_OK_SEQ[] = {
-    {0,8,ms_to_ticks(60)},{0,-8,ms_to_ticks(60)},{0,8,ms_to_ticks(60)},
-    {0,-8,ms_to_ticks(60)},{0,8,ms_to_ticks(60)},{0,-8,ms_to_ticks(60)}
+    {0,4,ms_to_ticks(60)},{0,-4,ms_to_ticks(60)},{0,4,ms_to_ticks(60)},
+    {0,-4,ms_to_ticks(60)},{0,4,ms_to_ticks(60)},{0,-4,ms_to_ticks(60)}
 };
 inline const CalibSeg CAL_END_FAIL_SEQ[] = {
-    {8,0,ms_to_ticks(60)},{-8,0,ms_to_ticks(60)},{8,0,ms_to_ticks(60)},
-    {-8,0,ms_to_ticks(60)},{8,0,ms_to_ticks(60)},{-8,0,ms_to_ticks(60)}
+    {4,0,ms_to_ticks(60)},{-4,0,ms_to_ticks(60)},{4,0,ms_to_ticks(60)},
+    {-4,0,ms_to_ticks(60)},{4,0,ms_to_ticks(60)},{-4,0,ms_to_ticks(60)}
 };
 
 struct CalibSample { std::chrono::steady_clock::time_point t; float dt_ms,sx,sy; };
