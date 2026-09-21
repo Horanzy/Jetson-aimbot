@@ -1,7 +1,9 @@
 // ============================================================================
 //  estimator.cu — estimator_step 的实现: 延迟补偿预测 → 清洗创新 → σ 自标定
 //    CUSUM / â 传感器更新 → 滤波位置/速度推进 → TargetState 发布 (无检测帧只
-//    发布 valid=false)。
+//    发布 valid=false)。自身运动的三处换算 (预测减法 / 清洗创新 / 自身加速度
+//    活动门) 一律用逐轴有效灵敏度 s_x/s_y (state.h 的 s_hid_now, 由采集线程按帧
+//    时刻的 ADS 状态取值) — 命令放大多少, 自身运动补偿就跟随多少。
 // ============================================================================
 
 #include "core/estimator.h"
@@ -24,7 +26,7 @@ static inline float accel_est(float ybar, float m2, float beta, float dt,
 
 float estimator_step(EstimatorState& st, std::chrono::steady_clock::time_point now,
                      bool found, float best_dx, float best_dy,
-                     float s_est, float l_est, float max_v) {
+                     float s_x, float s_y, float l_est, float max_v) {
     float dt=(float)elapsed_ms(now,st.t_prev); st.t_prev=now;
     dt=std::clamp(dt,1.0f,100.0f);
 
@@ -37,7 +39,7 @@ float estimator_step(EstimatorState& st, std::chrono::steady_clock::time_point n
             auto c0=g_counts.at(shift_ms(now,-(double)Lc-dt));
             auto c1=g_counts.at(shift_ms(now,-(double)Lc));
             float cax=(float)(c1.first-c0.first), cay=(float)(c1.second-c0.second);
-            float px_pred=st.fx+st.fvx*dt-s_est*cax, py_pred=st.fy+st.fvy*dt-s_est*cay;
+            float px_pred=st.fx+st.fvx*dt-s_x*cax, py_pred=st.fy+st.fvy*dt-s_y*cay;
             float inx=best_dx-px_pred, iny=best_dy-py_pred;
             if (std::hypot(inx,iny)>TRACK_JUMP_GATE) { st.fx=best_dx;st.fy=best_dy;st.fvx=0;st.fvy=0;
                 st.csx=st.csy=0;
@@ -62,8 +64,8 @@ float estimator_step(EstimatorState& st, std::chrono::steady_clock::time_point n
                    //   真实目标创新; 失配残留 ∝ Δ·a_own, 瞬态成对, 由活动门吸收)
                    auto c0n=g_counts.at(shift_ms(now,-(double)l_est-dt));
                    auto c1n=g_counts.at(shift_ms(now,-(double)l_est));
-                   float inx_c=inx-s_est*((c1.first-c0.first)-(float)(c1n.first-c0n.first));
-                   float iny_c=iny-s_est*((c1.second-c0.second)-(float)(c1n.second-c0n.second));
+                   float inx_c=inx-s_x*((c1.first-c0.first)-(float)(c1n.first-c0n.first));
+                   float iny_c=iny-s_y*((c1.second-c0.second)-(float)(c1n.second-c0n.second));
                    float clx=std::clamp(inx_c,-ACC_SIG_CLIP_K*srx,ACC_SIG_CLIP_K*srx);
                    float cly=std::clamp(iny_c,-ACC_SIG_CLIP_K*sry,ACC_SIG_CLIP_K*sry);
                    st.sig2rx+=beta*(clx*clx-st.sig2rx);
@@ -76,10 +78,10 @@ float estimator_step(EstimatorState& st, std::chrono::steady_clock::time_point n
                    auto s2=g_counts.at(shift_ms(now,-(double)dt));
                    auto s3=g_counts.at(shift_ms(now,-(double)dt-(double)w_own));
                    float th_a=max_v/(ACC_OW_ACTIV_K*std::max(1.0f,l_est));
-                   float aown_x=(s_est*((float)(s0.first-s1.first)
-                                       -(float)(s2.first-s3.first))/w_own)/dt;
-                   float aown_y=(s_est*((float)(s0.second-s1.second)
-                                       -(float)(s2.second-s3.second))/w_own)/dt;
+                   float aown_x=(s_x*((float)(s0.first-s1.first)
+                                     -(float)(s2.first-s3.first))/w_own)/dt;
+                   float aown_y=(s_y*((float)(s0.second-s1.second)
+                                     -(float)(s2.second-s3.second))/w_own)/dt;
                    float tx=aown_x/th_a, ty=aown_y/th_a;
                    float gx_own=1.0f/(1.0f+tx*tx*tx*tx*tx*tx);
                    float gy_own=1.0f/(1.0f+ty*ty*ty*ty*ty*ty);
@@ -120,7 +122,7 @@ float estimator_step(EstimatorState& st, std::chrono::steady_clock::time_point n
           g_target.last_dt=st.last_dt;g_target.last_alpha=st.last_alpha;
           g_target.last_beta=st.last_beta;
           g_target.cs=std::max(st.csx,st.csy)/CUSUM_H;
-          g_target.s_est=s_est;g_target.l_est_ms=l_est;
+          g_target.l_est_ms=l_est;
           g_target.t_pub=now;g_target.valid=true; }
     } else {
         std::lock_guard<std::mutex> lk(g_target.mtx); g_target.valid=false;

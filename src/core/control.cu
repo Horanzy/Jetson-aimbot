@@ -4,7 +4,9 @@
 //    type-2 速度前馈 (信任度插值门控 + 检测间隙衰减); 双侧键触发的标定状态机
 //    (cal=0..6, 激励轨迹表见 core/calib.h) 也在此驱动。跨帧控制状态 (积分器/
 //    状态机相位) 为函数内 static; counts 量化结果直接写入报文位移字节并记入
-//    g_counts。
+//    g_counts。注入换算与在飞补偿用同一份逐轴有效灵敏度 (state.h 的 s_hid_now,
+//    整数 spd 倍率, 100 = 基线); ADS 键按住的那一拍整套换成 adsspd 那一对, 并把
+//    该状态写进 g_ads_down 供逐帧消费者 (估计器自身运动补偿) 取同一状态。
 // ============================================================================
 
 #include "core/control.h"
@@ -32,6 +34,11 @@ void control_apply(int cam_fps, uint8_t* rpt, int16_t real_x, int16_t real_y) {
     uint16_t btns=rpt[1]|(rpt[2]<<8);
     bool left=btns&LEFT_KEY, right=btns&RIGHT_KEY, side=btns&SIDE_KEY;
     g_left_down.store(left);
+    // ADS 键 = 右键位: 本拍的有效灵敏度换算与逐帧消费者 (估计器自身运动补偿) 取
+    //   同一状态, ADS 期间的补偿不漂。ADS 倍率在按住的那一拍就生效。
+    const bool ads=right;
+    g_ads_down.store(ads);
+    const float s_x=s_hid_now(ads,0), s_y=s_hid_now(ads,1);
 
     int32_t fx=real_x, fy=real_y;
 
@@ -78,12 +85,12 @@ void control_apply(int cam_fps, uint8_t* rpt, int16_t real_x, int16_t real_y) {
         bool aiming=std::chrono::duration_cast<std::chrono::milliseconds>(
                         now-last_press).count()<=KEEP_ALIVE_MS;
         if (aiming) {
-            float px,py,vx,vy,se,le,cs;bool valid;
+            float px,py,vx,vy,le,cs;bool valid;
             std::chrono::steady_clock::time_point tp;
             float ax_e,ay_e,last_dt,last_alpha,last_beta;
             { std::lock_guard<std::mutex> lk(g_target.mtx);
               px=g_target.px;py=g_target.py;vx=g_target.vx;vy=g_target.vy;
-              se=g_target.s_est;le=g_target.l_est_ms;cs=g_target.cs;
+              le=g_target.l_est_ms;cs=g_target.cs;
               valid=g_target.valid;tp=g_target.t_pub;
               ax_e=g_target.ax_e;ay_e=g_target.ay_e;
               last_dt=g_target.last_dt;last_alpha=g_target.last_alpha;
@@ -94,8 +101,10 @@ void control_apply(int cam_fps, uint8_t* rpt, int16_t real_x, int16_t real_y) {
                 float Lc=le*PRED_L_COMP;
                 auto cp=g_counts.at(shift_ms(tp,-(double)Lc));
                 auto cn=g_counts.cum();
-                float ifx=se*(float)(cn.first-cp.first);
-                float ify=se*(float)(cn.second-cp.second);
+                // 在飞补偿: 每轴用该轴的有效灵敏度 (s_hid_now) — 与下方注入换算
+                //   同一个值, 命令放大多少补偿就跟随多少
+                float ifx=s_x*(float)(cn.first-cp.first);
+                float ify=s_y*(float)(cn.second-cp.second);
                 // 加速度偏差补偿: ε = â·T·(α/β−½) 修 α-β 速度结构滞后,
                 //   位置外推加 ½â·W²; 前馈用 v̂+ε — 对匀加速目标, 当前真实
                 //   速度才是 type-2 零拖尾的精确开环指令
@@ -140,8 +149,10 @@ void control_apply(int cam_fps, uint8_t* rpt, int16_t real_x, int16_t real_y) {
                 vy_u+=ff_eff*vffy;
                 float vcx=std::clamp(vx_u,-max_v,max_v);
                 float vcy=std::clamp(vy_u,-max_v,max_v);
-                float s=std::clamp(se,S_MIN,S_MAX);
-                rem_x+=vcx*TICK_MS/s; rem_y+=vcy*TICK_MS/s;
+                // 注入换算: 每轴的有效灵敏度 = 基线×100/spd_axis (state.h 的
+                //   s_hid_now) — 调大 spd = s 变小 = 发更多 counts = 更快。可执行器
+                //   上限 ±120 counts/拍是结构性的, 速度帽保持基线值。
+                rem_x+=vcx*TICK_MS/s_x; rem_y+=vcy*TICK_MS/s_y;
                 int sx=std::clamp((int)std::trunc(rem_x),-120,120);
                 int sy=std::clamp((int)std::trunc(rem_y),-120,120);
                 rem_x-=sx;rem_y-=sy; fx+=sx;fy+=sy;

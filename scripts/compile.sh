@@ -36,4 +36,17 @@ done
 # shellcheck disable=SC2086
 $NVCC $OBJS $LIBS $OCV -lopencv_imgcodecs $TRT -o "$BIN/aimbot"
 
+# 控制拍单测 (拉枪速度倍率 spd 的落点): spd=100 即基线 (1 count = 1 px), 逐轴独立,
+#   ADS 键按住那一拍整套切换 + g_ads_down 导出, 注入换算/在飞补偿/估计器自身运动
+#   补偿共用同一份逐轴有效灵敏度 (含随 spd 成比例变化), spd_clamp 的夹取带,
+#   热参路径 (spdx 下一拍生效 / 非法值被拒绝) — 链接除 main.o 外的模块对象并执行,
+#   断言失败 (退出码非 0) 时 set -e 终止整个编译。
+# shellcheck disable=SC2086
+$NVCC -c "$SRC/core/control_test.cu" $NVCC_FLAGS $INCLUDES -o "$BUILD/control_test.o"
+CONTROL_TEST_OBJS=$(printf '%s\n' $OBJS | grep -v "build/main.o" | tr '\n' ' ')
+# shellcheck disable=SC2086
+$NVCC "$BUILD/control_test.o" $CONTROL_TEST_OBJS $LIBS $OCV -lopencv_imgcodecs $TRT \
+    -o "$BUILD/control_test"
+"$BUILD/control_test"
+
 echo "✅ 编译完成 → $BIN"

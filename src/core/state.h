@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -41,6 +42,34 @@ const float TICK_MS      = 1000.0f / DEFAULT_FREQ;   // 控制拍周期 (ms)
 //   时长 (标定的激励段/停顿、触发与回执窗口都是设计量), 故拍数只由 ms 导出。
 constexpr int ms_to_ticks(int ms) { return ms * DEFAULT_FREQ / 1000; }
 
+// ========================= 拉枪速度倍率 (spd) =========================
+// spd 是**拉枪速度倍率**, 与有效灵敏度成反比: 有效灵敏度 = 基线 / k(spd),
+//   k(spd) = spd/100。spd 大 → 假定的游戏灵敏度低 → 同样的期望屏幕速度发出更多
+//   counts / 更大偏转 → 屏幕跟得更快 = 拉枪更快。整数步进 (105/109), **100 = 基线**
+//   (出厂手感), 与 spd 成反比的落点使"调大 = 更快"在四个值上一致。
+// 基线是有出处的, 不是为凑 100 造出来的: hid 的基线就是本库的灵敏度占位 1.0
+//   px/count, pad 的基线就是满偏屏幕速度 3000 px/s (COD 实测 30–70% 档
+//   193/556/1159/1651/1804 px/s → 满偏外推 ≈2600, 取 3000; 与速度帽推导
+//   2000 px/s = 960·v/d 同量级)。
+// 夹取带 [1, 10000] 是防误输入 (0/负数/离谱放大值); 有意义的带是 5..2000 ——
+//   有效灵敏度 s_hid_eff(spd) = 1/k 落在 0.05–20 px/count, 即本库灵敏度设计带
+//   (core/calib.h 的 S_MIN/S_MAX)。逐轴取值: 同一灵敏度下垂直与水平的屏速比是
+//   游戏属性 (俯仰灵敏度常更低), 一个总倍率会把两轴绑死; ADS 键按住期间整套换成
+//   adsspd 那一对。速度帽 (-x) 不随 spd 变 — 它约束"准星能否追上目标的屏幕速度",
+//   是游戏量, 与转换刻度无关。
+const int   SPD_BASE = 100;                          // 基线显示值 (整数步进 1 = 快 1%)
+const int   SPD_MIN  = 1, SPD_MAX = 10000;           // 防误输入夹取带 (见上)
+const float S_HID_BASE    = 1.0f;                    // hid 基线灵敏度 px/count (s_eff = 基线/k)
+const float GAIN_PAD_BASE = 3000.0f;                 // pad 满偏屏幕速度基线 px/s (A_eff = 基线/k;
+                                                     //   手柄输出是其第一个消费者)
+inline float spd_k(int spd) { return (float)spd / (float)SPD_BASE; }
+inline float s_hid_eff(int spd) { return S_HID_BASE / spd_k(spd); }
+inline float gain_pad_eff(int spd) { return GAIN_PAD_BASE / spd_k(spd); }
+// 夹取: 唯一定义点 — CLI (--spd/--ads-spd) 与热参 (spdx/...) 都经它
+inline int spd_clamp(long v) {
+    return (int)std::clamp<long>(v, (long)SPD_MIN, (long)SPD_MAX);
+}
+
 // ========================= 全局状态 =========================
 extern std::atomic<bool> global_running;
 void signal_handler(int);
@@ -61,6 +90,23 @@ extern std::atomic<bool>  g_aim_enabled;             // 鼠标接管 (-a / 热�
 extern std::atomic<bool>  g_cap_fire;                // 采集源开关 (-e / 热参): 开火截图
 extern std::atomic<bool>  g_cap_det;                 //   检测截图
 extern std::atomic<bool>  g_cap_auto;                //   定时截图
+// ---- 拉枪速度倍率 (CLI --spd/--ads-spd, 热参 spdx/spdy/adsspdx/adsspdy) ----
+// 四个值唯一, 逐轴: 腰射一对, ADS 键按住期间一对 (整套换, 不逐位混搭)。刻度与基线
+//   的定义见上方 "拉枪速度倍率 (spd)"。
+extern std::atomic<int>   g_spd_x, g_spd_y;          // 腰射: X / Y (显示值, 100 = 基线)
+extern std::atomic<int>   g_ads_spd_x, g_ads_spd_y;  // ADS 键按住时: X / Y (同刻度)
+// ADS 键状态 (右键位; 控制拍每拍写): 估计器/在飞补偿按帧时刻的该状态取倍率 —
+//   飞行窗只有 L 毫秒, 窗内切态的误差是二阶量 (接受的取舍)
+extern std::atomic<bool>  g_ads_down;
+inline bool ads_down() { return g_ads_down.load(); }
+// 逐轴取当前显示值 (axis: 0 = X / 1 = Y)
+inline int spd_axis(bool ads, int axis) {
+    return ads ? (axis ? g_ads_spd_y.load() : g_ads_spd_x.load())
+               : (axis ? g_spd_y.load() : g_spd_x.load());
+}
+// 逐轴 hid 有效灵敏度 (px/count) = 基线 / k(spd): 注入换算、在飞补偿、估计器自身
+//   运动补偿三处消费同一份值 — 分裂会让命令放大多少、补偿就错多少
+inline float s_hid_now(bool ads, int axis) { return s_hid_eff(spd_axis(ads, axis)); }
 
 // ---- 时间辅助 ----
 inline std::chrono::steady_clock::time_point shift_ms(
@@ -82,7 +128,7 @@ struct TargetState {
     float cs = 0;                                // CUSUM 告警电平 (σ 倍数归一, 信任度来源)
     bool  valid = false;
     std::chrono::steady_clock::time_point t_pub;
-    float s_est = 1.0f, l_est_ms = 60.0f;
+    float l_est_ms = 60.0f;                      // 标定量: 环路延迟 (ms), 唯一被回写的量
     std::mutex mtx;
 };
 extern TargetState g_target;
@@ -115,6 +161,12 @@ public:
     }
     std::pair<long long,long long> cum() const {
         std::lock_guard<std::mutex> lk(mtx); return {cum_x, cum_y};
+    }
+    // 清空: at() 按时间二分, 混入不同时间基的记录会让查找失效 — 单测在换时间基
+    //   时先清空 (真机上账本由单一线程按真实钟写入, 天然单调, 无需清空)
+    void clear() {
+        std::lock_guard<std::mutex> lk(mtx);
+        buf.clear(); cum_x = 0; cum_y = 0;
     }
 private:
     mutable std::mutex mtx;

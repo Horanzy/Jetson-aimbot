@@ -23,7 +23,7 @@ from . import discover
 
 HANDSHAKE_RE = re.compile(r"热参数通道: 127\.0\.0\.1:(\d+)")
 FPS_RE = re.compile(r"\[AI FPS\] (\d+) fps")
-CALIB_RE = re.compile(r"\[标定\] s=([0-9.eE+-]+) px/count, L=([0-9.eE+-]+) ms")
+CALIB_RE = re.compile(r"\[标定\] L=([0-9.eE+-]+) ms")
 # [SAVE] fire  (fire=12 det=3 auto=1 drop=0) — 每张截图一行, 计数是固件的累计值
 SAVE_RE = re.compile(r"\[SAVE\]\s*\S+\s*\(fire=(\d+) det=(\d+) auto=(\d+)")
 STATS_RE = re.compile(r"采集统计: fire=(\d+) det=(\d+) auto=(\d+)")
@@ -50,7 +50,7 @@ def fmt_num(v):
 
 
 def build_argv(root: Path, params: dict, calib: dict, script_path: Path) -> list:
-    """拼装 aimbot 命令行 (与脚本同构)。calib 缺项时省略 -s/-l, 固件按默认兜底。"""
+    """拼装 aimbot 命令行 (与脚本同构)。calib 缺项时省略 -l, 固件按默认兜底。"""
     model = str(params.get("model") or "")
     model_abs = model if os.path.isabs(model) else str(root / model)
     argv = [str(root / "bin" / "aimbot"),
@@ -62,12 +62,14 @@ def build_argv(root: Path, params: dict, calib: dict, script_path: Path) -> list
             "-f", fmt_num(params.get("cam_fps", 120)),
             "-x", fmt_num(params.get("max_speed", 1500.0)),
             "-S", str(script_path),
+            # 拉枪速度倍率 (逐轴, 100 = 基线) — 与脚本同构地显式给出, 缺省即脚本值
+            "--spd", "%d,%d" % (params.get("spd_x", 100), params.get("spd_y", 100)),
+            "--ads-spd", "%d,%d" % (params.get("ads_spd_x", 100),
+                                    params.get("ads_spd_y", 100)),
             "-k", str(params.get("aim_key", "both")),
             "-a", "y" if params.get("aim_enabled", True) else "n",
             "-r", fmt_num(params.get("fov", 150.0)),
             "-v", "y" if params.get("preview") else "n"]
-    if calib.get("s") is not None:
-        argv += ["-s", fmt_num(calib["s"])]
     if calib.get("l") is not None:
         argv += ["-l", fmt_num(calib["l"])]
     if params.get("capture_enabled"):
@@ -354,7 +356,7 @@ class InstanceManager:
             m = CALIB_RE.search(line)
             if m:
                 try:
-                    self.calib_live = {"s": float(m.group(1)), "l": float(m.group(2))}
+                    self.calib_live = {"l": float(m.group(1))}
                 except ValueError:
                     pass
             self._append_log(line)

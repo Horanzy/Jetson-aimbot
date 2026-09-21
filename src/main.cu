@@ -18,11 +18,16 @@
 //  鼠标接管: -a n (或热参 aim=0) 时固件纯透传真实鼠标 — 不注入任何移动, 检测/采集照常。
 //    模型未完善但需要采集数据的运行形态; aim=1 即恢复控制输出。
 //
-//  热参数: UDP 127.0.0.1 上的极小本地控制通道 (白名单 t/y/x/fov/k/aim/cap_*, 固件侧强制
-//    钳制), webui 保存后即时生效不重启; 结构常量仍为编译期, 与"无手调魔法数字"哲学一致。
+//  热参数: UDP 127.0.0.1 上的极小本地控制通道 (白名单 t/y/x/fov/spdx/spdy/
+//    adsspdx/adsspdy/k/aim/cap_*, 固件侧强制钳制), webui 保存后即时生效不重启;
+//    结构常量仍为编译期, 与"无手调魔法数字"哲学一致。
 //
 //  标定: 双侧键长按 5 秒, 程序自动生成激励轨迹 (画正方形), 块相位相关测背景位移,
-//    最小二乘估计灵敏度 s (px/count) + 环路延迟 L (ms); 经 -S 传入脚本路径时自动回写。
+//    最小二乘估计环路延迟 L (ms); 经 -S 传入脚本路径时自动回写 (拟合联立解出的
+//    灵敏度 s 只作诊断量打印 — 手感走 --spd/--ads-spd 四个逐轴倍率)。
+//
+//  拉枪速度: 四个逐轴倍率 —— 腰射一对 (--spd), ADS 键 (右键) 按住期间一对
+//    (--ads-spd); 有效灵敏度 = 基线/(倍率/100), 100 = 基线, 调大 = 更快。
 //
 //  本文件为程序入口: 参数解析, 设备打开, 线程孵化与 timerfd 控制主循环 (拍率 =
 //    DEFAULT_FREQ, core/state.h); 其余按归属分模块 — core/ (共享状态/控制律/
@@ -37,6 +42,7 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <stdexcept>
 #include <string>
 #include <thread>
 
@@ -66,8 +72,8 @@ int main(int argc, char* argv[]) {
              <<"  AI 视觉自瞄 (ff_pi_acc 控制律)\n"
              <<"========================================\n";
 
-    std::string a_m,a_c,a_t,a_y,a_d,a_f,a_x,a_s,a_l,a_S,a_k,a_v,a_r,a_D;
-    std::string a_o,a_a,a_e; bool have_e=false;
+    std::string a_m,a_c,a_t,a_y,a_d,a_f,a_x,a_l,a_S,a_k,a_v,a_r,a_D;
+    std::string a_o,a_a,a_e,a_spd,a_adsspd; bool have_e=false;
     int fire_ms=300; double auto_s=10;
     int cooldown_ms=500; int jpeg_q=95;
 
@@ -80,7 +86,6 @@ int main(int argc, char* argv[]) {
         else if (arg=="-d"&&i+1<argc) a_d=argv[++i];
         else if (arg=="-f"&&i+1<argc) a_f=argv[++i];
         else if (arg=="-x"&&i+1<argc) a_x=argv[++i];
-        else if (arg=="-s"&&i+1<argc) a_s=argv[++i];
         else if (arg=="-l"&&i+1<argc) a_l=argv[++i];
         else if (arg=="-S"&&i+1<argc) a_S=argv[++i];
         else if (arg=="-k"&&i+1<argc) a_k=argv[++i];
@@ -94,14 +99,18 @@ int main(int argc, char* argv[]) {
         else if (arg=="-q"&&i+1<argc) jpeg_q=std::stoi(argv[++i]);
         else if (arg=="-r"&&i+1<argc) a_r=argv[++i];
         else if (arg=="-D"&&i+1<argc) a_D=argv[++i];
+        else if (arg=="--spd"&&i+1<argc) a_spd=argv[++i];
+        else if (arg=="--ads-spd"&&i+1<argc) a_adsspd=argv[++i];
         else if (arg=="-h"||arg=="--help") {
             std::cout<<"用法: "<<argv[0]<<" [自瞄选项] [采集选项]\n"
                 "\n自瞄选项:\n"
                 "  -m <路径>  模型       -c <ID>   类别      -t <阈值> 置信度\n"
                 "  -y <偏移>  部位       -d <采集卡> 名字或 /dev/videoN\n"
                 "  -f <帧率>  120/60     -x <速度> 最大px/s\n"
-                "  -s <s>     初始灵敏度 -l <L>    初始延迟\n"
+                "  -l <L>     初始延迟\n"
                 "  -S <脚本>  回写路径   -k <键>   fire/ads/both  -v <y/n> 预览\n"
+                "  --spd <x>[,<y>]      拉枪速度倍率逐轴 (默认 100 = 基线; 调大=更快; 热参 spdx/spdy)\n"
+                "  --ads-spd <x>[,<y>]  ADS 键按住时的同一对 (默认 100; 热参 adsspdx/adsspdy)\n"
                 "  -r <半径>  FOV 半径 px (默认 150, 10–1000)\n"
                 "  -a <y/n>   鼠标接管 (默认 y; n=纯透传: 不动鼠标, 检测/采集照常)\n"
                 "  -D <子串>  鼠标 by-id 匹配子串 (默认空 = 任一 *-event-mouse 字典序首个)\n"
@@ -130,9 +139,28 @@ int main(int argc, char* argv[]) {
     float max_spd =std::stof(!a_x.empty()?a_x:get_input_with_default("最大速度","1500"));
     max_spd=std::clamp(max_spd,100.0f,20000.0f);
     const float max_v=max_spd/1000.0f;
-    float init_s=std::clamp(std::stof(a_s.empty()?"1.0":a_s),S_MIN,S_MAX);
     float init_l=std::clamp(std::stof(a_l.empty()?"60":a_l),L_MIN,L_MAX);
     const std::string persist_path=a_S;
+    // 拉枪速度倍率 (核心语义见 core/state.h): 有效灵敏度 = 基线/(倍率/100),
+    //   --spd <x>[,<y>] (y 省略 = 与 x 同) / --ads-spd <x>[,<y>]; 缺省 = 100 = 基线。
+    //   整数步进; 越界按防误输入夹取到 [SPD_MIN, SPD_MAX] (有意义的带是 5..2000)。
+    auto parse_spd=[&](const std::string& spec,int& x,int& y,const char* flag)->bool {
+        if (spec.empty()) return true;
+        auto val=[&](const std::string& t)->int {
+            size_t p=0; int v=0;
+            try { v=std::stoi(t,&p); } catch (const std::exception&) { p=0; }
+            if (p!=t.size()) throw std::invalid_argument(flag);
+            return spd_clamp(v); };
+        size_t comma=spec.find(',');
+        try { x=val(spec.substr(0,comma));
+              y=(comma==std::string::npos)?x:val(spec.substr(comma+1)); }
+        catch (const std::exception&) {
+            std::cerr<<"❌ "<<flag<<" 须为 <x>[,<y>] 整数\n"; return false; }
+        return true;
+    };
+    int spd_x=SPD_BASE,spd_y=SPD_BASE,ads_spd_x=SPD_BASE,ads_spd_y=SPD_BASE;
+    if (!parse_spd(a_spd,spd_x,spd_y,"--spd")) return 1;
+    if (!parse_spd(a_adsspd,ads_spd_x,ads_spd_y,"--ads-spd")) return 1;
     std::string aim_key=!a_k.empty()?a_k:get_input_with_default("触发键","fire");
     int aim_mode=0;
     if(aim_key=="ads")aim_mode=1; else if(aim_key=="both")aim_mode=2;
@@ -166,6 +194,8 @@ int main(int argc, char* argv[]) {
     g_aim_mode.store(aim_mode); g_fov_radius.store(fov_r);
     g_aim_enabled.store(aim_on);
     g_cap_fire.store(fire_on); g_cap_det.store(det_on); g_cap_auto.store(auto_on);
+    g_spd_x.store(spd_x); g_spd_y.store(spd_y);
+    g_ads_spd_x.store(ads_spd_x); g_ads_spd_y.store(ads_spd_y);
 
     const bool do_collect=!a_o.empty();
     if (do_collect) { ensure_dir(a_o); ensure_dir(a_o+"/fire");
@@ -182,10 +212,10 @@ int main(int argc, char* argv[]) {
     if (!hid_mouse_start(state,usb,a_D)) return 1;
 
     signal(SIGINT,signal_handler); signal(SIGTERM,signal_handler);
-    { std::lock_guard<std::mutex> lk(g_target.mtx);
-      g_target.s_est=init_s; g_target.l_est_ms=init_l; }
+    { std::lock_guard<std::mutex> lk(g_target.mtx); g_target.l_est_ms=init_l; }
 
-    std::cout<<"初始: s="<<init_s<<" L="<<init_l<<" fov="<<fov_r<<"\n";
+    std::cout<<"初始: L="<<init_l<<" spd_x="<<spd_x<<" spd_y="<<spd_y
+             <<" ads_spd_x="<<ads_spd_x<<" ads_spd_y="<<ads_spd_y<<" fov="<<fov_r<<"\n";
     std::cout<<"鼠标接管: "<<(aim_on?"开":"关 (纯透传: 不注入移动, 检测/采集照常)")<<"\n";
     if (do_collect) {
         std::string srcs;
@@ -199,7 +229,7 @@ int main(int argc, char* argv[]) {
     std::thread writer; if (do_collect) writer=std::thread(writer_thread,jpeg_q);
     std::thread hot(hotctl_thread);
     std::thread ai(ai_thread,model_path,cls,cam_dev,cam_fps,preview,
-                   init_s,init_l,persist_path,
+                   init_l,persist_path,
                    a_o,fire_ms,auto_s,cooldown_ms,jpeg_q);
 
     int tfd=timerfd_create(CLOCK_MONOTONIC,0);

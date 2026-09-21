@@ -10,7 +10,7 @@ Capture card (UVC 1080p NV12) → GStreamer nvvidconv → CUDA preprocess → Te
 → merged with the real mouse → USB raw_gadget userspace device stack (generic HID mouse) → game
 ```
 
-No hand-tuned gains: a bilateral side-key trigger runs auto-calibration, estimating sensitivity s (px/count) and loop delay L (ms) online. The control tick is 1 kHz (`DEFAULT_FREQ`). Adapts to PC / PS5 / 60fps / 120fps.
+No hand-tuned gains: a bilateral side-key trigger runs auto-calibration, measuring **only the loop delay L (ms)** online; the per-game speed feel is dialled by four **per-axis pull-speed ratios** (`--spd`/`--ads-spd` — effective sensitivity = baseline / (ratio/100), so 100 is the baseline and a larger ratio pulls faster). The control tick is 1 kHz (`DEFAULT_FREQ`). Adapts to PC / PS5 / 60fps / 120fps.
 
 **Control law**: the firmware (`src/main.cu` with `src/core/` and `src/io/`) uses **ff_pi_acc** (pole-placement PI + type-2 velocity feedforward with direction-contradiction CUSUM velocity reset and detection-gap FF decay, plus an innovation-mean â channel that removes the α-β structural lag on accelerating targets) — the convergence bandwidth `wn` is derived from the calibrated delay `L` via phase margin (`wn=(90°−PM)π/180/L`, PM=50°), **no hand-tuned magic numbers**, good generalization. The same binary has **optional training-data collection** (enabled with `-o`, otherwise pure aimbot). All control-law exploration/comparison/tuning happens in the pure-Python `arena/` simulation (this machine cannot compile .cu).
 
@@ -109,28 +109,31 @@ never reported as verified from here.
 | `src/main.cu` | **The program entry**: argument parsing, device open, thread spawn, the timerfd control loop (`DEFAULT_FREQ`). Full aimbot + optional training-data collection (`-o`); without `-o` it is pure aimbot |
 | `src/core/control.cu/.h` | ff_pi_acc header constants (PRED_*/FF_*/CUSUM_*/ACC_* — pole-placement PI + type-2 velocity feedforward with direction-contradiction CUSUM velocity reset, detection-gap FF decay, gated â acceleration-bias compensation; wn derived from L, no hand tuning) + the control tick + the calibration state machine (excitation tables in `core/calib.h`) |
 | `src/core/estimator.cu/.h` | α-β filter + direction-contradiction CUSUM + innovation-mean â sensor (`estimator_step`, driven per frame by the capture thread; publishes `g_target`) |
-| `src/core/calib.cu/.h` | `run_calibration` (least-squares s + coarse/fine delay sweep) / `persist_calibration` (atomic S_EST/L_EST write-back) / `resolve_cam_device` + the CalibSeg excitation tables (segment speed in counts/ms × wall-clock duration) and the calibration wall-clock constants |
+| `src/core/calib.cu/.h` | `run_calibration` (least-squares delay sweep — the sensitivity it solves for jointly is a by-product kept as a printed diagnostic, never written back) / `persist_calibration` (atomic write-back of the delay under the VAR name the caller passes, one name per output mode) / `resolve_cam_device` + the CalibSeg excitation tables (segment speed in counts/ms × wall-clock duration) and the calibration wall-clock constants |
 | `src/core/trt.cu/.h` | TensorRT Logger / `CHECK_CUDA` / BGR→RGB CHW preprocess kernels (kernel and its launch wrapper share one TU — no `-rdc`) / output-tensor parsing + NMS |
-| `src/core/state.cu/.h` | shared globals: system constants, `ms_to_ticks` (durations are wall-clock, ticks are derived), TargetState/CountsHistory/MouseState, hot-param & calibration atomics, time helpers, async save queue, signal |
+| `src/core/state.cu/.h` | shared globals: system constants, `ms_to_ticks` (durations are wall-clock, ticks are derived), the **pull-speed ratio scale** (`spd`: integer, 100 = baseline, effective sensitivity = baseline/k — the single definition point of the hid per-axis effective `s`, of the pad full-deflection screen speed, of the clamp both entry points use, and of the ADS-pair switch with its exported key state), TargetState/CountsHistory/MouseState, hot-param & calibration atomics, time helpers, async save queue, signal |
+| `src/core/control_test.cu` | `build/control_test` unit test (built and run by `compile.sh`): the pull-speed ratio's landing points — spd=100 is the baseline (1 count = 1 px at the hid base), per-axis independence, the ADS pair switching on the very tick the right key is held, and the three consumers (injection, in-flight compensation, the estimator's own-motion conversion) sharing one per-axis effective sensitivity; plus the clamp band and the hot-param path |
 | `src/io/capture.cu/.h` | GStreamer pipeline + `ai_thread` (capture → inference → `estimator_step`; calibration sampling/fit/write-back, three-source collection and preview) |
 | `src/io/hid_mouse.cu/.h` | real-mouse input and USB mouse identity: evdev read (EVIOCGRAB; device picked by `-D`, default = lexicographically first `*-event-mouse` so the choice is deterministic, an explicit substring matching several nodes is an error listing the candidates) + the USB mouse device definition (device/config/report descriptors — the report descriptor is the single source of truth for the 9-byte report layout; the identity is the kernel's generic gadget IDs `1d6b:0104` — a mouse is bound by HID class on every host, so a vendor identity would carry no information, and this one is the identity the deployment host's HID stack is already bound to, keeping its pointer settings in force) + per-tick report assembly submitted into the raw_gadget session's latest-report slot (control counts merged via the overlay callback) |
 | `src/io/usbraw.cu/.h` | raw_gadget session carrier: sysfs two-level UDC name discovery → INIT/RUN/VBUS_DRAW; the ep0 standard-request table (descriptors truncated to `wLength`, status/configuration/interface/feature; OUT or zero-length SETUPs closed through EP0_READ), device-specific requests answered by an optional per-device hook, unanswered ones STALLed — an unanswered SETUP would leave the kernel's ep0 stage pending and fail every later control transfer of the session; the interrupt-IN **latest-report slot** send thread (EP_WRITE length = submitted length — a short packet is a packet boundary); report rate = min(tick rate, host service rate) — the slot holds one state, not a queue, so the host sees exactly one report per report the producer submitted and no submission can turn into two host-visible reports, while a producer faster than the host has its extra submissions coalesced. Session parameters come from the device definition: enumeration speed (which sets the time unit of the endpoint `bInterval`), device qualifier (nullptr = none, that GET_DESCRIPTOR STALLs — the spec behaviour of full-speed-only devices), VBUS request (taken from the configuration's `bMaxPower`, uapi unit 2 mA, matching the kernel's `usb_gadget_vbus_draw(2 × value)`), descriptor set, endpoint set and class-request semantics. Shutdown wakes the threads blocked in endpoint ioctls with a no-op signal: those in-flight ioctls hold a file reference, so closing the fd alone cannot drive the UDC release |
-| `src/io/hotctl.cu/.h` | UDP hot-parameter channel 127.0.0.1:47700 |
-| `scripts/compile.sh` | nvcc build of aimbot → `bin/` via per-TU objects in `build/` (run on the Jetson) |
+| `src/io/hotctl.cu/.h` | UDP hot-parameter channel 127.0.0.1:47700 (`hotctl_apply` is the pure key/value apply step — testable without a socket) |
+| `scripts/compile.sh` | nvcc build of aimbot → `bin/` via per-TU objects in `build/`, plus the `build/control_test` unit test (run on the Jetson) |
 | `scripts/convert.sh` | Batch ONNX → TensorRT engine conversion |
 | `scripts/setup_mouse.sh` | raw_gadget module load + UDC vacated (legacy gadget instances unbound) + `/dev/raw-gadget` permissions |
-| `scripts/game/template.sh.example` | Per-game launcher template — copy to `<game>.sh` (`.example` keeps the webui from listing it as a launchable profile). Relative paths; mouse-takeover switch `AIM_ENABLED` and screenshot-collection switches (`CAPTURE` master + per-source `CAP_FIRE`/`CAP_DET`/`CAP_AUTO`); auto write-back of calibration values `S_EST`/`L_EST`; the `MAX_SPEED` rule and its derivation live in the file |
+| `scripts/game/template.sh.example` | Per-game launcher template — copy to `<game>.sh` (`.example` keeps the webui from listing it as a launchable profile). Relative paths; mouse-takeover switch `AIM_ENABLED` and screenshot-collection switches (`CAPTURE` master + per-source `CAP_FIRE`/`CAP_DET`/`CAP_AUTO`); the four pull-speed ratio VARs (`SPDX`/`SPDY`/`ADS_SPDX`/`ADS_SPDY` → `--spd`/`--ads-spd`, integer, 100 = baseline) with the scale explained in the file; auto write-back of the calibrated delay `L_EST` only (the ratios are manual entries the firmware never writes); the `MAX_SPEED` rule and its derivation live in the file |
 | `arena/` | Pure-Python control-law simulation evaluator (neutral simulator + 10 laws + standard + FPS test suites); see dedicated section |
 
 Linking note: `aimbot` needs `-lopencv_video` (calibration uses `phaseCorrelate`) and `-lopencv_imgcodecs` (collection `imwrite`).
 
 ## Parameters
 
-**aimbot** (missing `-s`/`-l`/`-S` silently fall back to defaults; other missing args prompt interactively):
+**aimbot** (missing `-l`/`-S` silently fall back to defaults; other missing args prompt interactively):
 
 ```
 -m model  -c class  -t confidence  -y height offset  -d capture card (Hagibis/Asus or /dev/videoN)
--f framerate (120/60)  -x speed cap px/s  -s initial s  -l initial L  -r FOV radius px (default 150)
+-f framerate (120/60)  -x speed cap px/s  -l initial L  -r FOV radius px (default 150)
+--spd <x>[,<y>] pull-speed ratio per axis (default 100 = baseline; larger = faster; hot params spdx/spdy)
+--ads-spd <x>[,<y>] the same pair while the ADS key (right button) is held (hot params adsspdx/adsspdy)
 -a mouse takeover (default y; n = pure pass-through: no injected motion, detection/collection keep running)
 -D mouse /dev/input/by-id substring (default empty = lexicographically first *-event-mouse; an
    explicit substring matching several nodes errors out and lists them — a plugged-in gamepad's
@@ -138,7 +141,9 @@ Linking note: `aimbot` needs `-lopencv_video` (calibration uses `phaseCorrelate`
 -S write-back script path  -k trigger key (fire/ads/both)  -v preview
 ```
 
-Hot params: the binary opens a localhost-only UDP control channel (127.0.0.1:47700, `key=value;...`); the webui pushes whitelisted params (`t`/`y`/`x`/`fov`/`k`/`aim`/`cap_fire`/`cap_det`/`cap_auto`, clamped firmware-side) into the running process without restart — protocol in `webui/README.md`. Structural constants stay compile-time.
+**Pull-speed ratio scale** (`src/core/state.h` is its single definition point): the ratio is the **pull-speed multiplier and is inverse to the effective sensitivity** — effective sensitivity = baseline / k, `k = ratio/100`. A larger ratio assumes a lower game sensitivity, so the same desired screen velocity emits more counts (a larger deflection) = the crosshair follows faster. Integers step by one percent (`105`, `109`), **100 = the baseline**, and the baseline is the repository's own sensitivity placeholder — the hid base is `1.0 px/count`, the pad base is `3000 px/s` full deflection (COD's measured 30–70 % levels 193/556/1159/1651/1804 px/s extrapolate to ≈2600 full deflection, so 3000 is the design baseline; it is also the same order as the speed-cap derivation below). The clamp band is `[1, 10000]` (a typo guard, shared by CLI and hot params); the meaningful band is `5..2000`, i.e. an effective sensitivity of 0.05–20 px/count. Per axis because a game's vertical/horizontal screen-speed ratio is a property of the game (pitch sensitivity is usually lower) and one shared ratio would tie the axes together; the ADS pair switches in as a whole on the tick the ADS key is held, and that key state is exported (`g_ads_down`) so the frame-rate consumers (the estimator's own-motion conversion) use the same state. The ratio lands **in the effective sensitivity** (not as an output-side multiplier) on purpose: the injection conversion, the in-flight compensation and the estimator's own-motion conversion all consume the same per-axis value, so a ratio change moves the command and its compensation together instead of desynchronizing them. The speed cap (`-x`) keeps its value — it constrains whether the crosshair can keep up with the target's screen velocity, a property of the game, not of the conversion scale.
+
+Hot params: the binary opens a localhost-only UDP control channel (127.0.0.1:47700, `key=value;...`); the webui pushes whitelisted params (`t`/`y`/`x`/`fov`/`spdx`/`spdy`/`adsspdx`/`adsspdy`/`k`/`aim`/`cap_fire`/`cap_det`/`cap_auto`, clamped firmware-side) into the running process without restart — protocol in `webui/README.md`. Structural constants stay compile-time.
 
 Note: the ff_pi_acc bandwidth is derived automatically from the calibrated `L`; **there are no hand-tuning parameters**. Structural parameters (PM/ζ/FF_GAIN_VAL/FF_I_GATE/over-compensation and the â-channel constants) are header constants in `src/core/control.h`, see "Tuning".
 
@@ -148,7 +153,7 @@ Note: the ff_pi_acc bandwidth is derived automatically from the calibrated `L`; 
 -o output dir (auto-creates fire/ det/ auto/)  -e enabled sources fire,det,auto (default all)  -F fire interval ms  -A timed interval s  -C cooldown ms  -q JPEG quality
 ```
 
-**Calibration**: aim at a static background with texture, hold both side keys for 5 s. Start = draw a square; success = nod; failure = shake. With `-S`, `S_EST=`/`L_EST=` are written back into the script automatically (atomic rename).
+**Calibration**: aim at a static background with texture, hold both side keys for 5 s. Start = draw a square; success = nod; failure = shake. With `-S`, `L_EST=` is written back into the script automatically (atomic rename) — the delay is the only calibrated quantity; the printed sensitivity is a diagnostic of the same fit, and the speed ratios are manual entries the firmware never writes.
 
 ## Architecture
 
@@ -157,8 +162,8 @@ Note: the ff_pi_acc bandwidth is derived automatically from the calibrated `L`; 
 | State | Method | Source | Runtime |
 |---|---|---|---|
 | Position/velocity | alpha-beta (gains normalized by measured dt: α=PRED_ALPHA0·dt/DT0, β=PRED_BETA0·dt/DT0; prediction step subtracts own control action) | first detection | every frame |
-| Sensitivity s | least-squares calibration (coarse 8ms + fine 2ms sweep) | hip-fire calibration | constant |
-| Delay L | phase-correlation delay sweep (same two rounds) | hip-fire calibration | constant |
+| Effective sensitivity | **not calibrated**: the pull-speed ratios (four manual entries, one per axis per fire state) divide the baseline — `s_hid_now` = base·100/ratio per axis (hid), `gain_pad_eff` the same for the pad's full-deflection screen speed | — | user dials |
+| Delay L | phase-correlation delay sweep (coarse 8ms + fine 2ms round), the only calibrated quantity | hip-fire calibration | constant |
 
 ### Control law (ff_pi_acc, `src/core/control.cu`)
 
@@ -166,7 +171,7 @@ Note: the ff_pi_acc bandwidth is derived automatically from the calibrated `L`; 
 Predictor (Smith, dt-normalized): α=min(.9, PRED_ALPHA0·dt/DT0), β=min(.6, PRED_BETA0·dt/DT0)
   Lc = L̂·PRED_L_COMP                                   // over-compensation; favors the under-compensated side (the dangerous one)
   ε = â·T·(α/β − ½),  W = age+Lc                        // α-β structural velocity lag on accelerating targets
-  ê = f + (v̂+ε)·W + ½â·W² − s·Σcounts(in flight)       // delay-removed error
+  ê = f + (v̂+ε)·W + ½â·W² − s_eff·Σcounts(in flight)  // delay-removed error (s_eff per axis)
 Convergence bandwidth: wn = (90°−PM)π/180 / L̂   (PM=50°, no hand tuning, auto-scales with L)
   Kp = 2ζ·wn, Ki = wn²   (ζ=1 critical damping, no overshoot)
   gate = FF_I_GATE/(FF_I_GATE+|ê|)                     // settled-region gate / I distance decay
@@ -177,7 +182,7 @@ Convergence bandwidth: wn = (90°−PM)π/180 / L̂   (PM=50°, no hand tuning, 
     floor = ACC_SNR·σ_noise·√(ρ/(2−ρ));  |ȳ| ≤ floor → â = 0   // reset/jump), own-acceleration activity gate,
   v = clamp(Kp·ê + Ki·∫err·gate + FF_GAIN_VAL·gate·gap_scale·(v̂+ε), ±vmax)   // significance floor
     gap_scale = 1 − clamp((age−frame_dt)/L̂, 0, 1)       // detection gap: withdraw the open-loop term on the L timescale
-Quantization: rem += v·h/s; counts = clamp(trunc(rem), ±120); rem −= counts
+Quantization: rem += v·h/s_eff (per axis); counts = clamp(trunc(rem), ±120); rem −= counts
 ```
 
 Without sustained real acceleration the three gates keep â ≡ 0 and the command stream is identical to plain ff_pi (bit-exact in arena).
@@ -193,21 +198,21 @@ The **P term** `Kp·ê` is the fast channel: flicks and instant corrections. The
 - Half-resolution 3×3 block phase correlation (full resolution would drop to ~30fps).
 - Calibration framerate ≠ usage framerate does not hurt accuracy (measured dt and real timestamps are used).
 - The excitation trajectory is a speed profile in counts/ms, sampled per tick by remainder quantization: at 1 kHz the 2 counts/ms excitation segment injects 1,2,1,2… counts (mean exactly 2) and totals 500 counts over its 250 ms — the same screen motion as the same segment played at any other tick rate.
-- The hip-fire calibrated s is a practical upper bound (scopes only lower it), so the initial value is inherently safe.
+- The hip-fire effective sensitivity is a practical upper bound (scopes only lower it), so the hid baseline (ratio 100) is inherently safe as a starting point; a game whose real sensitivity differs is dialled out by the ratios, which only ever enter as `base·100/ratio`.
 
 ## Invariants
 
 1. **Gains are normalized by measured dt**; framerate changes don't change the feel.
-2. **Never assume 1 count = 1 px**; everything is converted through s.
+2. **Never assume 1 count = 1 px**; everything is converted through the effective sensitivity (per axis, per fire state).
 3. **`g_counts` records exactly the counts the game actually received** (mouse + aimbot + calibration); filter compensation / in-flight correction / calibration all depend on it.
 4. **Jumps beyond `TRACK_JUMP_GATE` reset the filter**; no patch-style clamps.
-5. Calibration sampling (phase correlation) **does not depend on AI detection**; the two couple only through `s_est`/`l_est`.
+5. Calibration sampling (phase correlation) **does not depend on AI detection**; the two couple only through the effective sensitivity and `l_est`.
 6. The calibration state machine is driven by the control tick (hid: `io/hid_mouse.cu`'s report write calls `core/control.cu`'s `control_apply`); the AI thread only responds to the three atomics `g_calib_collect`/`g_calib_request`/`g_calib_done`.
 7. **Durations are wall-clock milliseconds** (`ms_to_ticks`, `core/state.h`): a tick count is never the source of truth for how long something lasts — the calibration trigger (5 s), the calibration reply timeout (2 s), every CalibSeg segment duration and the `g_counts` history depth (3 s) are stated in milliseconds and converted to ticks, and the keep-alive window is a millisecond constant already. **Rate quantities are stated per millisecond** (`CalibSeg::vx/vy`, counts/ms) and the per-tick motion is their remainder-quantized sample (`rem += v·TICK_MS`, the same quantizer the control law uses), so a tick-rate change re-times and re-scales nothing: the excitation keeps both its screen speed and its total displacement. Together with the dt-normalized gains (invariant 1) this is why the tick rate is a sampling-resolution choice, not a tuning knob.
 
 ## Tuning
 
-**The aimbot needs no hand tuning**: after calibrating `s,L`, `wn` scales with `L` automatically. Structural parameters are header constants in `src/core/control.h` (law, filter and trigger constants), `src/core/state.h` (system constants and the tick period) and `src/core/calib.h` (calibration constants and the excitation trajectory):
+**The aimbot needs no hand tuning**: after calibrating `L`, `wn` scales with `L` automatically and the per-game feel is the four pull-speed ratios (manual entries). Structural parameters are header constants in `src/core/control.h` (law, filter and trigger constants), `src/core/state.h` (system constants, the tick period and the ratio scale's base constants) and `src/core/calib.h` (calibration constants and the excitation trajectory):
 
 | Constant | Default | Meaning | On-device adjustment |
 |---|---|---|---|
@@ -220,7 +225,7 @@ The **P term** `Kp·ê` is the fast channel: flicks and instant corrections. The
 | `PRED_L_COMP` | 1.10 | Smith over-compensation factor | Calibrated L too low (dangerous) → keep >1; too high → 1.0 |
 | `FOV_RADIUS` | 150 px | Default FOV radius — target selection gate AND integrator-start boundary; runtime value overridable via `-r` and hot-param `fov` | Widen: farther targets enter the gate (multi-target grab risk); >~452 px is wasted (capture window diagonal) |
 
-On-device workflow: ① calibrate s,L (L too low is the dangerous direction). ② If real-device noise is far above arena's 0.5px: **lower `PRED_BETA0` first** — don't rush to add filters (that becomes hidden control tuning). ③ Mismatch oscillation → raise `FF_PM_DEG` (lower wn) or raise `FF_ZETA`. ④ After changing any estimator/compensation constant, rerun the wide-delay sweep of `arena.integrate ff_pi_acc` and the FPS behavior test suite `arena.fps_eval ff_pi_acc` to confirm no divergence and no event regression. `FOV_RADIUS`, `KEEP_ALIVE_MS` and the `CalibSeg` trajectory segments are also in the header constants area.
+On-device workflow: ① calibrate L (L too low is the dangerous direction); the sensitivity is the ratios' baseline, dialled per game. ② If real-device noise is far above arena's 0.5px: **lower `PRED_BETA0` first** — don't rush to add filters (that becomes hidden control tuning). ③ Mismatch oscillation → raise `FF_PM_DEG` (lower wn) or raise `FF_ZETA`. ④ After changing any estimator/compensation constant, rerun the wide-delay sweep of `arena.integrate ff_pi_acc` and the FPS behavior test suite `arena.fps_eval ff_pi_acc` to confirm no divergence and no event regression. `FOV_RADIUS`, `KEEP_ALIVE_MS`, the `S_HID_BASE`/`GAIN_PAD_BASE`/`SPD_*` ratio-scale constants and the `CalibSeg` trajectory segments are also in the header constants area.
 
 Collection uses raw NV12 (not MJPEG): NV12 is the only format both the Hagibis and the ASUS CU4K30 support at 1080p120, taking ~3Gbps of USB3 bandwidth; don't put two cards on the same USB controller. Preprocessing runs on the GPU (CUDA kernel BGR→RGB CHW) and does not bound the framerate.
 

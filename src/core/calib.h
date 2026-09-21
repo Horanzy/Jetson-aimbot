@@ -1,9 +1,10 @@
 // ============================================================================
-//  calib.h — 灵敏度 s (px/count) 与环路延迟 L (ms) 的在线标定: 最小二乘估计 +
-//    延迟粗/细双扫 (run_calibration), S_EST/L_EST 脚本原子回写
-//    (persist_calibration), 采集卡设备名解析 (resolve_cam_device), 以及标定的
-//    激励轨迹表 (CalibSeg — 由 core/control.cu 的状态机播放)。采样在
-//    io/capture.cu (块相位相关, 不依赖 AI 检测)。
+//  calib.h — 环路延迟 L (ms) 的在线标定: counts 历史与背景位移的最小二乘 +
+//    延迟粗/细双扫 (run_calibration; 拟合同时解出的灵敏度 s 只是该拟合的旁产物,
+//    仅作诊断量打印 — 手感走 core/state.h 的 spd 倍率), 单 VAR 的脚本原子回写
+//    (persist_calibration, VAR 名由调用方给出), 采集卡设备名解析
+//    (resolve_cam_device), 以及标定的激励轨迹表 (CalibSeg — 由 core/control.cu
+//    的状态机播放)。采样在 io/capture.cu (块相位相关, 不依赖 AI 检测)。
 //  时长一律由墙钟导出 (ms_to_ticks, core/state.h), 拍数只是它的换算结果。
 // ============================================================================
 
@@ -19,7 +20,9 @@
 const int   CALIB_TRIGGER_TICKS    = ms_to_ticks(5000);   // 双侧键长按 5s
 const int   CALIB_WINDOW           = 90;             // 最少样本帧数
 const float CALIB_MIN_EXCITE       = 4000.0f;        // 最小 ΣC² 激发量
-const float S_MIN = 0.05f, S_MAX = 20.0f;
+const float S_MIN = 0.05f, S_MAX = 20.0f;            // 灵敏度设计带 (px/count): 拟合出的
+                                                     //   s 的合法带, 与 spd 的有效灵敏度
+                                                     //   带同界 (core/state.h: spd 5..2000)
 const float L_MIN = 0.0f,  L_MAX = 200.0f;
 const int   CALIB_WAIT_TIMEOUT     = ms_to_ticks(2000);   // 等待标定计算回执超时 2s
 
@@ -55,6 +58,12 @@ inline const CalibSeg CAL_END_FAIL_SEQ[] = {
 
 struct CalibSample { std::chrono::steady_clock::time_point t; float dt_ms,sx,sy; };
 
-bool run_calibration(const std::deque<CalibSample>& hist, float& s_est, float& l_est);
-bool persist_calibration(const std::string& path, float s, float l);
+// 标定回写的唯一 VAR 名 (调用方给出): 每个输出模式一个 — hid 用 L_EST, 手柄输出
+//   将用自己的名字。标定只写延迟; 速度倍率是手动项, 固件永不写。
+const char* const L_VAR_HID = "L_EST";
+
+// s_fit = 拟合联立解出的灵敏度 (px/count, 只作诊断量打印, 不写回也不参与手感);
+//   l_est 进 = 延迟扫描起点, 出 = 标定结果 (ms)
+bool run_calibration(const std::deque<CalibSample>& hist, float& s_fit, float& l_est);
+bool persist_calibration(const std::string& path, const std::string& var, float l);
 std::string resolve_cam_device(const std::string& spec);

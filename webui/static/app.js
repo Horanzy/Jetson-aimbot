@@ -104,6 +104,14 @@ const PARAM_DEFS = [
     info: "关闭后固件只透传真实鼠标, 不注入任何移动; 检测与采集照常运行 —— 模型未完善、只想采数据时的形态, 随时可再打开恢复控制输出。🔥 热参数, 保存即生效。" },
   { group: "瞄准", key: "fov", label: "FOV 半径", type: "num", min: 10, max: 1000, step: 5, unit: "px", hot: true,
     info: "FOV 同时是目标筛选圈与积分器启动边界 (一值两用)。几何关系: 模型输入是 1080p 画面中心裁剪出的 640×640, 模型像素与屏幕像素 1:1, 检测范围为以准星为中心 ±320px (对角约 452px), 因此调到 452 以上没有额外效果。调大: 更远/更偏的目标进入筛选圈, 多目标抢锁风险上升; 调小: 只锁准星附近。🔥 热参数, 保存即生效。" },
+  { group: "拉枪速度 (每游戏自调)", key: "spd_x", label: "速度倍率 X — 腰射", type: "num", min: 1, max: 10000, step: 1, hot: true,
+    info: "拉枪速度倍率, 与有效灵敏度成反比 (有效灵敏度 = 基线/(倍率/100)): 调大 = 同样的期望屏幕速度发出更多 counts = 屏幕跟得更快。整数步进 (105 / 109), 100 = 基线 (出厂手感); 有意义的带是 5..2000 (对应 0.05–20 px/count), 越界会被固件夹取。🔥 热参数, 保存即生效。" },
+  { group: "拉枪速度 (每游戏自调)", key: "spd_y", label: "速度倍率 Y — 腰射", type: "num", min: 1, max: 10000, step: 1, hot: true,
+    info: "Y 轴同一刻度 (100 = 基线)。与 X 分开是因为同一灵敏度下垂直/水平的屏速比是游戏属性 —— 俯仰灵敏度常更低, 于是这里通常要给更大的值; 一个总倍率会把两轴绑死。🔥 热参数, 保存即生效。" },
+  { group: "拉枪速度 (每游戏自调)", key: "ads_spd_x", label: "速度倍率 X — ADS", type: "num", min: 1, max: 10000, step: 1, hot: true,
+    info: "ADS 键 (右键) 按住期间的 X 倍率, 同一刻度 (100 = 基线)。按住的那一拍整套切换, 与腰射那对互不影响。开镜灵敏度常设得更低, 故这里通常比腰射更大。🔥 热参数, 保存即生效。" },
+  { group: "拉枪速度 (每游戏自调)", key: "ads_spd_y", label: "速度倍率 Y — ADS", type: "num", min: 1, max: 10000, step: 1, hot: true,
+    info: "ADS 键按住期间的 Y 倍率, 同一刻度 (100 = 基线)。🔥 热参数, 保存即生效。" },
   { group: "瞄准", key: "class_id", label: "目标类别 ID", type: "num", min: 0, max: 255, step: 1, hot: false,
     info: "锁定哪个检测类别 (依模型标签, 如 0=头, 1=身)。❄ 冷参数, 下次启动生效。" },
   { group: "瞄准", key: "cam_fps", label: "采集帧率", type: "select", options: [120, 60], hot: false,
@@ -376,7 +384,7 @@ function renderRunTab() {
     { k: "GPU", v: tel && tel.gpu != null ? tel.gpu : "—", small: "%" },
     { k: "内存", v: tel && tel.mem ? tel.mem.percent : "—", small: tel && tel.mem ? "· " + tel.mem.used_mb + "MB" : "" },
     { k: "SoC 温度", v: soc != null ? soc.toFixed(0) : "—", small: "°C", cls: soc >= 85 ? "err" : soc >= 70 ? "warn" : "" },
-    { k: "标定 s · L", v: calib && calib.s != null ? (calib.s + " · " + calib.l) : "—", small: inst.calib_live ? "运行中回执" : "脚本值" },
+    { k: "标定延迟 L", v: calib && calib.l != null ? calib.l : "—", small: "ms · " + (inst.calib_live ? "运行中回执" : "脚本值"), t: "标定量 (唯一): 环路延迟 L (ms), 双侧键长按 5s 标定后回写脚本; 手感由「拉枪速度」那组的四个倍率调 — 固件不写它们" },
     { k: "热参数通道", v: inst.state === "running" ? (inst.hot_capable ? "已启用" : "不可用") : (S.state.scan.binary && S.state.scan.binary.hot_capable ? "固件支持" : "固件不支持"), small: inst.hot_port ? ":" + inst.hot_port : "", cls: (inst.state === "running" && !inst.hot_capable) ? "warn" : (inst.hot_capable ? "ok" : "") },
   ];
   $("#statusCards").innerHTML = cards.map(c =>

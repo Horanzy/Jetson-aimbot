@@ -29,7 +29,7 @@
 // conf / y_off / fov 每帧从热参数原子取快照 (帧内一致), 未收热参时值与 CLI 一致
 void ai_thread(std::string model_path, int target_cls,
                std::string cam_dev, int cam_fps, bool preview,
-               float init_s, float init_l, std::string persist_path,
+               float init_l, std::string persist_path,
                std::string out_dir, int fire_ms, double auto_s,
                int cooldown_ms, int jpeg_quality) {
     const int cam_w=1920, cam_h=1080;
@@ -110,7 +110,8 @@ void ai_thread(std::string model_path, int target_cls,
 
     EstimatorState est;
 
-    float s_est=init_s, l_est=init_l;
+    // 标定拟合出的灵敏度 (仅诊断量: 手感走 state.h 的 spd 倍率, 回写只有延迟)
+    float s_fit=S_HID_BASE, l_est=init_l;
     std::deque<CalibSample> hist; bool was_collecting=false;
     int collect_frames=0;
     int bs_w=cap_w/6, bs_h=cap_h/6;
@@ -207,7 +208,10 @@ void ai_thread(std::string model_path, int target_cls,
             if (dist<best_dist&&dist<fov_r) { best_dist=dist;best_dx=dx;best_dy=dy;found=true; } }
 
         auto now=std::chrono::steady_clock::now();
-        float dt=estimator_step(est,now,found,best_dx,best_dy,s_est,l_est,max_v);
+        // 自身运动换算的逐轴有效灵敏度: 按帧时刻的 ADS 键状态取, 与注入换算同一份值
+        const bool ads=g_ads_down.load();
+        float s_x=s_hid_now(ads,0), s_y=s_hid_now(ads,1);
+        float dt=estimator_step(est,now,found,best_dx,best_dy,s_x,s_y,l_est,max_v);
 
         if (cal_collecting) {
             cv::Mat gray,small,sf;
@@ -231,12 +235,13 @@ void ai_thread(std::string model_path, int target_cls,
 
         if (g_calib_request.exchange(false)) {
             bool ok=false;
-            for(int it=0;it<8;++it) ok|=run_calibration(hist,s_est,l_est);
+            for(int it=0;it<8;++it) ok|=run_calibration(hist,s_fit,l_est);
             g_calib_done=ok?1:2;
-            if (ok) { std::cout<<"[标定] s="<<s_est<<" px/count, L="<<l_est<<" ms\n";
+            if (ok) { std::cout<<"[标定] L="<<l_est<<" ms (拟合 s="<<s_fit
+                                 <<" px/count, 诊断量)\n";
                 if (!persist_path.empty()) {
-                    if (persist_calibration(persist_path,s_est,l_est))
-                        std::cout<<"[标定] 已回写 "<<persist_path<<"\n";
+                    if (persist_calibration(persist_path,L_VAR_HID,l_est))
+                        std::cout<<"[标定] 已回写 "<<persist_path<<" ("<<L_VAR_HID<<")\n";
                     else std::cerr<<"[标定] 回写失败\n"; }
             } else { std::cout<<"[标定] 失败: 样本 "<<hist.size()<<"/"<<collect_frames<<"\n"; }
         }

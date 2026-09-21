@@ -25,6 +25,12 @@ PARAM_DEFS = {
     "cam_dev":         dict(kind="str",   default="Asus"),
     "cam_fps":         dict(kind="int",   lo=1, hi=240, default=120),
     "max_speed":       dict(kind="float", lo=100.0, hi=20000.0, default=1500.0),
+    # 拉枪速度倍率 (逐轴, 100 = 基线): 与有效灵敏度成反比, 调大 = 更快;
+    #   范围与固件 spd_clamp 同带 (越界由固件再夹一次)
+    "spd_x":           dict(kind="int",   lo=1, hi=10000, default=100),
+    "spd_y":           dict(kind="int",   lo=1, hi=10000, default=100),
+    "ads_spd_x":       dict(kind="int",   lo=1, hi=10000, default=100),
+    "ads_spd_y":       dict(kind="int",   lo=1, hi=10000, default=100),
     "aim_key":         dict(kind="enum",  choices=("fire", "ads", "both"), default="both"),
     "aim_enabled":     dict(kind="bool",  default=True),
     "fov":             dict(kind="float", lo=10.0, hi=1000.0, default=150.0),
@@ -42,17 +48,22 @@ PARAM_DEFS = {
 # 热参数白名单: param key → 固件通道 key (对应 src/io/hotctl.cu hotctl_thread)
 HOT_WIRE_KEYS = {"conf": "t", "y_offset": "y", "max_speed": "x", "fov": "fov", "aim_key": "k",
                  "aim_enabled": "aim", "cap_fire": "cap_fire", "cap_det": "cap_det",
-                 "cap_auto": "cap_auto"}
+                 "cap_auto": "cap_auto", "spd_x": "spdx", "spd_y": "spdy",
+                 "ads_spd_x": "adsspdx", "ads_spd_y": "adsspdy"}
 
 SCRIPT_VARS = {
     "CLASS_ID": "class_id", "CONF_THRESH": "conf", "Y_OFFSET": "y_offset",
     "CAM_DEV": "cam_dev", "CAM_FPS": "cam_fps", "MAX_SPEED": "max_speed",
+    "SPDX": "spd_x", "SPDY": "spd_y",                    # 腰射拉枪速度倍率 (逐轴, 唯一手感旋钮)
+    "ADS_SPDX": "ads_spd_x", "ADS_SPDY": "ads_spd_y",    # ADS 键按住时的同一对
     "AIM_KEY": "aim_key", "AIM_ENABLED": "aim_enabled", "PREVIEW": "preview",
     "CAPTURE": "capture_enabled", "CAP_FIRE": "cap_fire", "CAP_DET": "cap_det",
     "CAP_AUTO": "cap_auto", "OUT_DIR": "capture_dir", "FIRE_MS": "fire_ms",
     "AUTO_S": "auto_s", "COOLDOWN_MS": "cooldown_ms", "JPEG_Q": "jpeg_q",
     "MODEL_PATH": "model", "FOV_R": "fov",
 }
+# 固件标定回写量 (脚本 VAR → 只读展示键): 标定只写延迟, 速度倍率是手动项
+CALIB_VARS = {"L_EST": "l"}
 
 
 def root_status(root: Path):
@@ -105,7 +116,7 @@ def _coerce(key: str, val: str, root: Path):
 def parse_script(path: Path, root: Path):
     """只读解析 game 脚本顶部 VAR=value 块。返回 (params, calib)。"""
     params = {k: d["default"] for k, d in PARAM_DEFS.items()}
-    calib = {"s": None, "l": None}
+    calib = {v: None for v in CALIB_VARS.values()}
     try:
         text = path.read_text(encoding="utf-8-sig", errors="replace")   # 脚本带 BOM
     except OSError:
@@ -120,9 +131,9 @@ def parse_script(path: Path, root: Path):
         if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
             v = v[1:-1]
         v = v.replace("$ROOT", str(root))
-        if name in ("S_EST", "L_EST"):
+        if name in CALIB_VARS:
             try:
-                calib["s" if name == "S_EST" else "l"] = float(v)
+                calib[CALIB_VARS[name]] = float(v)
             except ValueError:
                 pass
             continue

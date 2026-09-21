@@ -29,6 +29,10 @@ std::atomic<bool>  g_cap_fire{true};                 // 采集源开关 (-e / �
 std::atomic<bool>  g_cap_det{true};                  //   检测截图
 std::atomic<bool>  g_cap_auto{true};                 //   定时截图
 
+std::atomic<int>   g_spd_x{SPD_BASE}, g_spd_y{SPD_BASE};            // 拉枪速度倍率, 腰射 (100 = 基线)
+std::atomic<int>   g_ads_spd_x{SPD_BASE}, g_ads_spd_y{SPD_BASE};    //   同上, ADS 键按住期间
+std::atomic<bool>  g_ads_down{false};                // ADS 键状态 (控制拍每拍写)
+
 TargetState g_target;
 
 CountsHistory g_counts;

@@ -1,7 +1,8 @@
 // ============================================================================
-//  calib.cu — calib.h 的实现: counts 历史上的最小二乘 s 估计与延迟粗/细双扫
-//    (run_calibration), S_EST/L_EST 写入脚本的临时文件原子替换
-//    (persist_calibration), /dev/v4l/by-id 采集卡名解析 (resolve_cam_device)。
+//  calib.cu — calib.h 的实现: counts 历史上的最小二乘延迟估计与延迟粗/细双扫
+//    (run_calibration; s 与延迟由同一拟合联立解出, s 只作诊断量返回),
+//    延迟 VAR 写入脚本的临时文件原子替换 (persist_calibration),
+//    /dev/v4l/by-id 采集卡名解析 (resolve_cam_device)。
 // ============================================================================
 
 #include "core/calib.h"
@@ -22,7 +23,7 @@
 
 #include "core/state.h"
 
-bool run_calibration(const std::deque<CalibSample>& hist, float& s_est, float& l_est) {
+bool run_calibration(const std::deque<CalibSample>& hist, float& s_fit, float& l_est) {
     const int n=(int)hist.size(); if (n<CALIB_WINDOW) return false;
     auto scan=[&](float lo,float hi,float step,float& out_s,float& out_dl)->float {
         float best=FLT_MAX;
@@ -47,19 +48,19 @@ bool run_calibration(const std::deque<CalibSample>& hist, float& s_est, float& l
     if (scan(-40.0f,96.0f,8.0f,s1,dl1)==FLT_MAX) return false;
     float s2=s1,dl2=dl1;
     if (scan(dl1-8.0f,dl1+8.0f,2.0f,s2,dl2)==FLT_MAX) { s2=s1; dl2=dl1; }
-    s_est=std::clamp(s2,S_MIN,S_MAX); l_est=std::clamp(l_est+dl2,L_MIN,L_MAX);
+    s_fit=std::clamp(s2,S_MIN,S_MAX); l_est=std::clamp(l_est+dl2,L_MIN,L_MAX);
     return true;
 }
-bool persist_calibration(const std::string& path, float s, float l) {
+bool persist_calibration(const std::string& path, const std::string& var, float l) {
     std::ifstream in(path); if (!in.good()) return false;
     std::vector<std::string> lines; std::string line;
     while (std::getline(in,line)) lines.push_back(line); in.close();
-    char sbuf[64],lbuf[64];
-    snprintf(sbuf,sizeof(sbuf),"S_EST=%.4f",s); snprintf(lbuf,sizeof(lbuf),"L_EST=%.1f",l);
-    bool fs=false,fl=false;
-    for (auto& ln:lines) { if (ln.rfind("S_EST=",0)==0){ln=sbuf;fs=true;}
-                           else if (ln.rfind("L_EST=",0)==0){ln=lbuf;fl=true;} }
-    if (!fs) lines.push_back(sbuf); if (!fl) lines.push_back(lbuf);
+    char buf[64];
+    snprintf(buf,sizeof(buf),"%s=%.1f",var.c_str(),l);
+    const std::string key=var+"=";
+    bool found=false;
+    for (auto& ln:lines) if (ln.rfind(key,0)==0) { ln=buf; found=true; }
+    if (!found) lines.push_back(buf);
     struct stat st{}; bool have=(stat(path.c_str(),&st)==0);
     std::string tmp=path+".tmp";
     { std::ofstream o(tmp,std::ios::trunc); if (!o.good()) return false;
