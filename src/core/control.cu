@@ -2,7 +2,7 @@
 //  control.cu — ff_pi_acc 的控制拍执行 (拍率 = DEFAULT_FREQ): Smith ê 组装
 //    (含 â 的 ε 修正与 ½â·W² 外推) → 极点配置 PI (条件积分 + 距离门控) →
 //    type-2 速度前馈 (信任度插值门控 + 检测间隙衰减); 双侧键触发的标定状态机
-//    (激励轨迹表见 core/calib.h) 也在此驱动。律只写一次 (law_tick), 两个输出
+//    (标定引擎见 io/calib_run.h) 也在此驱动。律只写一次 (law_tick), 两个输出
 //    模式共用同一份数学 — 差别只在指标去向: hid 量化成 counts 写报文位移字节并
 //    记 g_counts, pad 交付期望速度 (px/ms) 并跳过 hid 专属尾巴。跨帧控制状态
 //    (积分器/量化余量/状态机相位) 为函数内 static。
@@ -19,8 +19,8 @@
 #include <iostream>
 #include <vector>
 
-#include "core/calib.h"
 #include "core/state.h"
+#include "io/calib_run.h"       // cal_step: 标定状态机 (hid 由本文件的律拍驱动)
 #include "io/pad_output.h"      // own_motion_ledger/own_motion_scale: 账本来源与
                                 //   账本→像素比例随输出模式 (hid/pad)
 
@@ -39,68 +39,15 @@ struct LawOut {
     bool gate = false;                   // pad: 注入门 (接管开 × 触发保持窗内)
 };
 
-// ---- hid 标定状态机 --------------------------------------------------------
-// 双侧键长按 CALIB_TRIGGER_TICKS 触发 → 起点十字 → 激励轨迹 (CAL_EXCITE_SEQ ×
-//   CAL_EXCITE_LOOPS) → 收尾停顿 → 等采样侧计算 (g_calib_done) → 点头/摇头序列。
-//   激励期整条注入通道归激励独占, 律本拍不参与 (接管关闭时一并复位: 激励是程序
-//   注入的移动, 与纯透传互斥)。状态跨拍保持, 故为函数内 static。
+// ---- hid 标定 ---------------------------------------------------------------
+// 状态机在 io/calib_run.cu (两模式共用同一份); 本文件只把键位字递给它并接回本拍
+//   的注入命令。激励期整条注入通道归激励独占, 律本拍不参与 (接管关闭时状态机自
+//   复位: 激励是程序注入的移动, 与纯透传互斥)。
 struct CalFrame { bool active=false; int32_t cx=0, cy=0; };
 
-CalFrame hid_cal_tick(int cam_fps, uint16_t btns) {
-    (void)cam_fps;
-    static int cal=0,hold=0;
-    static const CalibSeg* seq=nullptr;
-    static int slen=0,si=0,st=0,wt=0;
-    static std::vector<CalibSeg> excite;
-    static float exrem_x=0,exrem_y=0;                  // 激励的每拍位移余量
-
-    CalFrame c;
-    if (!g_aim_enabled.load()) {                       // 接管关闭: 标定不可达并复位
-        if (cal!=0) { cal=0; seq=nullptr; slen=si=st=wt=0; }
-        hold=0;
-        return c;
-    }
-    if (cal==3) {
-        c.active=true;
-        int done=g_calib_done.load();
-        if (done!=0||++wt>CALIB_WAIT_TIMEOUT) {
-            seq=done==1?CAL_END_OK_SEQ:CAL_END_FAIL_SEQ;
-            slen=done==1?(int)(sizeof(CAL_END_OK_SEQ)/sizeof(CalibSeg))
-                       :(int)(sizeof(CAL_END_FAIL_SEQ)/sizeof(CalibSeg));
-            cal=done==1?4:5; si=st=0; }
-        return c;
-    }
-    if (cal!=0) {
-        c.active=true;
-        if (si<slen) { auto& sg=seq[si];
-            // 激励段的每拍位移 = v·TICK_MS 的余量量化 (与瞄准的 rem += v·TICK_MS/s
-            //   同一手法): 段首余量清零, 段的总位移恒为 v×段毫秒数 — 拍率只决定
-            //   这条速度曲线被采样得多细, 屏幕上的激励速度不随拍率改变
-            if (st==0) { exrem_x=exrem_y=0; }
-            exrem_x+=sg.vx*TICK_MS; exrem_y+=sg.vy*TICK_MS;
-            c.cx=(int32_t)std::trunc(exrem_x); c.cy=(int32_t)std::trunc(exrem_y);
-            exrem_x-=(float)c.cx; exrem_y-=(float)c.cy;
-            if(++st>=sg.ticks){st=0;++si;} }
-        if (si>=slen) {
-            if (cal==1) { excite.clear();
-                constexpr int neseg=(int)(sizeof(CAL_EXCITE_SEQ)/sizeof(CalibSeg));
-                for(int i=0;i<CAL_EXCITE_LOOPS;++i)
-                    for(int j=0;j<neseg;++j) excite.push_back(CAL_EXCITE_SEQ[j]);
-                seq=excite.data();slen=(int)excite.size();si=st=0;
-                g_calib_collect=true;cal=2;
-            } else if (cal==2) { seq=CAL_SETTLE_SEQ;slen=1;si=st=0;cal=6;c.cx=c.cy=0;
-            } else if (cal==6) { g_calib_collect=false;g_calib_done=0;
-                g_calib_request=true;wt=0;cal=3;c.cx=c.cy=0;
-            } else { cal=0;c.active=false;c.cx=c.cy=0; } }
-        return c;
-    }
-    // 空闲: 双侧键长按 = 触发 (松手即复位计数, 标定期间不可重入)
-    if ((btns&BOTH_SIDE_KEYS)==BOTH_SIDE_KEYS) {
-        if(++hold>=CALIB_TRIGGER_TICKS){ hold=0; cal=1;
-            seq=CAL_START_SEQ; slen=(int)(sizeof(CAL_START_SEQ)/sizeof(CalibSeg));
-            si=st=0; std::cout<<"[标定] 触发\n";
-            c.active=true; c.cx=c.cy=0; }
-    } else hold=0;
+CalFrame hid_cal_tick(int cam_fps, uint16_t btns, std::chrono::steady_clock::time_point now) {
+    const CalStep st=cal_step(CAL_MODE_HID,btns,cam_fps,now);
+    CalFrame c; c.active=st.active; c.cx=st.cx; c.cy=st.cy;
     return c;
 }
 
@@ -122,9 +69,9 @@ void law_tick(const LawIn& in, LawOut& out) {
     //   hid 的 px/count = s_hid_now, pad 的是有效满偏屏速换算
     const LedgerPxScale sc=own_motion_scale();
 
-    // hid 标定 (pad 模式无标定): 双侧键长按触发, 激励期独占注入
+    // hid 标定: 状态机 (io/calib_run.cu) 双侧键长按触发, 激励期独占注入
     CalFrame cal;
-    if (!in.pad) cal=hid_cal_tick(in.cam_fps, in.btns);
+    if (!in.pad) cal=hid_cal_tick(in.cam_fps, in.btns, now);
 
     int32_t fx=in.real_x, fy=in.real_y;
 

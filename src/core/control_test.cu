@@ -33,6 +33,7 @@
 #include "core/control.h"
 #include "core/estimator.h"
 #include "core/state.h"
+#include "io/calib_run.h"      // CAL_VAR_HID/CAL_VAR_PAD (回写 VAR 名)
 #include "io/hotctl.h"
 
 static int g_fail = 0;
@@ -310,18 +311,18 @@ int main() {
             std::ifstream in(path);
             return std::string((std::istreambuf_iterator<char>(in)),
                                std::istreambuf_iterator<char>()); };
-        const bool ok = persist_calibration(path, L_VAR_HID, 42.5f);
+        const bool ok = persist_calibration(path, CAL_VAR_HID, 42.5f);
         const std::string all = slurp();
         struct stat st{};
         ::stat(path.c_str(), &st);
         CHECK(ok && all.find("L_EST=42.5") != std::string::npos,
-              "L 写进调用方给的 VAR (L_VAR_HID = L_EST)");
+              "L 写进调用方给的 VAR (CAL_VAR_HID = L_EST)");
         CHECK(all.find("SPDX=105") != std::string::npos
               && all.find("SPDY=110") != std::string::npos
               && all.find("S_EST") == std::string::npos,
               "速度倍率 VAR 逐字不变, 也没有任何速度 VAR 被写进脚本");
         CHECK((st.st_mode & 0777) == 0755, "原子替换保留执行位");
-        const bool ok2 = persist_calibration(path, "L_EST_PAD", 77.0f);
+        const bool ok2 = persist_calibration(path, CAL_VAR_PAD, 77.0f);
         const std::string all2 = slurp();
         CHECK(ok2 && all2.find("L_EST_PAD=77.0") != std::string::npos,
               "换一个 VAR 名即另一套 (手柄输出的名字由调用方给), 追加而非覆盖");

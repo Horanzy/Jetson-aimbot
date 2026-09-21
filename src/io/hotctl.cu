@@ -73,6 +73,13 @@ bool hotctl_apply(const char* key, const char* val) {
         std::cout<<"[热参] 忽略 "<<key<<"="<<val<<" (须 0/1)\n";
         return false;
     }
+    if (!strcmp(key,"padcalib")) {               // 手柄标定请求 (webui 按钮; 一次消费即清)
+        if (strcmp(val,"1")) {
+            std::cout<<"[热参] 忽略 padcalib="<<val<<" (须 1)\n"; return false; }
+        g_padcalib_request.store(true);
+        std::cout<<"[热参] padcalib=1 (请求手柄标定)\n";
+        return true;
+    }
     std::cout<<"[热参] 忽略未知 key: "<<key<<"\n";
     return false;
 }
@@ -89,7 +96,7 @@ void hotctl_thread() {
         std::cerr<<"⚠ 热参数通道绑定失败 (端口 "<<HOT_CTL_PORT<<" 被占), 热参不可用\n";
         close(fd); return; }
     std::cout<<"✅ 热参数通道: 127.0.0.1:"<<HOT_CTL_PORT
-             <<" (t/y/x/fov/padthr/spdx/spdy/adsspdx/adsspdy/k/aim/cap_*)\n";
+             <<" (t/y/x/fov/padthr/spdx/spdy/adsspdx/adsspdy/k/aim/padcalib/cap_*)\n";
     struct pollfd pfd{}; pfd.fd=fd; pfd.events=POLLIN;
     char buf[256];
     while (global_running) {

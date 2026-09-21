@@ -105,6 +105,14 @@ PadLogical pad_merge(const PadLogical& human, float aim_vx, float aim_vy,
 
 // pad 控制拍 (main 主循环调用, 拍率 = DEFAULT_FREQ): 人类态快照 → RT/LT 触发
 //   键位字 (fire→LEFT_KEY, ads→RIGHT_KEY, 复用律的 -k 语义与 KEEP_ALIVE 窗) →
+//   标定拍 (io/calib_run.h 的状态机; 激励期由 pad_excite 独占整只手柄) 或
 //   律取期望速度 → pad_merge 合并+账本 → 发布点覆盖写 → --pad-dump 节流打印。
 //   输出后端只消费发布点, 不进入本函数。
 void pad_tick(int cam_fps, PadState& in, bool dump);
+
+// 标定激励: 整只手柄由程序独占 — 右摇杆 = 激励偏转 (dx/dy, 逻辑量程), 左摇杆与两
+//   扳机置中, 按键照旧透传 (L3/R3 才到得了游戏)。理据见 pad_output.cu: 人手通道会
+//   改变被测量的那条响应本身 (走动 = 整幅画面平移; 扳机 = 瞄准镜/开火状态), 而不是
+//   只叠加一份运动, 且它们与命令无关, 停顿窗的噪声底抓不到。账本按激励偏转入账。
+PadLogical pad_excite(const PadLogical& human, int16_t dx, int16_t dy,
+                      std::chrono::steady_clock::time_point now);

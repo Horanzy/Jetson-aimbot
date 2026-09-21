@@ -16,6 +16,7 @@ void signal_handler(int) { global_running = false; }
 std::atomic<bool> g_calib_collect{false};
 std::atomic<bool> g_calib_request{false};
 std::atomic<int>  g_calib_done{0};                   // 0=计算中 1=成功 2=失败
+std::atomic<bool> g_padcalib_request{false};         // pad 标定请求 (热参 padcalib=1; 一次消费即清)
 
 std::atomic<bool> g_left_down{false};
 

@@ -30,9 +30,12 @@
 //    结构常量仍为编译期, 与"无手调魔法数字"哲学一致。
 
 //
-//  标定: 双侧键长按 5 秒, 程序自动生成激励轨迹 (画正方形), 块相位相关测背景位移,
-//    最小二乘估计环路延迟 L (ms); 经 -S 传入脚本路径时自动回写 (拟合联立解出的
-//    灵敏度 s 只作诊断量打印 — 手感走 --spd/--ads-spd 四个逐轴倍率)。
+//  标定: 只标**环路延迟 L**。hid = 鼠标双侧键长按 5 秒; 手柄模式 = L3+R3 长按 5 秒
+//    或 webui 的「开始标定」按钮 (热参 padcalib=1)。激励期程序独占注入通道 (手柄
+//    模式整只手柄归中, 按键照旧透传), 每段行程到位即停 + 段后停顿, 停顿里给出
+//    三个独立读数 (尾迹和 = 主读数, 停止沿, 起始沿) → 中位 + MAD 判定;
+//    成功 = 点头 + 只回写该模式的延迟 VAR (hid: L_EST / pad: L_EST_PAD), 失败 =
+//    摇头 + 原因, 绝不写编造的值。速度一概不标 (手感走下面四个倍率)。
 //
 //  拉枪速度: 四个逐轴倍率 —— 腰射一对 (--spd), ADS 键 (右键) 按住期间一对
 //    (--ads-spd); 有效灵敏度 = 基线/(倍率/100), 100 = 基线, 调大 = 更快。
@@ -62,6 +65,7 @@
 #include "core/calib.h"
 #include "core/control.h"
 #include "core/state.h"
+#include "io/calib_run.h"
 #include "io/capture.h"
 #include "io/hid_mouse.h"
 #include "io/hotctl.h"
@@ -124,7 +128,8 @@ int main(int argc, char* argv[]) {
                 "  -y <偏移>  部位       -d <采集卡> 名字或 /dev/videoN\n"
                 "  -f <帧率>  120/60     -x <速度> 最大px/s\n"
                 "  -l <L>     初始延迟\n"
-                "  -S <脚本>  回写路径   -k <键>   fire/ads/both  -v <y/n> 预览\n"
+                "  -S <脚本>  回写路径 (标定只写延迟: hid → L_EST, pad → L_EST_PAD)\n"
+                "  -k <键>   fire/ads/both  -v <y/n> 预览\n"
                 "  --spd <x>[,<y>]      拉枪速度倍率逐轴 (默认 100 = 基线; 调大=更快; 热参 spdx/spdy)\n"
                 "  --ads-spd <x>[,<y>]  ADS 键按住时的同一对 (默认 100; 热参 adsspdx/adsspdy)\n"
                 "  -r <半径>  FOV 半径 px (默认 150, 10–1000)\n"
@@ -138,6 +143,7 @@ int main(int argc, char* argv[]) {
                 "  -T <百分比> 手柄触发阈值 (默认 6 = 该手柄扳机实测 flat 15/255; RT/LT\n"
                 "             两键共享; 只作用于触发判定, 扳机模拟量仍 1:1 透传; 热参 padthr)\n"
                 "  --pad-dump 叠加调试输出: ≥50ms 打印合并后逻辑态 (透传/注入验证)\n"
+                "             标定期打印的就是激励波形 (右摇杆按计划偏转, 人手通道归中)\n"
                 "\n鼠标输入选项 (hid 模式):\n"
                 "  -D <子串>  鼠标 /dev/input/by-id 匹配子串 (默认空 = 任一 *-event-mouse\n"
                 "             字典序首个; 手柄插着时建议指定, 否则可能选中其附属鼠标接口)\n"
@@ -299,6 +305,7 @@ int main(int argc, char* argv[]) {
     std::thread hot(hotctl_thread);
     std::thread ai(ai_thread,model_path,cls,cam_dev,cam_fps,preview,
                    init_l,persist_path,
+                   pad_mode?CAL_MODE_PAD:CAL_MODE_HID,
                    a_o,fire_ms,auto_s,cooldown_ms,jpeg_q);
 
     int tfd=timerfd_create(CLOCK_MONOTONIC,0);

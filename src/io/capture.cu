@@ -1,8 +1,11 @@
 // ============================================================================
 //  capture.cu — ai_thread 的实现: 引擎反序列化与张量绑定, GStreamer 管道搭建
 //    (整幅预览 / 居中裁剪两种管道), 逐帧采集 → 预处理 → 推理 → 输出解析 →
-//    NMS → FOV 目标筛选 → estimator_step; 标定采样 (半分辨率 3×3 块相位
-//    相关) 与 g_calib_request 驱动的标定计算/回写, 三源截图入队与预览叠加。
+//    NMS → FOV 目标筛选 → estimator_step; 标定采样 (640 居中裁切 → 320 相关域 →
+//    3×3 块一维投影相位相关 → 静止簇剔除取中位, 见 core/calib.h) 与
+//    g_calib_request 驱动的拟合/回写, 三源截图入队与预览叠加。
+//    标定期间**整条推理链跳过** (标定既不需要检测也不需要注入, 省下的 GPU/CPU 付
+//    相关的账; 发布的目标自然过期, 跑完首次检测经既有 TRACK_JUMP_GATE 重锁)。
 // ============================================================================
 
 #include "io/capture.h"
@@ -25,11 +28,12 @@
 #include "core/estimator.h"
 #include "core/state.h"
 #include "core/trt.h"
+#include "io/calib_run.h"
 
 // conf / y_off / fov 每帧从热参数原子取快照 (帧内一致), 未收热参时值与 CLI 一致
 void ai_thread(std::string model_path, int target_cls,
                std::string cam_dev, int cam_fps, bool preview,
-               float init_l, std::string persist_path,
+               float init_l, std::string persist_path, CalMode cal_mode,
                std::string out_dir, int fire_ms, double auto_s,
                int cooldown_ms, int jpeg_quality) {
     const int cam_w=1920, cam_h=1080;
@@ -110,13 +114,16 @@ void ai_thread(std::string model_path, int target_cls,
 
     EstimatorState est;
 
-    // 标定拟合出的灵敏度 (仅诊断量: 手感走 state.h 的 spd 倍率, 回写只有延迟)
-    float s_fit=S_HID_BASE, l_est=init_l;
+    // 标定采样状态: l_est 是运行态里唯一的标定量 (回写只有延迟), 拟合在
+    //   g_calib_request 时一次跑完 (计划/窗口/拟合/诊断/回写都在 io/calib_run.h)
+    float l_est=init_l;
     std::deque<CalibSample> hist; bool was_collecting=false;
-    int collect_frames=0;
-    int bs_w=cap_w/6, bs_h=cap_h/6;
-    cv::Mat hann; cv::createHanningWindow(hann,cv::Size(bs_w,bs_h),CV_32F);
-    cv::Mat prev_gray_f;
+    CalibSampler sampler;
+    cv::Mat prev_dom;                      // 上一帧的相关域图 (CV_32F 320×320)
+    long collect_frames=0, collect_samples=0;
+    double collect_ms=0.0;                 // 采样本身的累计耗时 (每帧成本实测)
+    auto cal_t0=std::chrono::steady_clock::now();
+    const size_t hist_max=(size_t)std::max(60, cal_hist_frames(cal_mode,cam_fps));
 
     std::mt19937 rng(std::random_device{}());
     std::uniform_real_distribution<double> jitter(0.5,1.5);
@@ -147,6 +154,18 @@ void ai_thread(std::string model_path, int target_cls,
 
         cap_img=(preview&&frame.cols>cap_w)?frame(cv::Rect(crop_x,crop_y,cap_w,cap_h)):frame;
 
+        // 标定期不跑预处理/推理/NMS: 标定既不需要检测也不需要注入, 省下的 GPU/CPU
+        //   正好付相关的账。检测状态自然过期 (g_target 走 TARGET_STALE_MS 超时路径),
+        //   标定结束后第一帧检测重新入锁 — 既有 TRACK_JUMP_GATE 路径, 不引入新分支。
+        const bool cal_collecting=g_calib_collect.load();
+        if (cal_collecting&&!was_collecting) {
+            hist.clear(); prev_dom.release();
+            collect_frames=collect_samples=0; collect_ms=0.0;
+            cal_t0=std::chrono::steady_clock::now(); }
+        was_collecting=cal_collecting;
+
+        std::vector<Detection> filtered;
+        if (!cal_collecting) {
         CHECK_CUDA(cudaMemcpy2DAsync(d_bgr,(size_t)cap_w*3,
                      cap_img.data,cap_img.step,
                      (size_t)cap_w*3,cap_h,cudaMemcpyHostToDevice,stream));
@@ -192,16 +211,13 @@ void ai_thread(std::string model_path, int target_cls,
             }
             raw.push_back(d);
         }
-        auto filtered=nms(raw,nms_iou_thr);
+        filtered=nms(raw,nms_iou_thr);
         if (need_crop) for (auto& d:filtered) {
             d.cx+=m_off_x; d.cy+=m_off_y; }
-
-        bool cal_collecting=g_calib_collect.load();
-        if (cal_collecting&&!was_collecting) { hist.clear(); prev_gray_f.release();
-            collect_frames=0; }
-        was_collecting=cal_collecting;
+        }   // !cal_collecting
 
         float best_dist=1e9f,best_dx=0,best_dy=0; bool found=false;
+        if (!cal_collecting)
         for (auto& d:filtered) {
             float ty=d.cy+d.h*(0.5f-y_off_pct/100.0f);
             float dx=d.cx-cx0, dy=ty-cy0, dist=std::sqrt(dx*dx+dy*dy);
@@ -213,36 +229,65 @@ void ai_thread(std::string model_path, int target_cls,
         float dt=estimator_step(est,now,found,best_dx,best_dy,l_est,max_v);
 
         if (cal_collecting) {
-            cv::Mat gray,small,sf;
-            cv::cvtColor(cap_img,gray,cv::COLOR_BGR2GRAY);
-            cv::resize(gray,small,cv::Size(cap_w/2,cap_h/2),0,0,cv::INTER_AREA);
-            small.convertTo(sf,CV_32F);
-            if (!prev_gray_f.empty()) {
-                float shx[9],shy[9];int nv=0;
-                for(int by=0;by<3;++by)for(int bx=0;bx<3;++bx){
-                    cv::Rect r(bx*bs_w,by*bs_h,bs_w,bs_h); double resp=0;
-                    cv::Point2d sh=cv::phaseCorrelate(prev_gray_f(r),sf(r),hann,&resp);
-                    if(resp>0.01){shx[nv]=(float)sh.x;shy[nv]=(float)sh.y;++nv;} }
-                ++collect_frames;
-                if (nv>=4) { std::nth_element(shx,shx+nv/2,shx+nv);
-                             std::nth_element(shy,shy+nv/2,shy+nv);
-                             hist.push_back({now,dt,-2.0f*shx[nv/2],-2.0f*shy[nv/2]});
-                             if((int)hist.size()>300)hist.pop_front(); }
+            // 640 居中裁切 → 灰度 → 半分辨率 320 相关域 → 3×3 块一维投影相位相关
+            //   (先裁切后压缩: 裁切保证标定场居中且与模型解耦, 压缩决定算力; 采样
+            //   几何与两方案对照见 core/calib.h 文件头)
+            const auto t_smp0=std::chrono::steady_clock::now();
+            const CalCropRect cr=calib_crop_rect(cap_img.cols,cap_img.rows);
+            cv::Mat gray,dm;
+            cv::cvtColor(cap_img(cv::Rect(cr.x,cr.y,cr.w,cr.h)),gray,cv::COLOR_BGR2GRAY);
+            cv::resize(gray,gray,cv::Size(CALIB_SAMPLE_PX,CALIB_SAMPLE_PX),0,0,cv::INTER_AREA);
+            gray.convertTo(dm,CV_32F);
+            ++collect_frames;
+            if (!prev_dom.empty()&&prev_dom.size()==dm.size()) {
+                const CalibSampler::Frame f=sampler.measure(prev_dom,dm);
+                if (f.ok[0]||f.ok[1]) {
+                    CalibSample smp;
+                    smp.t=now; smp.dt_ms=dt;
+                    smp.sx=f.shift[0]; smp.sy=f.shift[1];
+                    smp.sx_all=f.shift_all[0]; smp.sy_all=f.shift_all[1];
+                    for (int a=0;a<2;++a) { smp.ok[a]=f.ok[a]; smp.resp[a]=f.resp[a];
+                                            smp.spread[a]=f.spread[a];
+                                            smp.n_static[a]=f.n_static[a]; }
+                    smp.slot=cal_note_sample(smp);       // 在线累计 + 打槽位
+                    hist.push_back(smp);
+                    while (hist.size()>hist_max) hist.pop_front();
+                    ++collect_samples;
+                }
             }
-            prev_gray_f=sf;
+            prev_dom=dm;
+            collect_ms+=elapsed_ms(std::chrono::steady_clock::now(),t_smp0);
         }
 
         if (g_calib_request.exchange(false)) {
-            bool ok=false;
-            for(int it=0;it<8;++it) ok|=run_calibration(hist,s_fit,l_est);
-            g_calib_done=ok?1:2;
-            if (ok) { std::cout<<"[标定] L="<<l_est<<" ms (拟合 s="<<s_fit
-                                 <<" px/count, 诊断量)\n";
+            // 拟合 (停顿 + 三读数; 账本不参与 — 测量完全来自屏幕位移), 诊断与回写
+            //   都在 io/calib_run.cu 里 (两模式同一份口径)
+            const CalResult cr=cal_fit(cal_mode,hist,g_cal_win.snapshot());
+            const int done=cal_done_code(cr);
+            cal_print_diag(cal_mode,cr,hist.size());
+            // 标定期采样率实测 (要求不假设 120fps: 读数分辨率 = ±dt/2, 段跨 = T/dt 帧 —
+            //   实测值连同每帧采样耗时一起进日志, 640→320 保帧率的验收点)
+            if (collect_frames>0) {
+                const double wall=elapsed_ms(std::chrono::steady_clock::now(),cal_t0);
+                const double ms=wall/(double)collect_frames;
+                const double fps=cam_fps;
+                printf("[标定] 采样: 有效样本 %ld / 采集帧 %ld, 均值 %.2fms ≈ %.0ffps "
+                       "(采集率 %d fps, 无样本帧 %.1f%%) | 采样耗时 %.2fms/帧 (几何 640→%d, "
+                       "9 块×2 轴一维投影)\n",
+                       collect_samples, collect_frames, ms, ms>0?1000.0/ms:0.0, cam_fps,
+                       100.0*(1.0-(double)collect_samples/std::max(1.0,(double)collect_frames)),
+                       collect_ms/std::max(1.0,(double)collect_frames), CALIB_SAMPLE_PX);
+                fflush(stdout);
+            }
+            if (done==1) {
                 if (!persist_path.empty()) {
-                    if (persist_calibration(persist_path,L_VAR_HID,l_est))
-                        std::cout<<"[标定] 已回写 "<<persist_path<<" ("<<L_VAR_HID<<")\n";
+                    if (cal_writeback(cal_mode,cr,persist_path))
+                        std::cout<<"[标定] 已回写 "<<persist_path
+                                 <<(cal_mode==CAL_MODE_HID?" (L_EST)":" (L_EST_PAD)")<<"\n";
                     else std::cerr<<"[标定] 回写失败\n"; }
-            } else { std::cout<<"[标定] 失败: 样本 "<<hist.size()<<"/"<<collect_frames<<"\n"; }
+                l_est=cr.l_est;      // 只标延迟: 唯一进运行态的标定量
+            } else std::cout<<"[标定] 失败, 未回写 (无编造的值)\n";
+            g_calib_done=done;
         }
 
         if (collecting_enabled) {

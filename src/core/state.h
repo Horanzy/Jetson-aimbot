@@ -52,8 +52,10 @@ constexpr int ms_to_ticks(int ms) { return ms * DEFAULT_FREQ / 1000; }
 //   193/556/1159/1651/1804 px/s → 满偏外推 ≈2600, 取 3000; 与速度帽推导
 //   2000 px/s = 960·v/d 同量级)。
 // 夹取带 [1, 10000] 是防误输入 (0/负数/离谱放大值); 有意义的带是 5..2000 ——
-//   有效灵敏度 s_hid_eff(spd) = 1/k 落在 0.05–20 px/count, 即本库灵敏度设计带
-//   (core/calib.h 的 S_MIN/S_MAX)。逐轴取值: 同一灵敏度下垂直与水平的屏速比是
+//   有效灵敏度 s_hid_eff = 100/spd 落在 0.05–20 px/count: 基线 (1 px/count 与
+//   3000 px/s) 两侧各约 1.3 个数量级的修正范围。这是选择规则不是实测带: 游戏侧的
+//   灵敏度是未知量, 倍率只需能把基线拉进游戏的工作区间, 再往外不产生新的分辨率,
+//   只会在第一次拉枪时把准星甩飞。逐轴取值: 同一灵敏度下垂直与水平的屏速比是
 //   游戏属性 (俯仰灵敏度常更低), 一个总倍率会把两轴绑死; ADS 键按住期间整套换成
 //   adsspd 那一对。速度帽 (-x) 不随 spd 变 — 它约束"准星能否追上目标的屏幕速度",
 //   是游戏量, 与转换刻度无关。
@@ -77,6 +79,7 @@ void signal_handler(int);
 extern std::atomic<bool> g_calib_collect;
 extern std::atomic<bool> g_calib_request;
 extern std::atomic<int>  g_calib_done;               // 0=计算中 1=成功 2=失败
+extern std::atomic<bool> g_padcalib_request;         // pad 标定请求 (热参 padcalib=1; 一次消费即清)
 
 extern std::atomic<bool> g_left_down;
 

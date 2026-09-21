@@ -22,7 +22,7 @@ TRT="-lnvinfer -lnvinfer_plugin -lcudart -Xcompiler -pthread"
 # 模块清单 = src/ 下的全部编译单元 (main.cu 与 core/io 各 .cu 逐一对应)
 MODULES="main \
          core/control core/estimator core/calib core/trt core/state \
-         io/capture io/hid_mouse io/usbraw io/hotctl io/pad_input io/pad_output io/pad_xinput"
+         io/capture io/hid_mouse io/usbraw io/hotctl io/calib_run io/pad_input io/pad_output io/pad_xinput"
 
 OBJS=""
 for m in $MODULES; do
@@ -58,5 +58,14 @@ $NVCC -c "$SRC/io/pad_test.cu" $NVCC_FLAGS $INCLUDES -o "$BUILD/pad_test.o"
 $NVCC "$BUILD/pad_test.o" $CONTROL_TEST_OBJS $LIBS $OCV -lopencv_imgcodecs $TRT \
     -o "$BUILD/pad_test"
 "$BUILD/pad_test"
+
+# 标定单测 (采样几何与块统计 / 一维投影与二维块相关的对照 / 状态机 / 合成闭环 e2e 的
+#   偏差与散度 / 不可测的诚实性): 同一链接方式, 断言失败即终止整个编译。
+# shellcheck disable=SC2086
+$NVCC -c "$SRC/core/calib_test.cu" $NVCC_FLAGS $INCLUDES -o "$BUILD/calib_test.o"
+# shellcheck disable=SC2086
+$NVCC "$BUILD/calib_test.o" $CONTROL_TEST_OBJS $LIBS $OCV -lopencv_imgcodecs $TRT \
+    -o "$BUILD/calib_test"
+"$BUILD/calib_test"
 
 echo "✅ 编译完成 → $BIN"

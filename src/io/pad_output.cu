@@ -1,10 +1,10 @@
 // ============================================================================
-//  pad_output.cu — pad_output.h 的实现: 注入换算与合并钳制 (纯换算), 摇杆账本
-//    入账, 模式路由选择子与账本→像素比例, 最终逻辑态发布点, pad 控制拍组装
-//    (触发键位 → 律期望速度 → 合并 → 发布) 与 --pad-dump 节流打印。输出后端
-//    (XInput over raw_gadget) 缝合在发布点上, 不进入本文件。
+//  pad_output.cu — pad_output.h 的实现: 注入换算与合并钳制 (纯换算), 标定激励期
+//    整只手柄由激励独占 (右摇杆 = 激励, 人手摇杆/扳机归中, 按键照旧透传), 摇杆
+//    账本入账, 模式路由选择子与账本→像素比例, 最终逻辑态发布点, pad 控制拍组装
+//    (标定拍 → 触发键位 → 律期望速度 → 合并 → 发布) 与 --pad-dump 节流打印。
+//    输出后端 (XInput over raw_gadget) 缝合在发布点上, 不进入本文件。
 // ============================================================================
-
 #include "io/pad_output.h"
 
 #include <algorithm>
@@ -13,6 +13,7 @@
 
 #include "core/control.h"
 #include "core/state.h"
+#include "io/calib_run.h"
 
 CountsHistory g_pad_ledger;
 PadPublishState g_pad_publish;
@@ -99,6 +100,22 @@ PadLogical pad_merge(const PadLogical& human, float aim_vx, float aim_vy,
     return out;
 }
 
+// 标定激励: **整只手柄由程序独占** — 右摇杆 = 激励偏转, 左摇杆与两扳机一律置中,
+//   键位直通 (L3/R3 必须到游戏才能长按触发; 见 pad_output.h)。为什么整只手柄: 被测
+//   的是"摇杆偏转 → 屏幕位移"这条响应, 而人手通道会改变这条响应本身而非只叠加运动
+//   — 左摇杆让角色走动 = 整幅画面平移 (直接偏置行程累计), 扳机可能把游戏置于瞄准镜/
+//   开火状态 (灵敏度被缩放、后坐让画面持续漂移)。两者都不进停顿窗 (停顿窗只看命令,
+//   命令是零, 它们与命令无关), 所以噪声底抓不到它们 — 结构性置中才是"测量期间人手
+//   不参与"的保证, 而不是对操作者的要求。
+PadLogical pad_excite(const PadLogical& human, int16_t dx, int16_t dy,
+                      std::chrono::steady_clock::time_point now) {
+    PadLogical out{};
+    out.btns=human.btns;
+    out.rx=dx; out.ry=dy;
+    ledger_add(out,now);
+    return out;
+}
+
 namespace {
 
 // --pad-dump 节流: ≥50ms 一行 — 调试日志与控制拍解耦的最小打印周期
@@ -126,16 +143,23 @@ void pad_tick(int cam_fps, PadState& in, bool dump) {
     const bool fire = h.rt >= thr;           // 与 hid 同一触发语义 (-k fire/ads/both)
     const bool ads  = h.lt >= thr;
     const uint16_t btns = (uint16_t)((fire?LEFT_KEY:0) | (ads?RIGHT_KEY:0));
-    float vx = 0, vy = 0;
-    const bool gate = control_apply_pad(cam_fps, btns, vx, vy);
-    // spd 落点: 注入换算逐轴用有效满偏屏速 A_eff = 基数×100/spd_axis (调大 =
-    //   偏转更大 = 更快); 速度帽逐轴取 min(-x, A_eff/1000), 在律里收口 (满偏行程
-    //   是物理上限)。合并与账本按同一 A_eff 的口径 — 律刚把本拍的 ADS 键状态写进
-    //   g_ads_down, 与上面的 ads 同值 (LT ≥ 阈值)。
-    const PadLogical out = pad_merge(h, vx, vy,
-                                     gain_pad_eff(spd_axis(ads, 0)),
-                                     gain_pad_eff(spd_axis(ads, 1)),
-                                     std::chrono::steady_clock::now());
+    auto now = std::chrono::steady_clock::now();
+    // 标定拍 (L3+R3 长按 / 热参 padcalib): 激励期律本拍不参与, 右摇杆由激励独占
+    const CalStep cal = cal_step(CAL_MODE_PAD, h.btns, cam_fps, now);
+    PadLogical out;
+    bool gate = false;
+    if (cal.active) out = pad_excite(h, cal.cx, cal.cy, now);
+    else {
+        float vx = 0, vy = 0;
+        gate = control_apply_pad(cam_fps, btns, vx, vy);
+        // spd 落点: 注入换算逐轴用有效满偏屏速 A_eff = 基数×100/spd_axis (调大 =
+        //   偏转更大 = 更快); 速度帽逐轴取 min(-x, A_eff/1000), 在律里收口 (满偏行程
+        //   是物理上限)。合并与账本按同一 A_eff 的口径 — 律刚把本拍的 ADS 键状态写进
+        //   g_ads_down, 与上面的 ads 同值 (LT ≥ 阈值)。
+        out = pad_merge(h, vx, vy,
+                        gain_pad_eff(spd_axis(ads, 0)),
+                        gain_pad_eff(spd_axis(ads, 1)), now);
+    }
     {   // 发布点覆盖写 (最新报告槽语义, 契约见 pad_output.h)
         std::lock_guard<std::mutex> lk(g_pad_publish.mtx);
         g_pad_publish.st = out;
