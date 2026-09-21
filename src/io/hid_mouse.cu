@@ -239,6 +239,9 @@ static UsbRawDeviceDef build_mouse_usb() {
     d.strings           = MOUSE_STRINGS;
     d.string_count      = (uint8_t)(sizeof(MOUSE_STRINGS) / sizeof(MOUSE_STRINGS[0]));
     d.vendor_request    = nullptr;            // 鼠标无设备特有请求 → 非标准请求段 STALL (类段走内建 HID 表)
+    d.has_ep_out        = false;              // 鼠标协议是单端点的 (主机不向鼠标写数据)
+    d.rate_trace        = true;               // 提交率/写完成率是本后端的实测项 (见 usbraw 发送线程)
+    d.rate_tag          = "USB-HID";
     return d;
 }
 

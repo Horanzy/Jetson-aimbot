@@ -16,11 +16,19 @@
 //    三源各有独立开关 (-e, 热参 cap_fire/cap_det/cap_auto), 间隔参数见 -F/-A/-C。
 //
 //  鼠标接管: -a n (或热参 aim=0) 时固件纯透传真实鼠标 — 不注入任何移动, 检测/采集照常。
-//    模型未完善但需要采集数据的运行形态; aim=1 即恢复控制输出。
+//    模型未完善但需要采集数据时的运行形态; aim=1 即恢复控制输出。
 //
-//  热参数: UDP 127.0.0.1 上的极小本地控制通道 (白名单 t/y/x/fov/spdx/spdy/
+//  手柄模式 (-M pad, 与鼠标模式互斥): 物理手柄 (Xbox 布局) 全透传 (按键/摇杆/扳机
+//    模拟量 1:1, 扳机只有"是否触发自瞄"的判定过阈值), 控制律期望速度按**逐轴有效
+//    满偏屏速**折算成右摇杆注入偏转, 与人类通道径向合并 (±满偏钳制); 摇杆账本
+//    Σ(偏转·ms) 供估计器/律的自身运动补偿 (按轴换算回像素)。合并后的最终逻辑态经
+//    发布点交给输出后端, 以 raw_gadget 呈现微软有线 360 手柄 (0x045E/0x028E) 给
+//    宿主 — 宿主侧即 XInput 手柄 (见 io/pad_xinput)。
+//
+//  热参数: UDP 127.0.0.1 上的极小本地控制通道 (白名单 t/y/x/fov/padthr/spdx/spdy/
 //    adsspdx/adsspdy/k/aim/cap_*, 固件侧强制钳制), webui 保存后即时生效不重启;
 //    结构常量仍为编译期, 与"无手调魔法数字"哲学一致。
+
 //
 //  标定: 双侧键长按 5 秒, 程序自动生成激励轨迹 (画正方形), 块相位相关测背景位移,
 //    最小二乘估计环路延迟 L (ms); 经 -S 传入脚本路径时自动回写 (拟合联立解出的
@@ -57,6 +65,9 @@
 #include "io/capture.h"
 #include "io/hid_mouse.h"
 #include "io/hotctl.h"
+#include "io/pad_input.h"
+#include "io/pad_output.h"
+#include "io/pad_xinput.h"
 #include "io/usbraw.h"
 
 // ========================= 命令行交互 =========================
@@ -74,6 +85,7 @@ int main(int argc, char* argv[]) {
 
     std::string a_m,a_c,a_t,a_y,a_d,a_f,a_x,a_l,a_S,a_k,a_v,a_r,a_D;
     std::string a_o,a_a,a_e,a_spd,a_adsspd; bool have_e=false;
+    std::string a_M,a_P,a_T; bool pad_dump=false;
     int fire_ms=300; double auto_s=10;
     int cooldown_ms=500; int jpeg_q=95;
 
@@ -99,6 +111,10 @@ int main(int argc, char* argv[]) {
         else if (arg=="-q"&&i+1<argc) jpeg_q=std::stoi(argv[++i]);
         else if (arg=="-r"&&i+1<argc) a_r=argv[++i];
         else if (arg=="-D"&&i+1<argc) a_D=argv[++i];
+        else if (arg=="-M"&&i+1<argc) a_M=argv[++i];
+        else if (arg=="-P"&&i+1<argc) a_P=argv[++i];
+        else if (arg=="-T"&&i+1<argc) a_T=argv[++i];
+        else if (arg=="--pad-dump") pad_dump=true;
         else if (arg=="--spd"&&i+1<argc) a_spd=argv[++i];
         else if (arg=="--ads-spd"&&i+1<argc) a_adsspd=argv[++i];
         else if (arg=="-h"||arg=="--help") {
@@ -112,8 +128,19 @@ int main(int argc, char* argv[]) {
                 "  --spd <x>[,<y>]      拉枪速度倍率逐轴 (默认 100 = 基线; 调大=更快; 热参 spdx/spdy)\n"
                 "  --ads-spd <x>[,<y>]  ADS 键按住时的同一对 (默认 100; 热参 adsspdx/adsspdy)\n"
                 "  -r <半径>  FOV 半径 px (默认 150, 10–1000)\n"
-                "  -a <y/n>   鼠标接管 (默认 y; n=纯透传: 不动鼠标, 检测/采集照常)\n"
-                "  -D <子串>  鼠标 by-id 匹配子串 (默认空 = 任一 *-event-mouse 字典序首个)\n"
+                "  -a <y/n>   鼠标接管 (默认 y; n=纯透传: 不注入, 检测/采集照常)\n"
+                "\n输出模式 (互斥, 缺省 hid):\n"
+                "  -M <模式>  hid=USB raw_gadget 鼠标 (游戏内鼠标灵敏度生效)\n"
+                "             pad=XInput 手柄输出: 物理手柄全透传 + 控制律注入右摇杆,\n"
+                "                 以 raw_gadget 呈现微软有线 360 手柄 (0x045E/0x028E) 给宿主\n"
+                "  -P <子串>  手柄 /dev/input/by-id 匹配子串 (默认空 = 任一 *-event-joystick\n"
+                "             节点; P5 General 加密狗自身的节点已被排除)\n"
+                "  -T <百分比> 手柄触发阈值 (默认 6 = 该手柄扳机实测 flat 15/255; RT/LT\n"
+                "             两键共享; 只作用于触发判定, 扳机模拟量仍 1:1 透传; 热参 padthr)\n"
+                "  --pad-dump 叠加调试输出: ≥50ms 打印合并后逻辑态 (透传/注入验证)\n"
+                "\n鼠标输入选项 (hid 模式):\n"
+                "  -D <子串>  鼠标 /dev/input/by-id 匹配子串 (默认空 = 任一 *-event-mouse\n"
+                "             字典序首个; 手柄插着时建议指定, 否则可能选中其附属鼠标接口)\n"
                 "\n采集选项 (不传 -o 则纯自瞄不截图):\n"
                 "  -o <目录>  输出目录 (自动建 fire/ det/ auto/ 子目录)\n"
                 "  -e <列表>  启用的截图源 fire/det/auto 逗号分隔 (默认全部; 也可运行中热切)\n"
@@ -161,6 +188,27 @@ int main(int argc, char* argv[]) {
     int spd_x=SPD_BASE,spd_y=SPD_BASE,ads_spd_x=SPD_BASE,ads_spd_y=SPD_BASE;
     if (!parse_spd(a_spd,spd_x,spd_y,"--spd")) return 1;
     if (!parse_spd(a_adsspd,ads_spd_x,ads_spd_y,"--ads-spd")) return 1;
+
+    // 输出模式: hid (USB raw_gadget 鼠标) / pad (XInput 手柄输出) — 互斥, 缺省 hid。
+    //   pad 模式读手柄、不读鼠标, 两模式各自独占 UDC 的 raw_gadget 会话。
+    const std::string out_mode=a_M.empty()?"hid":a_M;
+    if (out_mode!="hid"&&out_mode!="pad") {
+        std::cerr<<"❌ 未知模式 \""<<out_mode<<"\" (用 hid / pad)\n"; return 1;
+    }
+    const bool pad_mode=(out_mode=="pad");
+    const std::string pad_kw=a_P.empty()?DEFAULT_PAD_KEYWORD:a_P;
+    if (!a_P.empty()&&!pad_mode) std::cout<<"⚠ 忽略 -P (仅 pad 模式: 手柄选择)\n";
+    if (!a_T.empty()&&!pad_mode) std::cout<<"⚠ 忽略 -T (仅 pad 模式: 扳机触发阈值)\n";
+    if (pad_dump&&!pad_mode) std::cout<<"⚠ 忽略 --pad-dump (仅 pad 模式)\n";
+    if (!a_D.empty()&&pad_mode) std::cout<<"⚠ 忽略 -D (仅 hid 模式: 鼠标选择)\n";
+    // pad 触发阈值 (% 满量程): -T 或设计缺省 (出处见 io/pad_output.h) — 两键共享,
+    //   热参 padthr 运行中可调, 只影响触发判定 (扳机模拟量不受影响)
+    float pad_trig_thr=PAD_TRIG_THR_PCT;
+    if (!a_T.empty()) {
+        try { pad_trig_thr=std::stof(a_T); }
+        catch (const std::exception&) { std::cerr<<"❌ -T 需为 <百分比>\n"; return 1; }
+        pad_trig_thr=std::clamp(pad_trig_thr,0.0f,100.0f);
+    }
     std::string aim_key=!a_k.empty()?a_k:get_input_with_default("触发键","fire");
     int aim_mode=0;
     if(aim_key=="ads")aim_mode=1; else if(aim_key=="both")aim_mode=2;
@@ -196,6 +244,7 @@ int main(int argc, char* argv[]) {
     g_cap_fire.store(fire_on); g_cap_det.store(det_on); g_cap_auto.store(auto_on);
     g_spd_x.store(spd_x); g_spd_y.store(spd_y);
     g_ads_spd_x.store(ads_spd_x); g_ads_spd_y.store(ads_spd_y);
+    g_pad_trig_thr.store(pad_trig_thr);
 
     const bool do_collect=!a_o.empty();
     if (do_collect) { ensure_dir(a_o); ensure_dir(a_o+"/fire");
@@ -209,14 +258,24 @@ int main(int argc, char* argv[]) {
 
     MouseState state;
     UsbRawSession usb;
-    if (!hid_mouse_start(state,usb,a_D)) return 1;
+    PadState padst;
+    // 两模式单次运行只居其一, 且各自独占 UDC: hid = USB raw_gadget 鼠标,
+    //   pad = XInput 有线手柄 (0x045E/0x028E)
+    if (pad_mode) { if (!pad_xinput_start()) return 1; }
+    else          { if (!hid_mouse_start(state,usb,a_D)) return 1; }
 
     signal(SIGINT,signal_handler); signal(SIGTERM,signal_handler);
     { std::lock_guard<std::mutex> lk(g_target.mtx); g_target.l_est_ms=init_l; }
+    // 自身运动账本的来源与账本→像素比例随输出模式 (io/pad_output.h; 单次运行一模式)
+    own_motion_ledger_set(pad_mode);
 
     std::cout<<"初始: L="<<init_l<<" spd_x="<<spd_x<<" spd_y="<<spd_y
              <<" ads_spd_x="<<ads_spd_x<<" ads_spd_y="<<ads_spd_y<<" fov="<<fov_r<<"\n";
-    std::cout<<"鼠标接管: "<<(aim_on?"开":"关 (纯透传: 不注入移动, 检测/采集照常)")<<"\n";
+    if (pad_mode)
+        std::cout<<"模式: pad (XInput 手柄 0x045E/0x028E 呈现给宿主, 物理手柄全透传"
+                 <<(pad_dump?", --pad-dump 叠加打印":"")<<")  触发阈值="<<pad_trig_thr<<"%\n";
+    std::cout<<(pad_mode?"辅助瞄准注入: ":"鼠标接管: ")
+             <<(aim_on?"开":"关 (纯透传: 原样透传, 检测/采集照常)")<<"\n";
     if (do_collect) {
         std::string srcs;
         auto add_src=[&](bool on,const char* n){ if(on){ if(!srcs.empty()) srcs+=","; srcs+=n; } };
@@ -225,6 +284,16 @@ int main(int argc, char* argv[]) {
                  <<"  开火="<<fire_ms<<"ms  定时="<<auto_s<<"s  冷却="<<cooldown_ms<<"ms\n";
     } else
         std::cout<<"采集: 关闭 (未传 -o)\n";
+
+    std::thread pad_reader;
+    if (pad_mode) {
+        // 启动一次性诊断: 手柄在位/节点提示 + -P 多匹配报错 (verbose); 读取线程
+        //   自带缺席重试与掉线自愈, 未在位不阻塞启动
+        std::string pd=find_pad_device(pad_kw,true);
+        if (pd.empty()) std::cout<<"⚠ 手柄当前不在位 (读取线程每秒重试)\n";
+        else            std::cout<<"✅ 手柄节点: "<<pd<<"\n";
+        pad_reader=std::thread(pad_reader_thread,pad_kw,std::ref(padst));
+    }
 
     std::thread writer; if (do_collect) writer=std::thread(writer_thread,jpeg_q);
     std::thread hot(hotctl_thread);
@@ -246,6 +315,10 @@ int main(int argc, char* argv[]) {
         int nf=epoll_wait(ep,evs,1,500);
         if(nf<0&&errno==EINTR)continue; if(nf<=0)continue;
         uint64_t exp; read(tfd,&exp,sizeof(exp));
+        if (pad_mode) {
+            pad_tick(cam_fps,padst,pad_dump);   // 手柄拍: 快照 → 触发 → 律 → 合并 → 发布
+            continue;
+        }
         int16_t x,y;int8_t w,hw;uint16_t b;
         extract_and_clear(state,x,y,w,hw,b);
         hid_report_submit(usb,x,y,w,hw,b,[cam_fps](std::array<uint8_t,HID_REPORT_LEN>& rpt,
@@ -255,9 +328,11 @@ int main(int argc, char* argv[]) {
 
     global_running=false;
     g_save_cv.notify_all();
+    // 输出后端先停 (它持有 UDC 的 raw_gadget 会话), 再停输入读取线程与其它线程
+    if (pad_mode) pad_xinput_stop(); else hid_mouse_stop(usb);
+    if (pad_reader.joinable()) pad_reader.join();
     hot.join(); ai.join();
     if (do_collect) writer.join();
-    hid_mouse_stop(usb);
     close(tfd);close(ep);
     std::cout<<"已停止\n";
     return 0;

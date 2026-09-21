@@ -22,7 +22,7 @@ TRT="-lnvinfer -lnvinfer_plugin -lcudart -Xcompiler -pthread"
 # 模块清单 = src/ 下的全部编译单元 (main.cu 与 core/io 各 .cu 逐一对应)
 MODULES="main \
          core/control core/estimator core/calib core/trt core/state \
-         io/capture io/hid_mouse io/usbraw io/hotctl"
+         io/capture io/hid_mouse io/usbraw io/hotctl io/pad_input io/pad_output io/pad_xinput"
 
 OBJS=""
 for m in $MODULES; do
@@ -48,5 +48,15 @@ CONTROL_TEST_OBJS=$(printf '%s\n' $OBJS | grep -v "build/main.o" | tr '\n' ' ')
 $NVCC "$BUILD/control_test.o" $CONTROL_TEST_OBJS $LIBS $OCV -lopencv_imgcodecs $TRT \
     -o "$BUILD/control_test"
 "$BUILD/control_test"
+
+# 手柄模式单测 (输入映射 8→16 位 / 注入合并几何 / 账本与发布点契约 / XInput 线格式
+#   与设备字节): 与控制拍单测同一链接方式 (除 main.o 外的模块对象), 断言失败即
+#   set -e 终止整个编译。
+# shellcheck disable=SC2086
+$NVCC -c "$SRC/io/pad_test.cu" $NVCC_FLAGS $INCLUDES -o "$BUILD/pad_test.o"
+# shellcheck disable=SC2086
+$NVCC "$BUILD/pad_test.o" $CONTROL_TEST_OBJS $LIBS $OCV -lopencv_imgcodecs $TRT \
+    -o "$BUILD/pad_test"
+"$BUILD/pad_test"
 
 echo "✅ 编译完成 → $BIN"

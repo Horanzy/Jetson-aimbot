@@ -29,9 +29,10 @@ SAVE_RE = re.compile(r"\[SAVE\]\s*\S+\s*\(fire=(\d+) det=(\d+) auto=(\d+)")
 STATS_RE = re.compile(r"采集统计: fire=(\d+) det=(\d+) auto=(\d+)")
 # 模型: YOLOv8/11 416x416 1类 — 启动时从固件控制台抓取, 不落存储
 MODEL_RE = re.compile(r"模型:\s*(\S+)\s+(\d+)x(\d+)(?:\s+(\d+)类)?")
-# 这两类高频/低信息行不推进页面日志流 (原始环里照存, /api/logs/current 下载仍是全量);
-# [SAVE] 的信息改由截图卡片承载, [AI FPS] 由帧率卡片 + AI FPS 历史面板承载
-HIDDEN_IN_STREAM = ("[SAVE]", "[AI FPS]")
+# 这几类高频/低信息行不推进页面日志流 (原始环里照存, /api/logs/current 下载仍是全量);
+# [SAVE] 的信息改由截图卡片承载, [AI FPS] 由帧率卡片 + AI FPS 历史面板承载,
+# 每 60s 一行的报告率观测 ([USB-HID]/[PAD-USB], 需 SSH 看控制台) 不进页面流
+HIDDEN_IN_STREAM = ("[SAVE]", "[AI FPS]", "[USB-HID]", "[PAD-USB]")
 FPS_HIST_MAX = 720                     # 60s 一读 → 12h 会话覆盖
 
 RUNNING_STATES = ("starting", "running", "stopping")

@@ -52,3 +52,12 @@ const int KEEP_ALIVE_MS = 200;                       // 松开触发键后保持
 //  位移字节; 纯透传 (-a n / 热参 aim=0) 时不注入。cam_fps 用于丢帧期前馈衰减的
 //  时间尺度, rpt 为 HID_REPORT_LEN 字节报文缓冲 (只改写位移字节)。
 void control_apply(int cam_fps, uint8_t* rpt, int16_t real_x, int16_t real_y);
+
+// pad 输出模式的律入口 (与 control_apply 同一份律数学, 逐句一致; 指标去向不同:
+//  hid 量化成 counts 写报文位移字节, pad 交付期望速度 px/ms 由合并层换算成摇杆
+//  偏转)。btns 为触发键位字 (fire→LEFT_KEY, ads→RIGHT_KEY, 由 pad 侧 RT/LT 门控
+//  生成 — 侧键抑制与双侧键标定是 hid 键位语义, pad 键位字恒无那些位, 分支自然
+//  惰性)。速度帽逐轴取 min(热参 x, 该轴有效满偏屏速 A_eff/1000): 注入打到该轴
+//  满偏即该轴行程上限 (hid 两轴同为热参 x, 算式与单帽逐位相同)。返回注入门
+//  (接管开 × 触发保持窗内)。
+bool control_apply_pad(int cam_fps, uint16_t btns, float& out_vx, float& out_vy);

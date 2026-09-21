@@ -208,10 +208,9 @@ void ai_thread(std::string model_path, int target_cls,
             if (dist<best_dist&&dist<fov_r) { best_dist=dist;best_dx=dx;best_dy=dy;found=true; } }
 
         auto now=std::chrono::steady_clock::now();
-        // 自身运动换算的逐轴有效灵敏度: 按帧时刻的 ADS 键状态取, 与注入换算同一份值
-        const bool ads=g_ads_down.load();
-        float s_x=s_hid_now(ads,0), s_y=s_hid_now(ads,1);
-        float dt=estimator_step(est,now,found,best_dx,best_dy,s_x,s_y,l_est,max_v);
+        // 自身运动换算的账本来源与逐轴比例在 estimator_step 内部按输出模式取
+        //   (一次快照, 见 core/estimator.cu)
+        float dt=estimator_step(est,now,found,best_dx,best_dy,l_est,max_v);
 
         if (cal_collecting) {
             cv::Mat gray,small,sf;

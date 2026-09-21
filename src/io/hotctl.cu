@@ -19,6 +19,7 @@
 #include <unistd.h>
 
 #include "core/state.h"
+#include "io/pad_output.h"      // g_pad_trig_thr (pad 触发阈值热参 padthr)
 
 // 数值 token 解析: 整对消费成功才有效 (尾随垃圾一律拒绝)
 static bool num_val(const char* val, float& out) {
@@ -28,12 +29,14 @@ static bool num_val(const char* val, float& out) {
 }
 
 bool hotctl_apply(const char* key, const char* val) {
-    if (!strcmp(key,"t")||!strcmp(key,"y")||!strcmp(key,"x")||!strcmp(key,"fov")) {
+    if (!strcmp(key,"t")||!strcmp(key,"y")||!strcmp(key,"x")||!strcmp(key,"fov")
+        ||!strcmp(key,"padthr")) {
         float v=0;
         if (!num_val(val,v)) { std::cout<<"[热参] 忽略 "<<key<<"="<<val<<" (非数值)\n"; return false; }
         if      (!strcmp(key,"t"))   { v=std::clamp(v,0.0f,1.0f);       g_conf_thr.store(v); }
         else if (!strcmp(key,"y"))   { v=std::clamp(v,0.0f,100.0f);     g_y_off_pct.store(v); }
         else if (!strcmp(key,"x"))   { v=std::clamp(v,100.0f,20000.0f); g_max_v.store(v/1000.0f); }
+        else if (!strcmp(key,"padthr")) { v=std::clamp(v,0.0f,100.0f);  g_pad_trig_thr.store(v); }
         else                         { v=std::clamp(v,10.0f,1000.0f);   g_fov_radius.store(v); }
         std::cout<<"[热参] "<<key<<"="<<v<<"\n";
         return true;
@@ -86,7 +89,7 @@ void hotctl_thread() {
         std::cerr<<"⚠ 热参数通道绑定失败 (端口 "<<HOT_CTL_PORT<<" 被占), 热参不可用\n";
         close(fd); return; }
     std::cout<<"✅ 热参数通道: 127.0.0.1:"<<HOT_CTL_PORT
-             <<" (t/y/x/fov/spdx/spdy/adsspdx/adsspdy/k/aim/cap_*)\n";
+             <<" (t/y/x/fov/padthr/spdx/spdy/adsspdx/adsspdy/k/aim/cap_*)\n";
     struct pollfd pfd{}; pfd.fd=fd; pfd.events=POLLIN;
     char buf[256];
     while (global_running) {

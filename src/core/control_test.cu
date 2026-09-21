@@ -220,17 +220,20 @@ int main() {
               "在飞补偿随 spd 成比例变化 (命令放大多少, 补偿跟随多少)");
         g_spd_x.store(SPD_BASE);
         // 估计器自身运动补偿: 帧窗内植入已知 counts, 发布值可精确手算
-        //   (首拍后 fx=fvx=0 ⇒ px_pred = −s_x·Δcounts, inx = 观测 − px_pred)
-        const auto est_case = [](float sx, float sy, float& out_px, float& out_py) {
+        //   (首拍后 fx=fvx=0 ⇒ px_pred = −s_x·Δcounts, inx = 观测 − px_pred)。
+        //   换算比例由估计器按输出模式与 spd 自己取 (io/pad_output.h 的
+        //   own_motion_scale), 故这里改 spd 原子而不传比例。
+        const auto est_case = [](int spd, float& out_px, float& out_py) {
+            g_spd_x.store(spd); g_spd_y.store(spd);
             EstimatorState est;
             g_counts.clear();
             auto t0 = std::chrono::steady_clock::now();
-            estimator_step(est, t0, true, 0.0f, 0.0f, sx, sy, (float)T_L, 20.0f);
+            estimator_step(est, t0, true, 0.0f, 0.0f, (float)T_L, 20.0f);
             auto t1 = shift_ms(t0, 10.0);
             ledger_plateau(shift_ms(t1, -65.0), 0, 0);      // 飞行窗 [t1−65, t1−55]:
             ledger_set(shift_ms(t1, -60.0), 10, 4);         //   窗内 Δcounts = (10,4)
             ledger_plateau(shift_ms(t1, -55.0), 10, 4);
-            estimator_step(est, t1, true, -8.0f, -3.0f, sx, sy, (float)T_L, 20.0f);
+            estimator_step(est, t1, true, -8.0f, -3.0f, (float)T_L, 20.0f);
             std::lock_guard<std::mutex> lk(g_target.mtx);
             out_px = g_target.px; out_py = g_target.py;
         };
@@ -240,8 +243,9 @@ int main() {
             return -s * counts + alpha * (obs + s * counts);
         };
         float px1, py1, px2, py2;
-        est_case(s100, s100, px1, py1);
-        est_case(s100 * 0.5f, s100 * 0.5f, px2, py2);
+        est_case(SPD_BASE, px1, py1);
+        est_case(SPD_BASE * 2, px2, py2);                   // spd=200 → 有效灵敏度减半
+        g_spd_x.store(SPD_BASE); g_spd_y.store(SPD_BASE);
         std::printf("      估计器 s=%.2f → (%.3f,%.3f); s=%.2f → (%.3f,%.3f); 手算 (%.3f,%.3f)/(%.3f,%.3f)\n",
                     s100, px1, py1, s100 * 0.5f, px2, py2,
                     pred(s100, 10.0f, -8.0f), pred(s100, 4.0f, -3.0f),

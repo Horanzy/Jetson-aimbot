@@ -11,13 +11,29 @@
 #
 #  标定: 游戏内对准有细节的静止背景, 双侧键长按 5 秒 (画正方形 → 点头/摇头);
 #        成功后固件自动把 L_EST 回写进本脚本 (原子替换), 无需手改 —— 标定只出环路
-#        延迟, 手感由下面四个速度倍率调。
+#        延迟, 手感由下面四个速度倍率调 (两个输出模式共用同一条标定路径与同一个
+#        L, 手柄模式暂无自己的标定).
 # ==============================================================================
 
 # ---- 路径 ----
 ROOT="$(cd "$(dirname "$(realpath "$0")")/../.." && pwd)"
 APP="$ROOT/bin/aimbot"
 MODEL_PATH="$ROOT/engine/example.engine"   # ← 改成 engine/ 下你实际转好的模型
+
+# ---- 输出模式 (hid = USB 鼠标 (PC 游戏内灵敏度生效) / pad = XInput 手柄 (PC);
+#      互斥, 一次运行只居其一) ----
+# pad 模式: 物理手柄全透传 (按键/摇杆/扳机模拟量 1:1, 扳机只有"是否触发"过阈值),
+#      控制律期望速度按逐轴有效满偏屏速折算成右摇杆注入偏转与人类通道合并;
+#      固件以 raw_gadget 呈现微软有线 360 手柄 (0x045E/0x028E) 给宿主, 宿主侧
+#      即 XInput 手柄。速度帽逐轴 = min(-x, 该轴有效满偏屏速)。
+OUTPUT_MODE="hid"   # hid / pad
+PAD_KEYWORD=""      # pad: 手柄 by-id 匹配子串 (空 = 任意 *-event-joystick 节点)
+PAD_TRIG_THR=6      # pad: 触发阈值 % (RT/LT 两键共享; 默认 6 = 该手柄扳机实测 flat
+                    #      15/255 的上取整; 只作用于触发判定, 扳机模拟量仍 1:1 透传)
+MOUSE_KEYWORD=""    # hid: 鼠标 by-id 匹配子串 (空 = 任意 *-event-mouse 取字典序首个;
+                    #      手柄插着时建议指定, 否则可能选中手柄的附属鼠标接口)
+PAD_DUMP="n"        # pad: y = 每 ≥50ms 打一行合并逻辑态 [PAD] lx/ly/rx/ry/lt/rt/
+                    #      fire/ads/aim_gate — 现场诊断注入用 (看命令波形, 不影响行为)
 
 # ---- 自瞄参数 ----
 CLASS_ID=0          # 目标类别 (依模型标签: 0=头 1=身)
@@ -72,6 +88,18 @@ sudo bash "$ROOT/scripts/setup_mouse.sh"
 
 SCRIPT_PATH="$(realpath "$0")"
 
+# 模式参数: hid 用鼠标选择 (-D), pad 用手柄选择与触发阈值 (-M/-P/-T) — 两模式的
+#   标定量互不覆盖 (L 由 -l 走同一个脚本行)。缺行时 ${VAR:-缺省} 兜住, 不会让启动失败。
+PAD_KW_V="${PAD_KEYWORD:-}"
+PAD_THR_V="${PAD_TRIG_THR:-6}"
+MOUSE_KW_V="${MOUSE_KEYWORD:-}"
+if [ "${OUTPUT_MODE:-hid}" = "pad" ]; then
+  MODE_ARGS=(-M pad -P "$PAD_KW_V" -T "$PAD_THR_V")
+  [ "${PAD_DUMP:-n}" = "y" ] && MODE_ARGS+=(--pad-dump)
+else
+  MODE_ARGS=(-D "$MOUSE_KW_V")
+fi
+
 CAPTURE_ARGS=()
 if [ "$CAPTURE" = "y" ]; then
   CAP_SRC=""
@@ -98,4 +126,5 @@ sudo "$APP" \
   -a "$AIM_ENABLED" \
   -r "$FOV_R" \
   -v "$PREVIEW" \
+  "${MODE_ARGS[@]}" \
   "${CAPTURE_ARGS[@]}"

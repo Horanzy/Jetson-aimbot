@@ -1,9 +1,9 @@
 // ============================================================================
 //  usbraw.cu — usbraw.h 的实现: UDC 两级名字发现, raw_gadget ioctl 会话
-//    (INIT → RUN → VBUS_DRAW), ep0 标准请求表 (控制线程) 与中断 IN 端点的
-//    最新报告槽发送线程。
+//    (INIT → RUN → VBUS_DRAW), ep0 标准请求表 (控制线程), 中断 IN 发送线程与
+//    中断 OUT 收取线程。
 //
-//  阻塞收尾: stop() 置 stopping、唤醒两个线程、close fd — close 即解绑 UDC
+//  阻塞收尾: stop() 置 stopping、唤醒三个线程、close fd — close 即解绑 UDC
 //    (内核 raw_gadget 驱动 raw_release → usb_gadget_unregister_driver →
 //    driver.disconnect)。唤醒信号见下文 "端点 ioctl 的唤醒信号": 在途 ioctl
 //    持有文件引用, 只 close 无法驱动 release, 必须先把阻塞线程叫回来。
@@ -16,6 +16,7 @@
 #include "io/usbraw.h"
 
 #include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -50,6 +51,17 @@ struct alignas(8) RawIoBuf {
     //   失真 (__memcpy_chk 误判 abort), 写入一律走 buf 内偏移
     uint8_t* payload() { return buf + sizeof(usb_raw_ep_io); }
 };
+
+// ---- 墙钟常数 --------------------------------------------------------------
+// 统计窗口 60s: 报告率是稳态运维观测量, 秒级无增量信息, 与固件的 [AI FPS] 同一
+//   节奏 (60s 一行); 该行在 webui 的日志流里被隐藏 (proc.HIDDEN_IN_STREAM),
+//   需要时 SSH 看控制台。窗内出现 >100ms 空档视为流中断 (断链/挂起, 该间隔不是
+//   主机服务周期) 并重开窗口; 收尾等待 100ms 是"读线程从被唤醒到 ioctl 返回"的
+//   充裕上限。
+const double RATE_PRINT_MS  = 60000.0;
+const double RATE_GAP_MS    = 100.0;
+const int    OUT_RETIRE_WAIT_MS = 100;
+const int    OUT_ENABLE_TRIES   = 3;
 
 // ---- UDC 名字发现 ----------------------------------------------------------
 // 两级名字: device_name = /sys/class/udc 首个实例目录名; driver_name = 该实例
@@ -251,15 +263,58 @@ static bool hid_class_request(UsbRawSession& s, const usb_ctrlrequest& c) {
     return ep0_reply(s.fd, c, buf, len);
 }
 
-// SET_CONFIGURATION: 值 = bConfigurationValue (=1) 时: 使能中断端点 (未使能时)
-//   → 状态阶段 (阻塞至完成) → CONFIGURE (gadget 进入 configured 态) → 置
-//   configured 唤醒发送线程 — 状态阶段完成后才宣告配置的次序。值 = 0: 去配置。
-//   其余值: 设备只定义唯一配置, STALL。
+// ---- OUT 端点: 收尾与使能 (控制线程调用) -----------------------------------
+// 使能/失效的次序约束来自内核 raw_gadget: EP_ENABLE 要求端点处于 DISABLED 且
+//   该序号无在途请求 (urb_queued → EINVAL/EBUSY), 而在途请求只有把它读回来的
+//   那个线程能观察到它结束 — 因此收尾做成"唤醒读线程 → 等它退出读 → DISABLE"。
+// 收尾握手 (out_ep_retire): 纪元先失效 (读循环不再续读, 也不重入读), 句柄先撤
+//   (刚被唤醒的读线程不会再拿旧句柄开读), 再唤醒/等待在途读, 最后 DISABLE。
+static void out_ep_retire(UsbRawSession& s) {
+    std::unique_lock<std::mutex> lk(s.mtx);
+    const int h = s.out_handle;
+    const bool in_read = s.out_reading;
+    s.out_handle = -1;
+    s.out_enabled = false;
+    ++s.out_gen;                                      // 纪元失效: 读循环退出并等待下一纪元
+    lk.unlock();
+
+    if (in_read) {
+        wake_blocked_io(s.out_th);                    // 在途读: 唤醒至 ioctl 返回
+        lk.lock();
+        if (!s.out_cv.wait_for(lk, std::chrono::milliseconds(OUT_RETIRE_WAIT_MS),
+                               [&] { return !s.out_reading; })) {
+            lk.unlock();                              // 唤醒落在"读尚未入队"的窗口内: 交由
+            std::cerr << "⚠ OUT 端点: 在途读未在 " << OUT_RETIRE_WAIT_MS  //   下一次使能重试继续收尾
+                      << "ms 内收尾\n";
+            return;
+        }
+        lk.unlock();
+    }
+    if (h >= 0) ioctl(s.fd, USB_RAW_IOCTL_EP_DISABLE, h);
+    lk.lock();
+    s.out_cv.notify_all();
+}
+
+// 使能 (set_configuration 调用): 上一纪元的收尾是异步的, 失败即再收尾一次重试。
+static int out_ep_enable(UsbRawSession& s) {
+    for (int attempt = 0; attempt < OUT_ENABLE_TRIES; ++attempt) {
+        int h = ioctl(s.fd, USB_RAW_IOCTL_EP_ENABLE, &s.dev->ep_out);
+        if (h >= 0) return h;
+        out_ep_retire(s);
+    }
+    return -1;
+}
+
+// SET_CONFIGURATION: 值 = bConfigurationValue (=1) 时: 使能中断端点 (未使能时;
+//   OUT 端点先收尾上一纪元) → 状态阶段 (阻塞至完成) → CONFIGURE (gadget 进入
+//   configured 态) → 置 configured 唤醒发送线程 — 状态阶段完成后才宣告配置的
+//   次序。值 = 0: 去配置 (两端点收尾)。其余值: 设备只定义唯一配置, STALL。
 static void set_configuration(UsbRawSession& s, const usb_ctrlrequest& c) {
     const uint8_t val = c.wValue & 0xff;
     const uint8_t cfg_val = s.dev->config[5];             // 配置节 bConfigurationValue
     if (val != 0 && val != cfg_val) { usbraw_ep0_stall(s); return; }
     if (val == 0) {
+        if (s.dev->has_ep_out) out_ep_retire(s);
         { std::lock_guard<std::mutex> lk(s.mtx); s.cfg_value = 0; s.configured = false; }
         ep0_reply(s.fd, c, nullptr, 0);
         return;
@@ -279,6 +334,19 @@ static void set_configuration(UsbRawSession& s, const usb_ctrlrequest& c) {
         global_running = false;
         return;
     }
+    if (s.dev->has_ep_out) {
+        const int oh = out_ep_enable(s);
+        if (oh < 0) {
+            if (s.stopping) return;
+            usbraw_ep0_stall(s);
+            std::cerr << "❌ 中断 OUT 端点使能失败: " << strerror(errno) << "\n";
+            global_running = false;
+            return;
+        }
+        { std::lock_guard<std::mutex> lk(s.mtx);
+          s.out_handle = oh; s.out_enabled = true; ++s.out_gen; }
+        s.out_cv.notify_all();
+    }
     ep0_reply(s.fd, c, nullptr, 0);                       // 状态阶段 (阻塞至完成)
     if (ioctl(s.fd, USB_RAW_IOCTL_CONFIGURE, 0) < 0) {
         std::cerr << "⚠ CONFIGURE 失败: " << strerror(errno) << "\n";
@@ -288,16 +356,20 @@ static void set_configuration(UsbRawSession& s, const usb_ctrlrequest& c) {
     s.cv.notify_all();
 }
 
-// RESET: 中断端点随重枚举失效 → 使能的一端 DISABLE; SET_CONFIGURATION 到来时
-//   再 ENABLE (见 set_configuration) — 端点生命周期与官方 raw-gadget 示例一致:
+// RESET: 中断端点随重枚举失效 → 使能的一端 DISABLE (若使能), OUT 端点走收尾
+//   握手 (在途读必须先返回, 见 out_ep_retire)。SET_CONFIGURATION 到来时再
+//   ENABLE (见 set_configuration) — 端点生命周期与官方 raw-gadget 示例一致:
 //   在未配置状态 enable 的端点, tegra-xudc 不会为其服务 IN token (主机 IN 轮询
 //   永不完成, 数据请求排队无消费)。
 static void on_reset(UsbRawSession& s) {
-    std::lock_guard<std::mutex> lk(s.mtx);
-    if (s.ep_enabled && ioctl(s.fd, USB_RAW_IOCTL_EP_DISABLE, s.ep_handle) == 0)
-        s.ep_enabled = false;
-    s.cfg_value = 0;
-    s.configured = false;
+    {
+        std::lock_guard<std::mutex> lk(s.mtx);
+        if (s.ep_enabled && ioctl(s.fd, USB_RAW_IOCTL_EP_DISABLE, s.ep_handle) == 0)
+            s.ep_enabled = false;
+        s.cfg_value = 0;
+        s.configured = false;
+    }
+    if (s.dev->has_ep_out) out_ep_retire(s);
 }
 
 // ---- 线程 ------------------------------------------------------------------
@@ -368,6 +440,11 @@ static void send_loop(UsbRawSession* s) {
     RawIoBuf b;
     b.io()->flags = 0;
     int errs = 0;
+    auto win_start = std::chrono::steady_clock::now();
+    auto last_done = win_start;
+    uint64_t sub0 = 0;                                // 窗口起点的提交计数 (提交由生产线程记)
+    int n_done = 0;
+    double sum_gap = 0;
     while (true) {
         {
             std::unique_lock<std::mutex> lk(s->mtx);
@@ -378,8 +455,40 @@ static void send_loop(UsbRawSession* s) {
             memcpy(b.payload(), s->slot, s->slot_len);
             s->slot_fresh = false;
         }
+        auto now = std::chrono::steady_clock::now();
         if (ioctl(s->fd, USB_RAW_IOCTL_EP_WRITE, b.io()) >= 0) {
             errs = 0;
+            if (s->dev->rate_trace) {
+                // 完成即主机取走: 相邻完成的间隔均值 = 主机服务周期。窗内出现空档
+                //   (>RATE_GAP_MS) 说明流中断 (断链/挂起/主机暂停轮询), 该段不是
+                //   稳态服务周期 → 整窗重开, 避免把暂停算成"慢轮询"。
+                const double gap = elapsed_ms(now, last_done);
+                last_done = now;
+                if (gap > RATE_GAP_MS) {
+                    win_start = now; sub0 = s->submits; n_done = 0; sum_gap = 0;
+                } else {
+                    sum_gap += gap;
+                    ++n_done;
+                }
+                const double span = elapsed_ms(now, win_start);
+                if (span >= RATE_PRINT_MS) {
+                    const uint64_t sub = s->submits;
+                    // 提交率与写完成率分开报: 前者是设备侧生产节拍, 后者是主机取走
+                    //   报告的节拍。两者相等 = 无积压; 完成率显著更低 = 主机轮询
+                    //   上限 (端点 bInterval × 枚举速度) 或宿主调度成了瓶颈。
+                    //   OUT 计数是主机侧命令 (LED/力反馈) 的存在性观测: 它在动说明
+                    //   收取线程确有必要, 恒零说明该宿主从不写这条管道。
+                    std::printf("[%s] 报告率: 提交 %.0fHz (%llu) / 写完成 %.0fHz (mean %.2fms, %d) / OUT %llu\n",
+                                s->dev->rate_tag ? s->dev->rate_tag : "USB",
+                                sub > sub0 ? (double)(sub - sub0) * 1000.0 / span : 0.0,
+                                (unsigned long long)(sub - sub0),
+                                n_done ? n_done * 1000.0 / span : 0.0,
+                                n_done ? sum_gap / n_done : 0.0, n_done,
+                                (unsigned long long)s->outs.load(std::memory_order_relaxed));
+                    std::fflush(stdout);
+                    win_start = now; sub0 = sub; n_done = 0; sum_gap = 0;
+                }
+            }
             continue;
         }
         const int e = errno;
@@ -394,13 +503,50 @@ static void send_loop(UsbRawSession* s) {
     }
 }
 
+// OUT 收取线程: 等"有端点的配置纪元" → EP_READ (阻塞) → 收到即丢 (主机侧 LED/
+//   力反馈命令无消费方, 收下是端点存在的意义: 只使能不收, 主机的 OUT 传输
+//   永远 NAK)。读失败或纪元失效即退出读循环, 端点使能/失效由控制线程收尾。
+static void out_loop(UsbRawSession* s) {
+    RawIoBuf b;
+    uint64_t handled = 0;
+    while (true) {
+        int h;
+        {
+            std::unique_lock<std::mutex> lk(s->mtx);
+            s->out_cv.wait(lk, [&] { return s->stopping.load() || s->out_gen != handled; });
+            if (s->stopping) return;
+            handled = s->out_gen;
+            h = s->out_handle;
+            if (h >= 0) s->out_reading = true;
+        }
+        while (h >= 0) {
+            {
+                std::lock_guard<std::mutex> lk(s->mtx);
+                if (s->stopping || s->out_gen != handled) break;   // 纪元失效: 不再续读
+                b.io()->ep = h;
+                b.io()->flags = 0;
+                b.io()->length = s->dev->ep_out.wMaxPacketSize;
+            }
+            if (ioctl(s->fd, USB_RAW_IOCTL_EP_READ, b.io()) < 0) break;   // 重枚举/停机/总线错误
+            s->outs.fetch_add(1, std::memory_order_relaxed);
+        }
+        {
+            std::lock_guard<std::mutex> lk(s->mtx);
+            s->out_reading = false;
+        }
+        s->out_cv.notify_all();
+    }
+}
+
 // ---- 生命周期 --------------------------------------------------------------
 bool usbraw_start(UsbRawSession& s, const UsbRawDeviceDef& dev) {
     if (dev.config_len > USBRAW_DESC_MAX || dev.report_desc_len > USBRAW_DESC_MAX) {
         std::cerr << "❌ 设备定义描述符超应答缓冲上限 (" << USBRAW_DESC_MAX << "B)\n";
         return false;
     }
-    if (dev.ep_in.wMaxPacketSize == 0 || dev.ep_in.wMaxPacketSize > USBRAW_PKT_MAX) {
+    if (dev.ep_in.wMaxPacketSize == 0 || dev.ep_in.wMaxPacketSize > USBRAW_PKT_MAX
+        || (dev.has_ep_out && (dev.ep_out.wMaxPacketSize == 0
+                               || dev.ep_out.wMaxPacketSize > USBRAW_PKT_MAX))) {
         std::cerr << "❌ 设备定义端点包长非法 (须 1.." << USBRAW_PKT_MAX << ")\n";
         return false;
     }
@@ -442,10 +588,15 @@ bool usbraw_start(UsbRawSession& s, const UsbRawDeviceDef& dev) {
 
     s.ctrl_th = std::thread(ctrl_loop, &s);
     s.send_th = std::thread(send_loop, &s);
+    if (dev.has_ep_out) s.out_th = std::thread(out_loop, &s);
     std::cout << "✅ raw_gadget 会话: UDC " << init.device_name
               << " (driver " << init.driver_name << ", "
               << (dev.speed == USB_SPEED_FULL ? "full" : dev.speed == USB_SPEED_HIGH ? "high" : "?")
-              << "-speed, " << (int)vbus_2ma * 2 << "mA)\n";
+              << "-speed, IN bInterval=" << (int)dev.ep_in.bInterval
+              << " → 轮询 " << (dev.speed == USB_SPEED_FULL
+                                    ? 1000 / (int)dev.ep_in.bInterval
+                                    : 8000 >> ((int)dev.ep_in.bInterval - 1))
+              << "Hz 上限, " << (int)vbus_2ma * 2 << "mA)\n";
     return true;
 }
 
@@ -455,14 +606,17 @@ void usbraw_stop(UsbRawSession& s) {
         if (s.stopping.exchange(true)) return;
     }
     s.cv.notify_all();
+    s.out_cv.notify_all();
     // 在途 ioctl 持有文件引用, close 无法驱动 release (见 "端点 ioctl 的唤醒信号"):
-    //   两个线程各自阻塞在自己的 ioctl 上, 一一叫回来再 close。
+    //   三个线程各自阻塞在自己的 ioctl 上, 一一叫回来再 close。
     wake_blocked_io(s.ctrl_th);
     wake_blocked_io(s.send_th);
+    wake_blocked_io(s.out_th);
     if (s.fd >= 0) close(s.fd);                           // close 即解绑 UDC (见文件头)
     s.fd = -1;
     if (s.ctrl_th.joinable()) s.ctrl_th.join();
     if (s.send_th.joinable()) s.send_th.join();
+    if (s.out_th.joinable()) s.out_th.join();
 }
 
 void usbraw_submit(UsbRawSession& s, const uint8_t* rpt, uint16_t len) {
@@ -474,6 +628,7 @@ void usbraw_submit(UsbRawSession& s, const uint8_t* rpt, uint16_t len) {
         s.slot_len = len;
         s.slot_fresh = true;
     }
+    s.submits.fetch_add(1, std::memory_order_relaxed);
     s.cv.notify_one();
 }
 
