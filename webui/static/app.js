@@ -89,6 +89,17 @@ async function api(path, opts) {
 
 /* ================= 参数定义 (ⓘ 文案与热/冷标记) ================= */
 const PARAM_DEFS = [
+  { group: "输出模式与设备", key: "output_mode", label: "输出模式", type: "select", options: ["hid", "pad", "p5g"], hot: false,
+    labels: { hid: "hid — USB 鼠标 → PC", pad: "pad — XInput 手柄 → PC", p5g: "p5g — P5 General → PS5" },
+    info: "输出通道, 三选一互斥, 各自独占 UDC。hid: 通用 USB 鼠标, 游戏内鼠标灵敏度生效 (读鼠标, 用 -D 选设备)。pad: 物理手柄全透传 + 控制律注入右摇杆, 本机呈现微软有线 360 手柄 (0x045E/0x028E), 宿主 XInput 直接认。p5g: 同一输入/合并/标定链面向 PS5, 本机呈现 P5 General 手柄 (0x2B81/0x0101), 且需要真加密狗插在本机 USB 口作签名协处理器 —— 每份报告经它签名后才上线, 缺席时线上不产生任何报告。手柄模式读手柄、不读鼠标; hid 读鼠标、不碰手柄。❄ 冷参数 (它决定整条后端), 下次启动生效。" },
+  { group: "输出模式与设备", key: "mouse_keyword", label: "鼠标匹配子串 -D", type: "text", hot: false, showIfMode: ["hid"],
+    info: "按 /dev/input/by-id 的子串挑鼠标 (留空 = 任一 *-event-mouse, 取字典序首个)。注意: 手柄插着时它的辅助鼠标接口也匹配空模式, 想让人手通道干净就在这里点名真鼠标。多个命中会被固件判为错误并列出候选。❄ 冷参数, 下次启动生效。" },
+  { group: "输出模式与设备", key: "pad_keyword", label: "手柄匹配子串 -P", type: "text", hot: false, showIfMode: ["pad", "p5g"],
+    info: "按 /dev/input/by-id 的子串挑手柄 (留空 = 任一 *-event-joystick 节点; P5 General 加密狗自身的节点已被固件排除)。手柄的额外按键可能挂在同一个 USB 设备的第二个接口上, 固件按 VID:PID 找齐兄弟节点一并读取, 所以这里点名手柄本体即可。❄ 冷参数, 下次启动生效。" },
+  { group: "输出模式与设备", key: "pad_trig_thr", label: "手柄触发阈值 -T", type: "num", min: 0, max: 100, step: 1, unit: "%", hot: true, showIfMode: ["pad", "p5g"],
+    info: "手柄扳机 (RT/LT 两键共享) 的自瞄触发门槛, 按满量程百分比。它只门控「自瞄认为扳机按下了没有」, 再与 -k 的 fire/ads/both 语义一起决定开火/开镜; 扳机模拟量本身 1:1 透传给游戏, 不过阈值也不 reshape。默认 6 = 该手柄扳机实测 flat 15/255 的上取整 (低于它的读数只在噪声里抖)。手柄换型后按新 flat 调。🔥 热参数 (padthr), 保存即生效。" },
+  { group: "输出模式与设备", key: "pad_dump", label: "合并态调试输出 --pad-dump", type: "bool", hot: false, showIfMode: ["pad", "p5g"],
+    info: "开启后每 ≥50ms 在日志打一行合并后的逻辑态 (rx/ry = 人手 + 注入, 带 fire/ads/aim_gate)。这是分辨「注入没到游戏」还是「律根本没下命令」的唯一手段; 标定期打印的就是激励波形。只想正常玩时关掉。❄ 冷参数, 下次启动生效。" },
   { group: "瞄准", key: "model", label: "模型 engine", type: "engine", hot: false,
     info: "TensorRT engine 模型 (engine/ 下选择)。engine 与本机 GPU/TRT 版本绑定, 换机或升级 TRT 后需重新 convert; onnx 比对应 engine 新时「模型与运维」页会提示过期。冷参数, 下次启动生效。" },
   { group: "瞄准", key: "conf", label: "置信度阈值", type: "num", min: 0, max: 1, step: 0.01, hot: true,
@@ -366,14 +377,27 @@ function renderRunTab() {
   // 状态卡
   const tel = S.state.telemetry, p = curProfile();
   const model = S.params && S.params.model ? String(S.params.model).split("/").pop() : "（未选）";
-  const calib = inst.calib_live || (p ? p.calib : null);
+  // 运行中的实例有自己的模式与标定回执; 没在跑就看当前选中的 profile
+  const runProf = (inst.state === "running" && inst.profile && !inst.adopted)
+    ? profsSafe().find(x => x.file === inst.profile) : null;
+  const calibProf = runProf || p;
+  const mode = (calibProf && calibProf.script_params && calibProf.script_params.output_mode)
+    || (S.params && S.params.output_mode) || "hid";
+  const lKey = (mode === "pad" || mode === "p5g") ? "l_pad" : "l_hid";
+  const lVar = lKey === "l_pad" ? "L_EST_PAD" : "L_EST";
+  const calib = inst.calib_live && inst.calib_live.l != null ? inst.calib_live
+              : (calibProf ? calibProf.calib : null);
   const soc = tel && tel.soc_temp != null ? tel.soc_temp : null;
   const cap = inst.capture;
   const capTotal = cap ? cap.fire + cap.det + cap.auto : null;
   const capSmall = cap ? "fire " + cap.fire + " · det " + cap.det + " · auto " + cap.auto
                        : (inst.adopted ? "认领实例无日志" : "");
   const mi = inst.model_info;
+  const MODE_LABEL = { hid: "hid — 鼠标 → PC", pad: "pad — XInput 手柄 → PC",
+                       p5g: "p5g — P5 General → PS5" };
   const cards = [
+    { k: "输出模式", v: esc(mode), small: mode === "hid" ? "-D 选鼠标" : "-P/-T 选手柄",
+      t: MODE_LABEL[mode] || mode },
     { k: "模型 (选中)", v: esc(model) },
     { k: "模型架构", v: mi ? esc(mi.arch) : "—", small: mi && mi.classes != null ? mi.classes + " 类" : "", t: "每次启动从固件控制台输出抓取; v8 与 v11 在输出层不可区分, 固件打印 YOLOv8/11" },
     { k: "输入尺寸", v: mi ? mi.size : "—", small: mi ? "px" : "", t: "模型输入分辨率, 每次启动从固件控制台输出抓取" },
@@ -384,7 +408,9 @@ function renderRunTab() {
     { k: "GPU", v: tel && tel.gpu != null ? tel.gpu : "—", small: "%" },
     { k: "内存", v: tel && tel.mem ? tel.mem.percent : "—", small: tel && tel.mem ? "· " + tel.mem.used_mb + "MB" : "" },
     { k: "SoC 温度", v: soc != null ? soc.toFixed(0) : "—", small: "°C", cls: soc >= 85 ? "err" : soc >= 70 ? "warn" : "" },
-    { k: "标定延迟 L", v: calib && calib.l != null ? calib.l : "—", small: "ms · " + (inst.calib_live ? "运行中回执" : "脚本值"), t: "标定量 (唯一): 环路延迟 L (ms), 双侧键长按 5s 标定后回写脚本; 手感由「拉枪速度」那组的四个倍率调 — 固件不写它们" },
+    { k: "标定延迟 L (" + esc(lVar) + ")", v: calib && calib[lKey] != null ? calib[lKey] : "—",
+      small: "ms · " + (inst.calib_live ? "运行中回执" : "脚本值"),
+      t: "本模式的延迟: " + lVar + " (hid 与手柄模式各一条, 互不覆盖)。标定只出这一个量, 由它导出控制律带宽; 手感由「拉枪速度」那组的四个倍率调 — 固件不写它们。" },
     { k: "热参数通道", v: inst.state === "running" ? (inst.hot_capable ? "已启用" : "不可用") : (S.state.scan.binary && S.state.scan.binary.hot_capable ? "固件支持" : "固件不支持"), small: inst.hot_port ? ":" + inst.hot_port : "", cls: (inst.state === "running" && !inst.hot_capable) ? "warn" : (inst.hot_capable ? "ok" : "") },
   ];
   $("#statusCards").innerHTML = cards.map(c =>
@@ -402,6 +428,19 @@ function renderRunTab() {
     rb.textContent = "该实例不是本 WebUI 启动的 (认领): 日志不可见; 按【启动】以当前设置接管";
     rb.className = "banner";
   } else rb.classList.add("hidden"), rb.className = "banner hidden";
+
+  // 标定卡片: 触发方式按模式给 —— hid 只有鼠标双侧键长按, 手柄模式还有这个按钮
+  const gamepad = (mode === "pad" || mode === "p5g");
+  $("#btnCalib").disabled = !(gamepad && inst.state === "running" && !inst.adopted
+                              && inst.hot_capable);
+  $("#calibMode").textContent = MODE_LABEL[mode] || mode;
+  $("#calibVar").textContent = lVar;
+  $("#calibHint").textContent = !gamepad
+    ? "hid 的触发是鼠标双侧键长按 5 秒 (没有按钮入口): 游戏内对准有细节的静止背景, 双手离开控制器后按住双侧键不放。"
+    : inst.state !== "running" ? "先在【启动】里跑起一个本模式实例, 再从这里触发。"
+    : inst.adopted ? "运行中的是认领实例 (不知其读的是哪个 profile), 不盲发热参; 按【启动】接管后即可触发。"
+    : !inst.hot_capable ? "运行中的固件是旧版 (无热参数通道): 重编译固件后启动即可用按钮。"
+    : "点此按钮, 或在手柄上长按 L3+R3 5 秒。激励期间程序独占右摇杆且人手通道归中 —— 准星会按计划摆动, 那是测量不是失控; 全程几十秒, 结论与逐级读数看日志的 [标定] 行。";
 
   // 启动命令预览 (懒加载)
   $("#cmdDetails").querySelector("summary").innerHTML =
@@ -501,6 +540,8 @@ async function pollCapFolder() {
 /* ================= 渲染: 参数页 ================= */
 function paramRow(d) {
   if (d.showIf && !S.params[d.showIf]) return "";
+  // 模式相关的行只在当前输出模式下有意义 (hid 用 -D; pad/p5g 用 -P/-T/--pad-dump)
+  if (d.showIfMode && !d.showIfMode.includes(S.params.output_mode)) return "";
   const v = S.params[d.key];
   // 运行中的固件不支持热参数 → 🔥 置灰并提示需重编译 (不盲发, 下次启动生效)
   const hotDead = d.hot && S.state.instance.state === "running" &&
@@ -518,6 +559,8 @@ function paramRow(d) {
   } else if (d.type === "select") {
     ctl = `<select data-pk="${d.key}">` + d.options.map(o =>
       `<option value="${esc(o)}"${String(v) === String(o) ? " selected" : ""}>${esc(d.labels ? d.labels[o] || o : o)}</option>`).join("") + `</select>`;
+  } else if (d.type === "text") {
+    ctl = `<input type="text" data-pk="${d.key}" value="${esc(v == null ? "" : v)}" spellcheck="false" placeholder="留空 = 任意设备 (取字典序首个)">`;
   } else if (d.type === "bool") {
     ctl = `<label class="switch"><input type="checkbox" data-pk="${d.key}"${v ? " checked" : ""}><span class="tr"></span></label>`;
   } else if (d.type === "engine") {
@@ -634,6 +677,17 @@ async function stopInstance() {
     await api("/api/instance/stop", { method: "POST" });
     toast("已发送停止 (SIGTERM → 超时 SIGKILL)", "ok");
   } catch (e) { toast("停止失败: " + e.message, "err"); }
+}
+
+async function triggerCalib() {
+  if (!confirm("让运行中的实例跑一轮标定?\n\n期间请双手离开控制器 (手柄模式程序会独占右摇杆), "
+               + "游戏内保持有细节的静止背景。准星会按计划摆动几十秒。"))
+    return;
+  try {
+    await api("/api/instance/calib", { method: "POST" });
+    toast("标定请求已发出 (热参 padcalib=1) — 生效与结论看日志 [标定] 行", "ok");
+    showTab("run");
+  } catch (e) { toast("标定触发失败: " + e.message, "err"); }
 }
 
 /* ================= 渲染: 模型与运维 ================= */
@@ -859,6 +913,7 @@ function bindEvents() {
   $("#profileSel").addEventListener("change", e => selectProfile(e.target.value));
   $("#btnStart").addEventListener("click", startInstance);
   $("#btnStop").addEventListener("click", stopInstance);
+  $("#btnCalib").addEventListener("click", triggerCalib);
   $("#btnSave").addEventListener("click", () => saveProfile().catch(e2 => toast("保存失败: " + e2.message, "err")));
   $("#btnSave2").addEventListener("click", () => saveProfile().catch(e2 => toast("保存失败: " + e2.message, "err")));
   $("#btnRevert").addEventListener("click", () => selectProfile(S.selected, { force: true }));
@@ -877,6 +932,7 @@ function bindEvents() {
       S.params[k] = e.target.checked;
       if (d.captureSwitch) renderParams();          // 开关控制整组显隐
     } else S.params[k] = e.target.value;
+    if (k === "output_mode") renderParams();        // 模式决定 -D 与 -P/-T 哪一组可见
     if (d.type !== "bool") markDirtyLite(k);
     markDirty();
   });

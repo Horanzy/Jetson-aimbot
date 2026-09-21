@@ -9,6 +9,8 @@
 #  控制律带宽由标定延迟 L 自动导出, 无手调参数 —— 换游戏只需重标定, 不用调律。
 #  路径全部相对脚本自身解析 (realpath 向上找 ROOT), 整个目录可以随意移动/改名。
 #
+#  每个手改量都有守卫 (${VAR:-默认}): 本文件少写任何一行, 脚本照样能起。
+#
 #  标定: 游戏内对准有细节的静止背景, 双手离开控制器后长按触发键 5 秒 —— hid = 鼠标双侧键,
 #        手柄模式 = L3+R3 (或 webui 的「开始标定」按钮)。程序按轴给出交替激励 (行程到位即停,
 #        段后停顿), 块相位相关测背景位移, 三个独立读数 (尾迹和 = 主读数 / 起始沿 / 停止沿)
@@ -17,77 +19,87 @@
 #        速度一概不标: 手感由下面四个倍率调。
 # ==============================================================================
 
+# ==============================================================================
+#  下面这一行行是模板的手改量: 改这里。每个默认值都以 ${VAR:-默认} 的形式出现在两处 ——
+#  这里 (看得见、改得动) 和最后那条命令行 (兜底)。两处是同一个数, 兜底只在下述两种情况下
+#  生效: 本文件被整行删掉某项, 或这份脚本是更早抄下来的、还没有这个旋钮。于是"少写一行"
+#  只会退回默认值, 永远不会启动失败。
+# ==============================================================================
+
 # ---- 路径 ----
 ROOT="$(cd "$(dirname "$(realpath "$0")")/../.." && pwd)"
 APP="$ROOT/bin/aimbot"
-MODEL_PATH="$ROOT/engine/example.engine"   # ← 改成 engine/ 下你实际转好的模型
+MODEL_PATH="${MODEL_PATH:-$ROOT/engine/example.engine}"  # ← 改成 engine/ 下你实际转好的模型
 
-# ---- 输出模式 (hid = USB 鼠标 (PC 游戏内灵敏度生效) / pad = XInput 手柄 (PC) /
-#      p5g = P5General 加密狗 (PS5); 互斥, 一次运行只居其一) ----
-# 手柄模式 (pad / p5g): 物理手柄全透传 (按键/摇杆/扳机模拟量 1:1, 扳机只有"是否
-#      触发"过阈值), 控制律期望速度按逐轴有效满偏屏速折算成右摇杆注入偏转与人类
-#      通道合并; 速度帽逐轴 = min(-x, 该轴有效满偏屏速)。pad 以 raw_gadget 呈现
-#      微软有线 360 手柄 (0x045E/0x028E) 给宿主, 宿主侧即 XInput 手柄。
-# p5g 面向 PS5: 同一输入/合并/标定链, 设备口呈现 P5 General 手柄 (0x2B81/0x0101),
-#      真加密狗插 Jetson 的普通 USB 口作签名协处理器 —— 每份报告先交它签名, 只有
-#      它返回的字节才发上线; 加密狗不在位时线上不产生任何报告。
-OUTPUT_MODE="hid"   # hid / pad / p5g
-PAD_KEYWORD=""      # pad/p5g: 手柄 by-id 匹配子串 (空 = 任意 *-event-joystick 节点)
-PAD_TRIG_THR=6      # pad/p5g: 触发阈值 % (RT/LT 两键共享; 默认 6 = 该手柄扳机实测 flat
-                    #      15/255 的上取整; 只作用于触发判定, 扳机模拟量仍 1:1 透传)
-MOUSE_KEYWORD=""    # hid: 鼠标 by-id 匹配子串 (空 = 任意 *-event-mouse 取字典序首个;
-                    #      手柄插着时建议指定, 否则可能选中手柄的附属鼠标接口)
-PAD_DUMP="n"        # pad/p5g: y = 每 ≥50ms 打一行合并逻辑态 [PAD] lx/ly/rx/ry/lt/rt/
-                    #      fire/ads/aim_gate — 现场诊断注入用 (看命令波形, 不影响行为)
+# ---- 输出模式 ----
+# 三个模式互斥, 各自独占 UDC; 一次运行只居其一 (hid 读鼠标, 手柄模式读手柄)。
+#   hid = 通用 USB 鼠标 → PC 游戏 (游戏内鼠标灵敏度生效; -D 选鼠标)
+#   pad = 物理手柄全透传 + 控制律注入右摇杆 → PC; 本机呈现微软有线 360 手柄
+#         (0x045E/0x028E), 宿主的 XInput 栈直接把它当手柄读
+#   p5g = 同一输入/合并/标定链 → PS5; 本机呈现 P5 General 手柄 (0x2B81/0x0101),
+#         真加密狗插本机 USB 口作签名协处理器 —— 每份报告先交它签名, 只有它返回的
+#         字节才发上线; 加密狗不在位时线上不产生任何报告
+# 手柄模式 (pad / p5g): 按键/摇杆/扳机模拟量 1:1 透传, 扳机只有"是否触发"过阈值;
+#   控制律期望速度按逐轴有效满偏屏速折算成右摇杆注入偏转, 与人类通道径向合并。
+OUTPUT_MODE="${OUTPUT_MODE:-hid}"   # hid / pad / p5g
+PAD_KEYWORD="${PAD_KEYWORD:-}"      # pad/p5g: 手柄 by-id 匹配子串 (空 = 任意 *-event-joystick 节点;
+                                    #       P5 General 加密狗自身的节点已被固件排除)
+PAD_TRIG_THR="${PAD_TRIG_THR:-6}"   # pad/p5g: 触发阈值 % 满量程 (RT/LT 两键共享; 默认 6 = 该手柄
+                                    #       扳机实测 flat 15/255 的上取整; 只作用于触发判定,
+                                    #       扳机模拟量仍 1:1 透传; 热参 padthr)
+MOUSE_KEYWORD="${MOUSE_KEYWORD:-}"  # hid: 鼠标 by-id 匹配子串或 /dev/input/eventN (空 = 任意
+                                    #       *-event-mouse 取字典序首个; 手柄插着时建议指定,
+                                    #       否则可能选中手柄的附属鼠标接口)
+PAD_DUMP="${PAD_DUMP:-n}"           # pad/p5g: y = 每 ≥50ms 打一行合并逻辑态 (rx/ry/fire/ads/aim_gate)
+                                    #       — 现场诊断注入用 (看命令波形, 不影响行为)
 
 # ---- 自瞄参数 ----
-CLASS_ID=0          # 目标类别 (依模型标签: 0=头 1=身)
-CONF_THRESH=0.5     # 置信度阈值
-Y_OFFSET=65         # 瞄准高度 (0=脚 50=中心 65=胸颈 100=头)
-CAM_DEV="Hagibis"   # 采集卡: Hagibis / Asus (或 /dev/videoN)
-CAM_FPS=120         # 采集帧率: 120 / 60
-MAX_SPEED=2000      # 准星速度上限 px/s (= 屏幕速度上限 px/ms × 1000)
-                    # 取值依据: 屏幕速度 = 960·v_world/d_min (f≈960px@1080p/90°hFOV),
-                    # 准星必须至少赶上目标的屏幕速度, 否则饱和追赶、误差无界增长。
-                    # 2000 覆盖本库行为模型里最快的屏幕运动 (10m 冲刺 1.6 / 近距
-                    # 大跳 1.83 / 逼近 1.99 px/ms); 再高不再改变精度 (饱和于目标速度)。
-                    # 移动速度系统更快的游戏 (蹬墙/滑铲/突进爆发) 按同一公式往上加。
-AIM_KEY=both        # 触发键: fire / ads / both
-AIM_ENABLED=y       # 鼠标接管: n=纯透传 (不动鼠标, 检测/采集照常), webui 可运行中热切
-FOV_R=150           # FOV 半径 px (目标选取门兼积分器边界, webui 可热调)
-PREVIEW="n"         # 预览窗口: y / n
+CLASS_ID="${CLASS_ID:-0}"           # 目标类别 (依模型标签: 0=头 1=身)
+CONF_THRESH="${CONF_THRESH:-0.5}"   # 置信度阈值
+Y_OFFSET="${Y_OFFSET:-65}"          # 瞄准高度 (0=脚 50=中心 65=胸颈 100=头)
+CAM_DEV="${CAM_DEV:-Hagibis}"       # 采集卡: Hagibis / Asus (或 /dev/videoN)
+CAM_FPS="${CAM_FPS:-120}"           # 采集帧率: 120 / 60
+MAX_SPEED="${MAX_SPEED:-2000}"      # 准星速度上限 px/s (= 屏幕速度上限 px/ms × 1000)
+                                    # 取值依据: 屏幕速度 = 960·v_world/d_min (f≈960px@1080p/90°hFOV),
+                                    # 准星必须至少赶上目标的屏幕速度, 否则饱和追赶、误差无界增长。
+                                    # 2000 覆盖本库行为模型里最快的屏幕运动 (10m 冲刺 1.6 / 近距
+                                    # 大跳 1.83 / 逼近 1.99 px/ms); 再高不再改变精度 (饱和于目标速度)。
+                                    # 移动速度系统更快的游戏 (蹬墙/滑铲/突进爆发) 按同一公式往上加。
+AIM_KEY="${AIM_KEY:-both}"          # 触发键: fire / ads / both
+AIM_ENABLED="${AIM_ENABLED:-y}"     # 鼠标接管: n=纯透传 (不动鼠标, 检测/采集照常), webui 可运行中热切
+FOV_R="${FOV_R:-150}"               # FOV 半径 px (目标选取门兼积分器边界, webui 可热调)
+PREVIEW="${PREVIEW:-n}"             # 预览窗口: y / n
 
 # ---- 拉枪速度 (四个逐轴倍率, 唯一的手感旋钮; webui 可运行中热切) ----
 # 刻度: 整数, 100 = 基线, 与有效灵敏度成反比 —— 有效灵敏度 = 基线/(倍率/100)。
-#   倍率调大 = 同样的期望屏幕速度发出更多 counts = 屏幕跟得更快 = 拉枪更快,
+#   倍率调大 = 同样的期望屏幕速度发出更多 counts / 更大的摇杆偏转 = 屏幕跟得更快,
 #   每加 1 约快 1%, 所以调法是 105 / 109 这样走整数, 不是 1.05。
-#   有意义的带是 5..2000 (有效灵敏度 0.05–20 px/count); 越界会被夹取。
-# 基线: hid 是 1.0 px/count, 即 -l 那条延迟标定量之外本库唯一的灵敏度参照 —
-#   倍率 100 就是它。逐轴是因为同一灵敏度下垂直/水平的屏速比是游戏属性 (俯仰
-#   灵敏度常更低), 一个总倍率会把两轴绑死。
-# ADS 那一对在右键按住期间整套生效 (开镜灵敏度常设得较低, 故通常比腰射大)。
-SPDX=100            # 腰射 X 倍率 (热参 spdx)
-SPDY=100            # 腰射 Y 倍率 (y 轴常需更大值: 垂直灵敏度更低; 热参 spdy)
-ADS_SPDX=100        # ADS 键按住时 X 倍率 (热参 adsspdx)
-ADS_SPDY=100        # ADS 键按住时 Y 倍率 (热参 adsspdy)
+#   有意义的带是 5..2000 (有效灵敏度 0.05–20 px/count); 带外会被固件夹取到 [1, 10000]。
+# 基线: hid 是 1.0 px/count, pad 是满偏屏幕速度 3000 px/s —— 倍率 100 就是它们。
+#   逐轴是因为同一灵敏度下垂直/水平的屏速比是游戏属性 (俯仰灵敏度常更低), 一个总倍率会把两轴绑死。
+# ADS 那一对在 ADS 键 (右键 / LT) 按住期间整套生效 (开镜灵敏度常设得较低, 故通常比腰射大)。
+SPDX="${SPDX:-100}"                 # 腰射 X 倍率 (热参 spdx)
+SPDY="${SPDY:-100}"                 # 腰射 Y 倍率 (y 轴常需更大值: 垂直灵敏度更低; 热参 spdy)
+ADS_SPDX="${ADS_SPDX:-100}"         # ADS 键按住时 X 倍率 (热参 adsspdx)
+ADS_SPDY="${ADS_SPDY:-100}"         # ADS 键按住时 Y 倍率 (热参 adsspdy)
 
 # ---- 训练数据采集 (开关) ----
-CAPTURE="n"                 # y=开启截图采集  n=纯自瞄
-OUT_DIR="$ROOT/dataset"     # 输出目录 (自动建 fire/ det/ auto/ 子目录)
-CAP_FIRE=y                  # 源 fire: 开火瞬间截图 (按住左键期间按 FIRE_MS 间隔连拍)
-CAP_DET=y                   # 源 det: 检测到目标即拍 (YOLO 命中进 FOV, 受 COOLDOWN_MS 限制)
-CAP_AUTO=y                  # 源 auto: 定时截图 (无目标也拍, 背景负样本; 受 COOLDOWN_MS 限制)
-FIRE_MS=800                 # 开火截图间隔 ms
-AUTO_S=10                   # 定时截图间隔 s (随机 0.5x~1.5x)
-COOLDOWN_MS=800             # 检测/定时截图冷却 ms (开火不受限)
-JPEG_Q=95                   # JPEG 质量
+CAPTURE="${CAPTURE:-n}"                 # y=开启截图采集  n=纯自瞄
+OUT_DIR="${OUT_DIR:-$ROOT/dataset}"     # 输出目录 (自动建 fire/ det/ auto/ 子目录)
+CAP_FIRE="${CAP_FIRE:-y}"               # 源 fire: 开火瞬间截图 (按住左键期间按 FIRE_MS 间隔连拍)
+CAP_DET="${CAP_DET:-y}"                 # 源 det: 检测到目标即拍 (YOLO 命中进 FOV, 受 COOLDOWN_MS 限制)
+CAP_AUTO="${CAP_AUTO:-y}"               # 源 auto: 定时截图 (无目标也拍, 背景负样本; 受 COOLDOWN_MS 限制)
+FIRE_MS="${FIRE_MS:-800}"               # 开火截图间隔 ms
+AUTO_S="${AUTO_S:-10}"                  # 定时截图间隔 s (随机 0.5x~1.5x)
+COOLDOWN_MS="${COOLDOWN_MS:-800}"       # 检测/定时截图冷却 ms (开火不受限)
+JPEG_Q="${JPEG_Q:-95}"                  # JPEG 质量
 
 # ---- 标定结果 [首次运行前为固件默认值; 标定成功后自动回写本模式的那一条, 请勿手改] ----
 # 两个输出模式各有一条延迟: hid 用 L_EST, 手柄模式 (pad/p5g) 用 L_EST_PAD —— 互不覆盖,
 # 两条都喂给 -l (缺行/缺值时兜底 60.0, 等价于命令行不给 -l)。它只是占位: 没标定过就直接跑,
 # 准星跟随会明显偏慢或偏快。先标定 (只出延迟), 再用手感倍率调速度。
-L_EST=60.0
-L_EST_PAD=60.0
+L_EST="${L_EST:-60.0}"
+L_EST_PAD="${L_EST_PAD:-60.0}"
 
 # ==============================================================================
 sudo jetson_clocks
@@ -95,46 +107,46 @@ sudo bash "$ROOT/scripts/setup_mouse.sh"
 
 SCRIPT_PATH="$(realpath "$0")"
 
-# 模式参数: hid 用鼠标选择 (-D); pad/p5g 用手柄选择与触发阈值 (-M/-P/-T, 两者参数
-#   展开一致, 只换 -M 的值) — 两模式的标定量各写各的 VAR (L_EST / L_EST_PAD),
-#   这里按模式取对应的那条喂给 -l。
-PAD_KW_V="${PAD_KEYWORD:-}"
-PAD_THR_V="${PAD_TRIG_THR:-6}"
-MOUSE_KW_V="${MOUSE_KEYWORD:-}"
-if [ "${OUTPUT_MODE:-hid}" = "pad" ] || [ "${OUTPUT_MODE:-hid}" = "p5g" ]; then
-  MODE_ARGS=(-M "${OUTPUT_MODE}" -P "$PAD_KW_V" -T "$PAD_THR_V")
-  L_V="${L_EST_PAD:-60.0}"
-  [ "${PAD_DUMP:-n}" = "y" ] && MODE_ARGS+=(--pad-dump)
-else
-  MODE_ARGS=(-D "$MOUSE_KW_V")
-  L_V="${L_EST:-60.0}"
-fi
+# 模式参数: hid 用鼠标选择 (-D); pad/p5g 用手柄选择与触发阈值 (-M/-P/-T; 两者展开一致,
+#   只换 -M 的值) —— 两模式的标定量各写各的 VAR, 这里按模式取对应的那条喂给 -l。
+MODE_ARGS=()
+case "${OUTPUT_MODE:-hid}" in
+  pad|p5g)
+    MODE_ARGS=(-M "${OUTPUT_MODE:-hid}" -P "${PAD_KEYWORD:-}" -T "${PAD_TRIG_THR:-6}")
+    [ "${PAD_DUMP:-n}" = "y" ] && MODE_ARGS+=(--pad-dump)
+    L_V="${L_EST_PAD:-60.0}"
+    ;;
+  *)
+    MODE_ARGS=(-D "${MOUSE_KEYWORD:-}")
+    L_V="${L_EST:-60.0}"
+    ;;
+esac
 
 CAPTURE_ARGS=()
-if [ "$CAPTURE" = "y" ]; then
+if [ "${CAPTURE:-n}" = "y" ]; then
   CAP_SRC=""
-  [ "$CAP_FIRE" = "y" ] && CAP_SRC="${CAP_SRC:+$CAP_SRC,}fire"
-  [ "$CAP_DET"  = "y" ] && CAP_SRC="${CAP_SRC:+$CAP_SRC,}det"
-  [ "$CAP_AUTO" = "y" ] && CAP_SRC="${CAP_SRC:+$CAP_SRC,}auto"
-  CAPTURE_ARGS=(-o "$OUT_DIR" -F "$FIRE_MS" -A "$AUTO_S" -C "$COOLDOWN_MS" \
-                -q "$JPEG_Q" -e "$CAP_SRC")
+  [ "${CAP_FIRE:-y}" = "y" ] && CAP_SRC="${CAP_SRC:+$CAP_SRC,}fire"
+  [ "${CAP_DET:-y}"  = "y" ] && CAP_SRC="${CAP_SRC:+$CAP_SRC,}det"
+  [ "${CAP_AUTO:-y}" = "y" ] && CAP_SRC="${CAP_SRC:+$CAP_SRC,}auto"
+  CAPTURE_ARGS=(-o "${OUT_DIR:-$ROOT/dataset}" -F "${FIRE_MS:-800}" -A "${AUTO_S:-10}" \
+                -C "${COOLDOWN_MS:-800}" -q "${JPEG_Q:-95}" -e "$CAP_SRC")
 fi
 
 sudo "$APP" \
-  -m "$MODEL_PATH" \
-  -c "$CLASS_ID" \
-  -t "$CONF_THRESH" \
-  -y "$Y_OFFSET" \
-  -d "$CAM_DEV" \
-  -f "$CAM_FPS" \
-  -x "$MAX_SPEED" \
-  -l "$L_V" \
+  -m "${MODEL_PATH:-$ROOT/engine/example.engine}" \
+  -c "${CLASS_ID:-0}" \
+  -t "${CONF_THRESH:-0.5}" \
+  -y "${Y_OFFSET:-65}" \
+  -d "${CAM_DEV:-Hagibis}" \
+  -f "${CAM_FPS:-120}" \
+  -x "${MAX_SPEED:-2000}" \
+  -l "${L_V:-60.0}" \
   -S "$SCRIPT_PATH" \
-  --spd "$SPDX,$SPDY" \
-  --ads-spd "$ADS_SPDX,$ADS_SPDY" \
-  -k "$AIM_KEY" \
-  -a "$AIM_ENABLED" \
-  -r "$FOV_R" \
-  -v "$PREVIEW" \
+  --spd "${SPDX:-100},${SPDY:-100}" \
+  --ads-spd "${ADS_SPDX:-100},${ADS_SPDY:-100}" \
+  -k "${AIM_KEY:-both}" \
+  -a "${AIM_ENABLED:-y}" \
+  -r "${FOV_R:-150}" \
+  -v "${PREVIEW:-n}" \
   "${MODE_ARGS[@]}" \
   "${CAPTURE_ARGS[@]}"

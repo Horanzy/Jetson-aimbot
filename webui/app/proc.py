@@ -1,8 +1,14 @@
 """实例管理: 单实例状态机 + 启动序列 + 日志环 + 孤儿认领。
 
 启动序列与 game 脚本完全同构: jetson_clocks → setup_mouse.sh → bin/aimbot
-(全量参数, -S 指向 profile 脚本使标定回写照旧落进脚本)。euid==0 时直接执行
-(推荐, systemd root 服务); 否则加 sudo 前缀 (需 NOPASSWD, 见 webui/README.md)。
+(全量参数, -S 指向 profile 脚本使标定回写照旧落进脚本)。命令行的中段由脚本的
+OUTPUT_MODE 决定 (hid: -D; pad/p5g: -M/-P/-T/--pad-dump), 延迟取本模式那条标定
+VAR (hid L_EST / 手柄 L_EST_PAD) —— 与脚本同一条规则, 不引入第二个事实源。
+
+权限: euid==0 (部署推荐形态: systemd root 服务) 时三步都直接执行; 否则给前两步加
+sudo 前缀 (需 NOPASSWD), aimbot 本身仍以服务身份运行 —— 它要的 /dev/raw-gadget
+权限由 setup_mouse.sh 每次 chmod 666 给出, /dev/input 则需要服务用户属于 input 组,
+否则手柄/鼠标节点一律读不到。
 
 状态机: stopped → starting → running → exited (→ stopped 由下次启动覆盖)。
 异常退出 (非用户停止且退出码非 0) 置 abnormal, UI 横幅可查。
@@ -51,7 +57,12 @@ def fmt_num(v):
 
 
 def build_argv(root: Path, params: dict, calib: dict, script_path: Path) -> list:
-    """拼装 aimbot 命令行 (与脚本同构)。calib 缺项时省略 -l, 固件按默认兜底。"""
+    """拼装 aimbot 命令行 (与 game 脚本逐项同构)。
+
+    输出模式决定中间那一段: hid 用 -D 选鼠标; pad/p5g 用 -M 选后端 + -P 选手柄 + -T
+    触发阈值 (pad/p5g 展开一致, 只换 -M 的值), 外加可选的 --pad-dump。延迟从本模式那条
+    标定 VAR 取 (hid → L_EST, pad/p5g → L_EST_PAD); 缺值时省略 -l, 固件按默认兜底。"""
+    mode = str(params.get("output_mode") or "hid")
     model = str(params.get("model") or "")
     model_abs = model if os.path.isabs(model) else str(root / model)
     argv = [str(root / "bin" / "aimbot"),
@@ -71,8 +82,16 @@ def build_argv(root: Path, params: dict, calib: dict, script_path: Path) -> list
             "-a", "y" if params.get("aim_enabled", True) else "n",
             "-r", fmt_num(params.get("fov", 150.0)),
             "-v", "y" if params.get("preview") else "n"]
-    if calib.get("l") is not None:
-        argv += ["-l", fmt_num(calib["l"])]
+    l_key = discover.mode_l_key(mode)
+    if calib.get(l_key) is not None:
+        argv += ["-l", fmt_num(calib[l_key])]
+    if mode in ("pad", "p5g"):
+        argv += ["-M", mode, "-P", str(params.get("pad_keyword") or ""),
+                 "-T", fmt_num(params.get("pad_trig_thr", 6.0))]
+        if params.get("pad_dump"):
+            argv.append("--pad-dump")
+    else:
+        argv += ["-D", str(params.get("mouse_keyword") or "")]
     if params.get("capture_enabled"):
         od = str(params.get("capture_dir") or "dataset")
         od_abs = od if os.path.isabs(od) else str(root / od)
@@ -214,8 +233,14 @@ class InstanceManager:
     def start(self, root: Path, profile: str, display_name: str,
               params: dict, calib: dict, script_path: Path):
         with self._lock:
+            # 【启动】= 以新设置重启 = 保存 + 清场 + 拉起: 在跑的实例 (含 SSH 手跑被认领的)
+            # 先停掉 —— 否则"按【启动】接管"只是一个不成立的提示。清场后 state 落到
+            # starting, 旧进程的 pump 线程收尾时按进程对象判别, 不会覆盖新状态。
             if self.state in RUNNING_STATES:
-                return False, "已有实例在启动或运行 (先停止, 或直接再点【启动】= 以新设置重启)"
+                self._append_log("■ 已有实例在跑 (%s): 先停止, 再以新设置启动" % self.state)
+                self.kill_all(root)
+                self._proc = None
+                self.pid = None
             bin_path = root / "bin" / "aimbot"
             if not bin_path.is_file():
                 return False, "bin/aimbot 不存在 —— 先在「模型与运维」页编译"
@@ -367,6 +392,8 @@ class InstanceManager:
             pass
         rc = proc.wait()
         with self._lock:
+            if self._proc is not proc:
+                return                       # 已被新的一次【启动】取代: 这次收尾不属当前实例
             self._proc = None
             self.pid = None
             self.ended_at = time.time()
@@ -426,6 +453,22 @@ class InstanceManager:
                 "exit_code": None, "exit_signal": signal.SIGTERM,
                 "abnormal": False, "duration_s": None,
             })
+
+    # ---------- 标定触发 ----------
+
+    def request_calib(self, hot_port_default: int):
+        """请求运行中的实例跑一轮标定: 热参 `padcalib=1` (固件一次消费即清, 进行中
+        到达的请求记一行丢弃、绝不重入)。只发给本 WebUI 启动且固件支持热参的实例 ——
+        认领实例不知道它读的是哪个脚本, 盲发一条请求等于替用户按下一个开关。"""
+        inst = self.snapshot()
+        if inst["state"] != "running":
+            return False, "实例未在运行 —— 标定要在运行中触发"
+        if inst["adopted"]:
+            return False, "认领实例 (非本 WebUI 启动): 不盲发热参; 按【启动】接管后即可触发"
+        if not inst["hot_capable"]:
+            return False, "运行中的固件不支持热参数通道 (旧版), 重编译后启动即可"
+        send_hot(inst["hot_port"] or hot_port_default, {"padcalib": "1"})
+        return True, ""
 
     # ---------- 孤儿认领 ----------
 

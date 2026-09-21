@@ -242,14 +242,17 @@ def _wire_value(pk: str, v):
 
 @app.put("/api/profiles/{stem}")
 def api_profile_put(stem: str, inp: ProfileIn):
-    """保存 = 原子写回脚本 (脚本 = 唯一事实源), 然后与脚本现值做热参差量下发。"""
+    """保存 = 原子写回脚本 (脚本 = 唯一事实源), 然后与脚本现值做热参差量下发。
+
+    提交体是**补丁**: 只校验并写回它点名的键, 其余 VAR 保持脚本现值 —— 一次只改 spd
+    的提交不会把别的 VAR 打回默认。"""
     p = _find_profile(stem)
     if p is None:
         raise HTTPException(404, "未知的游戏 profile: %s" % stem)
     script_path = S.root() / "scripts" / "game" / (stem + ".sh")
     old_params, _ = discover.parse_script(script_path, S.root())
-    new_params = discover.validate_params(inp.params if inp.params is not None
-                                          else old_params, S.root())
+    new_params = dict(old_params)
+    new_params.update(discover.validate_params(inp.params or {}, S.root(), partial=True))
     try:
         discover.write_script_params(script_path, new_params, S.root())
     except OSError as e:
@@ -328,6 +331,27 @@ def api_instance_start(body: dict):
 @app.post("/api/instance/stop")
 def api_instance_stop():
     ok, err = S.inst.stop(S.root())
+    if not ok:
+        raise HTTPException(409, err)
+    return {"ok": True}
+
+
+@app.post("/api/instance/calib")
+def api_instance_calib():
+    """请求运行中的实例跑一轮标定 (热参 padcalib=1, 固件一次消费即清)。
+
+    只有手柄模式有这条入口 —— hid 的触发是鼠标双侧键长按 5 秒, 固件不给按钮路径。
+    落地量永远是延迟 (hid 写 L_EST, pad/p5g 写 L_EST_PAD), 结论看日志的 `[标定]` 行。"""
+    inst = S.inst.snapshot()
+    if inst["state"] != "running":
+        raise HTTPException(409, "实例未在运行 —— 标定要在运行中触发")
+    stem = inst["profile"]
+    p = _find_profile(stem) if stem else None
+    if p is None:
+        raise HTTPException(409, "认领实例 (非本 WebUI 启动): 不知道它读的是哪个 profile, 不盲发")
+    if (p["script_params"] or {}).get("output_mode") not in ("pad", "p5g"):
+        raise HTTPException(409, "hid 模式的触发是鼠标双侧键长按 5 秒; 热参标定入口只给手柄模式")
+    ok, err = S.inst.request_calib(S.cfg["hot_port"])
     if not ok:
         raise HTTPException(409, err)
     return {"ok": True}

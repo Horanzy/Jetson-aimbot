@@ -36,10 +36,76 @@ scripts/   compile.sh / convert.sh (ONNX→engine) / setup_mouse.sh (raw_gadget 
 docs/      p5general/ — the P5 General wire protocol (zh-CN/en), transcribed from the
            GP2040-CE reference firmware and hardware-verified against the real dongle
 arena/     pure-Python control-law simulator + benchmark suite
+webui/     browser control panel (FastAPI + vanilla JS): profile params, start/stop,
+           hot-param push, calibration button, model/compile tasks, log stream
 build/     per-TU object files (not committed)
 engine/    TensorRT engines (not committed)
 onnx/      ONNX models (not committed)
 ```
+
+## Parameter face
+
+Every per-game value lives in the launcher script (`scripts/game/<game>.sh`, a copy of
+`template.sh.example`), and **the script is the single source of truth** — the WebUI only rewrites
+the values of the VARs it knows and leaves every other line byte-identical. Each hand-edited value
+carries a guard default (`CLASS_ID="${CLASS_ID:-0}"`), so a script missing any single line still
+launches; the WebUI reads the guard's effective value, not its literal text.
+
+| Script VAR | CLI | Meaning |
+|---|---|---|
+| `OUTPUT_MODE` | `-M` | `hid` / `pad` / `p5g` — mutually exclusive, each owns the UDC |
+| `MOUSE_KEYWORD` | `-D` | hid: mouse `by-id` match substring (empty = lexicographically first `*-event-mouse`) |
+| `PAD_KEYWORD` | `-P` | pad/p5g: gamepad match substring (empty = any `*-event-joystick`; the dongle's own node is excluded) |
+| `PAD_TRIG_THR` | `-T` | pad/p5g: trigger threshold in % of full scale, shared by RT and LT; it gates the aim-trigger decision only — the analog value passes through 1:1 (hot param `padthr`) |
+| `PAD_DUMP` | `--pad-dump` | pad/p5g: log the merged logical state every ≥50 ms (injection debugging) |
+| `SPDX` / `SPDY` | `--spd` | hip-fire pull-speed ratio, per axis (integer; `100` = baseline, larger = faster, meaningful band `5..2000`) |
+| `ADS_SPDX` / `ADS_SPDY` | `--ads-spd` | the same pair while the ADS key is held |
+| `MAX_SPEED` | `-x` | crosshair speed cap px/s (derivation in the template) |
+| `L_EST` / `L_EST_PAD` | `-l` | the calibrated loop delay, **one per output mode** — the only quantity the firmware ever writes back |
+| `AIM_KEY` / `AIM_ENABLED` / `FOV_R` / `PREVIEW` | `-k` / `-a` / `-r` / `-v` | trigger key, mouse takeover, FOV radius, preview |
+| `CAPTURE` `CAP_FIRE` `CAP_DET` `CAP_AUTO` `OUT_DIR` `FIRE_MS` `AUTO_S` `COOLDOWN_MS` `JPEG_Q` | `-o` `-e` `-F` `-A` `-C` `-q` | training-data collection |
+
+A per-axis `-s`/`S_EST`, a `-G`/`PAD_STICK_GAIN` entry and the old single `vcoef` do not exist: the
+per-game feel is the four integer ratios above, each an inverse factor on the effective gain
+(`base × 100 / ratio`), and both bases are compile-time constants (`S_HID_BASE`, `GAIN_PAD_BASE`).
+The base only decides how close a ratio's first guess is; the ratios are what gets dialled, and the
+injection, the ledger→pixel scale and the own-motion compensation all consume the same per-axis
+effective gain, so they cannot desynchronize.
+
+## Hot-parameter channel
+
+The binary opens a **localhost-only** UDP channel (`127.0.0.1:47700`, datagrams of
+`key=value;key=value`) so a running instance can be retuned without a restart. Whitelisted keys —
+`t` `y` `x` `fov` `padthr` `spdx` `spdy` `adsspdx` `adsspdy` `k` `aim` `cap_fire` `cap_det`
+`cap_auto` — are clamped by the firmware as well, so the sender is never trusted; `padcalib=1`
+requests one calibration round (consumed once; a request arriving mid-run is logged and dropped,
+never re-entrant). Structural constants (PM/ζ/FF gain/CUSUM thresholds) are compile-time and
+deliberately absent from the wire. Every applied key is echoed as a `[热参] …` log line; the full
+table with clamps is in `webui/README.md`.
+
+## WebUI
+
+```bash
+cd <deploy-root>/webui
+sudo python3 -m pip install -r requirements.txt
+sudo bash deploy/install.sh           # systemd unit + autostart; token printed in the journal
+sudo journalctl -u aimbot-webui -n 20 --no-pager   # first-run token → set a password in the browser
+```
+
+It is an **orchestrator, not a replacement**: it runs the same three steps a launcher does
+(`jetson_clocks` → `setup_mouse.sh` → `bin/aimbot` with the full parameter set, `-S` pointing at the
+profile script so calibration writes back to the same place). Adding a game means copying
+`scripts/game/template.sh.example` → `<game>.sh` (the WebUI has a "copy profile" button too); the new
+script shows up in the profile list on the next scan. The output mode is a field of the profile, and
+the rows a mode owns (`-D` for hid, `-P`/`-T`/`--pad-dump` for pad/p5g) are shown only for that mode
+— switching it changes which device VARs reach the generated command line, and the `-l` source VAR
+switches with it (`L_EST` ↔ `L_EST_PAD`). Calibration runs from the launcher's key hold (both side
+keys for hid, L3+R3 for the gamepad modes) or, for pad/p5g, from the WebUI's 「开始标定」 button (hot
+param `padcalib=1`). The `[标定]` lines, the per-level readings and the verdict stay visible in the
+page's log stream; the 60 s report-rate lines (`[USB-HID]`/`[PAD-USB]`), `[AI FPS]` and `[SAVE]` are
+filtered out of it (they appear as cards and history instead, and the raw ring is still in the
+download). `webui/README.md` is the operator manual (permissions, security, discovery model,
+hot-param table, acceptance checklist).
 
 ## Build & run (on the Jetson)
 
