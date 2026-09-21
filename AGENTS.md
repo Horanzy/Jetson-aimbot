@@ -12,7 +12,7 @@ Capture card (UVC 1080p NV12) → GStreamer nvvidconv → CUDA preprocess → Te
 
 No hand-tuned gains: a bilateral side-key trigger runs auto-calibration, estimating sensitivity s (px/count) and loop delay L (ms) online. Adapts to PC / PS5 / 60fps / 120fps.
 
-**Control law**: the single program `src/aimbot.cu` uses **ff_pi_acc** (pole-placement PI + type-2 velocity feedforward with direction-contradiction CUSUM velocity reset and detection-gap FF decay, plus an innovation-mean â channel that removes the α-β structural lag on accelerating targets) — the convergence bandwidth `wn` is derived from the calibrated delay `L` via phase margin (`wn=(90°−PM)π/180/L`, PM=50°), **no hand-tuned magic numbers**, good generalization. The same binary has **optional training-data collection** (enabled with `-o`, otherwise pure aimbot). All control-law exploration/comparison/tuning happens in the pure-Python `arena/` simulation (this machine cannot compile .cu).
+**Control law**: the firmware (`src/main.cu` with `src/core/` and `src/io/`) uses **ff_pi_acc** (pole-placement PI + type-2 velocity feedforward with direction-contradiction CUSUM velocity reset and detection-gap FF decay, plus an innovation-mean â channel that removes the α-β structural lag on accelerating targets) — the convergence bandwidth `wn` is derived from the calibrated delay `L` via phase margin (`wn=(90°−PM)π/180/L`, PM=50°), **no hand-tuned magic numbers**, good generalization. The same binary has **optional training-data collection** (enabled with `-o`, otherwise pure aimbot). All control-law exploration/comparison/tuning happens in the pure-Python `arena/` simulation (this machine cannot compile .cu).
 
 ## Author's requirements (binding)
 
@@ -74,7 +74,7 @@ clearly apart; "should be better" is not a result — give a number or write "un
 **7. Documentation and code move together.** A changed constant, default, CLI flag or module
 list updates its prose, its tables and its docstring defaults in the same edit.
 
-**8. `src/aimbot.cu` is edited here, verified on the Jetson.** This machine cannot compile or
+**8. `src/` is edited here, verified on the Jetson.** This machine cannot compile or
 run it; every `.cu` change needs a rebuild and on-device validation on the Jetson and is
 never reported as verified from here.
 
@@ -85,9 +85,12 @@ never reported as verified from here.
 
 ```
 <deploy-root>/
-├── src/         aimbot.cu (ff_pi_acc + optional collection)
+├── src/         CUDA/C++ source — main.cu (entry) + core/ (control law, estimator,
+│                calibration, TRT helpers, shared state) + io/ (capture, mouse input,
+│                HID mouse output, hot params)
 ├── scripts/     compile.sh / convert.sh / setup_mouse.sh
 │   └── game/    launcher template (template.sh.example → 复制成 <game>.sh 使用)
+├── build/       per-TU object files (aimbot)
 ├── bin/         build output (aimbot)
 ├── engine/      *.engine model library
 ├── onnx/        *.onnx
@@ -102,8 +105,16 @@ never reported as verified from here.
 
 | File | Role |
 |---|---|
-| `src/aimbot.cu` | **The program**: full aimbot + optional training-data collection. Control law ff_pi_acc (pole-placement PI + type-2 velocity feedforward with direction-contradiction CUSUM velocity reset and detection-gap FF decay; gated â acceleration-bias compensation; wn derived from L, no hand tuning). Without `-o` it is pure aimbot |
-| `scripts/compile.sh` | nvcc build of aimbot → `bin/` (run on the Jetson) |
+| `src/main.cu` | **The program entry**: argument parsing, device open, thread spawn, the timerfd control loop (`DEFAULT_FREQ`). Full aimbot + optional training-data collection (`-o`); without `-o` it is pure aimbot |
+| `src/core/control.cu/.h` | ff_pi_acc header constants (PRED_*/FF_*/CUSUM_*/ACC_* — pole-placement PI + type-2 velocity feedforward with direction-contradiction CUSUM velocity reset, detection-gap FF decay, gated â acceleration-bias compensation; wn derived from L, no hand tuning) + the control tick + the calibration state machine (excitation tables in `core/calib.h`) |
+| `src/core/estimator.cu/.h` | α-β filter + direction-contradiction CUSUM + innovation-mean â sensor (`estimator_step`, driven per frame by the capture thread; publishes `g_target`) |
+| `src/core/calib.cu/.h` | `run_calibration` (least-squares s + coarse/fine delay sweep) / `persist_calibration` (atomic S_EST/L_EST write-back) / `resolve_cam_device` + the CalibSeg excitation trajectory tables and the calibration wall-clock constants |
+| `src/core/trt.cu/.h` | TensorRT Logger / `CHECK_CUDA` / BGR→RGB CHW preprocess kernels (kernel and its launch wrapper share one TU — no `-rdc`) / output-tensor parsing + NMS |
+| `src/core/state.cu/.h` | shared globals: system constants, `ms_to_ticks` (durations are wall-clock, ticks are derived), TargetState/CountsHistory/MouseState, hot-param & calibration atomics, time helpers, async save queue, signal |
+| `src/io/capture.cu/.h` | GStreamer pipeline + `ai_thread` (capture → inference → `estimator_step`; calibration sampling/fit/write-back, three-source collection and preview) |
+| `src/io/hid_mouse.cu/.h` | evdev mouse read (EVIOCGRAB) + `/dev/hidg0` HID report write (control counts merged via the overlay callback) |
+| `src/io/hotctl.cu/.h` | UDP hot-parameter channel 127.0.0.1:47700 |
+| `scripts/compile.sh` | nvcc build of aimbot → `bin/` via per-TU objects in `build/` (run on the Jetson) |
 | `scripts/convert.sh` | Batch ONNX → TensorRT engine conversion |
 | `scripts/setup_mouse.sh` | USB Gadget config, creates `/dev/hidg0` |
 | `scripts/game/template.sh.example` | Per-game launcher template — copy to `<game>.sh` (`.example` keeps the webui from listing it as a launchable profile). Relative paths; mouse-takeover switch `AIM_ENABLED` and screenshot-collection switches (`CAPTURE` master + per-source `CAP_FIRE`/`CAP_DET`/`CAP_AUTO`); auto write-back of calibration values `S_EST`/`L_EST`; the `MAX_SPEED` rule and its derivation live in the file |
@@ -124,7 +135,7 @@ Linking note: `aimbot` needs `-lopencv_video` (calibration uses `phaseCorrelate`
 
 Hot params: the binary opens a localhost-only UDP control channel (127.0.0.1:47700, `key=value;...`); the webui pushes whitelisted params (`t`/`y`/`x`/`fov`/`k`/`aim`/`cap_fire`/`cap_det`/`cap_auto`, clamped firmware-side) into the running process without restart — protocol in `webui/README.md`. Structural constants stay compile-time.
 
-Note: the ff_pi_acc bandwidth is derived automatically from the calibrated `L`; **there are no hand-tuning parameters**. Structural parameters (PM/ζ/FF_GAIN_VAL/FF_I_GATE/over-compensation and the â-channel constants) are header constants in `src/aimbot.cu`, see "Tuning".
+Note: the ff_pi_acc bandwidth is derived automatically from the calibrated `L`; **there are no hand-tuning parameters**. Structural parameters (PM/ζ/FF_GAIN_VAL/FF_I_GATE/over-compensation and the â-channel constants) are header constants in `src/core/control.h`, see "Tuning".
 
 **Collection options** (enabled with `-o`, otherwise pure aimbot; the three sources are the `-e` list, each also a hot switch):
 
@@ -144,7 +155,7 @@ Note: the ff_pi_acc bandwidth is derived automatically from the calibrated `L`; 
 | Sensitivity s | least-squares calibration (coarse 8ms + fine 2ms sweep) | hip-fire calibration | constant |
 | Delay L | phase-correlation delay sweep (same two rounds) | hip-fire calibration | constant |
 
-### Control law (ff_pi_acc, `src/aimbot.cu`)
+### Control law (ff_pi_acc, `src/core/control.cu`)
 
 ```
 Predictor (Smith, dt-normalized): α=min(.9, PRED_ALPHA0·dt/DT0), β=min(.6, PRED_BETA0·dt/DT0)
@@ -185,11 +196,12 @@ The **P term** `Kp·ê` is the fast channel: flicks and instant corrections. The
 3. **`g_counts` records exactly the counts the game actually received** (mouse + aimbot + calibration); filter compensation / in-flight correction / calibration all depend on it.
 4. **Jumps beyond `TRACK_JUMP_GATE` reset the filter**; no patch-style clamps.
 5. Calibration sampling (phase correlation) **does not depend on AI detection**; the two couple only through `s_est`/`l_est`.
-6. The calibration state machine is driven by the 500Hz mouse thread; the AI thread only responds to the three atomics `g_calib_collect`/`g_calib_request`/`g_calib_done`.
+6. The calibration state machine is driven by the control tick (hid: `io/hid_mouse.cu`'s report write calls `core/control.cu`'s `control_apply`); the AI thread only responds to the three atomics `g_calib_collect`/`g_calib_request`/`g_calib_done`.
+7. **Durations are wall-clock milliseconds** (`ms_to_ticks`, `core/state.h`): a tick count is never the source of truth for how long something lasts — the calibration trigger (5 s), the calibration reply timeout (2 s), every CalibSeg segment duration and the `g_counts` history depth (3 s) are stated in milliseconds and converted to ticks, and the keep-alive window is a millisecond constant already. Changing the tick rate therefore re-times nothing.
 
 ## Tuning
 
-**The aimbot needs no hand tuning**: after calibrating `s,L`, `wn` scales with `L` automatically. Structural parameters are header constants in `src/aimbot.cu`:
+**The aimbot needs no hand tuning**: after calibrating `s,L`, `wn` scales with `L` automatically. Structural parameters are header constants in `src/core/control.h` (law, filter and trigger constants), `src/core/state.h` (system constants and the tick period) and `src/core/calib.h` (calibration constants and the excitation trajectory):
 
 | Constant | Default | Meaning | On-device adjustment |
 |---|---|---|---|
@@ -208,7 +220,7 @@ Collection uses raw NV12 (not MJPEG): NV12 is the only format both the Hagibis a
 
 ## arena control-law simulation
 
-`arena/` is a **neutral pure-Python simulator** for fair evaluation/comparison/tuning of control laws. All control-law conclusions stand on its measurements. This machine has no TRT/GStreamer and can't compile .cu, so all control-law exploration happens here; the winner is then ported into `src/aimbot.cu`.
+`arena/` is a **neutral pure-Python simulator** for fair evaluation/comparison/tuning of control laws. All control-law conclusions stand on its measurements. This machine has no TRT/GStreamer and can't compile .cu, so all control-law exploration happens here; the winner is then ported into the firmware control section (`src/core/control.cu` with `src/core/estimator.cu`).
 
 ### Design principles (important)
 
@@ -330,7 +342,7 @@ Constraints for any future estimator work (each measured, each a constraint rath
 
 \* reseed_pi's fps-delta is a denominator effect: on the 60fps side step×2/const_vel/accel are bit-identical to 120fps behavior and maneuver moves +0.5px; the improved 120fps composite shrinks the ratio. The FPS behavior tests (`arena.fps_eval`) are the meaningful law-vs-law comparison. Superseded prototypes (ff_pi, mpc) were removed from the library when a successor dominated them on every test-suite cell; they live in git history.
 
-### The shipped law (ff_pi_acc → `src/aimbot.cu`)
+### The shipped law (ff_pi_acc → `src/core/control.cu`)
 
 **Core constraint (low patch-smell / generalization first)**: reject parameters "tuned by trial that cannot be explained from principle" (games change, and the tests don't run in-game). Therefore:
 
@@ -341,15 +353,15 @@ Constraints for any future estimator work (each measured, each a constraint rath
 
 **Why ff_pi_acc is the shipped law** — best balance of tracking/lock AND maneuver overshoot, and a strict Pareto improvement over its predecessor ff_pi: matched composite 114.7 (step settle 277ms / 3.11px, accel rmse 4.4px, maneuver rmse 19.4px, relock 386ms), FPS behavior suite RMSE 20.4px / event overshoot 28.0px, while holding the **full delay band L20–80 and s0.7–1.3 with no divergence** — the entire mismatch band, step/maneuver/relock and event metrics are bit-identical to ff_pi (the â channel is exactly zero without sustained real acceleration), while accel tracking, matched composite and framerate independence improve (fpsΔ 9.2%→1.9%). The CUSUM-reset mechanism is principled: a broken target model (stop/reversal) is handled by discarding the contradicted velocity state and re-running the proven step response, not by patching gains. The â channel follows the same discipline: innovation-mean acceleration inversion is admitted only on sustained, plausibility-checked evidence (rebuild suppression + own-acceleration activity gate + significance floor).
 
-**Predecessor status (arena side)**: `ff_pi.py` was removed from the library after `ff_pi_acc` dominated it on every test-suite cell (see above). `src/aimbot.cu` now implements ff_pi_acc; the AI-thread filter update carries the â sensor (cleaned innovation → robust scale → own-acceleration gate → gated ȳ EMA → inversion) and the 500Hz control tick assembles ê with (v̂+ε) and ½â·W² — mirroring `arena/laws/ff_pi_acc.py` line for line. Any future challenger must beat ff_pi_acc under the same triple gate before replacing it.
+**Predecessor status (arena side)**: `ff_pi.py` was removed from the library after `ff_pi_acc` dominated it on every test-suite cell (see above). The firmware now implements ff_pi_acc — the capture thread's filter update (`core/estimator.cu`) carries the â sensor (cleaned innovation → robust scale → own-acceleration gate → gated ȳ EMA → inversion) and the control tick (`core/control.cu`) assembles ê with (v̂+ε) and ½â·W² — mirroring `arena/laws/ff_pi_acc.py` line for line. Any future challenger must beat ff_pi_acc under the same triple gate before replacing it.
 
-**Laws not shipped** (kept in `arena/`): `ballistic_ff` has the fastest convergence segment (step settle 167ms, relock 219ms, accel 3.9px) but pays worst-mismatch 135.0 and slightly higher event overshoot under flaky detection, and keeps the L80 settle-fail. `sliding_obs` is the robustness record (full L20–80 + s0.7–1.3 band, flattest profile, OVERALL 138.1) but its P-only tail makes first-reach slow, and hard y-axis stops can trip the CUSUM reset. `mpc_osc` holds the best worst-mismatch (113.4) and fixes L20, but solves a QP per tick — unverified against Jetson 500Hz embedded compute — and keeps the L80 knife-edge. `pi_guard` is pi_pm's no-FF structure plus model-break reset (full band pass); without FF the accel lag a/(Ki·ig) is structural. `kalman_pi`/`smith_filt` are covered on the Pareto front: the Kalman estimator's model overtrust makes a FF+CUSUM pack unfixable under mismatch (measured across 50+ configurations), and smith_filt's settle/relock/recovery records (151ms/198ms/9ms) are bound to an unfiltered extrapolation whose L80/s0.7 corners are structural. `pi_pm`/`sliding`/`ballistic` remain as undominated baselines (their successors carry disclosed regressions). `imm_pi` is the best matched/FPS law of the whole set (accel 4.3px / maneuver 13.6px, FPS RMSE 17.1px / event recovery 7ms) but fails the mismatch band outright. `reseed_pi` keeps ff_pi-level nominal behavior with an evidence-gated seed (exact counts-window junk bound) and now ties the zero-reset design at the mismatch edge (125.6 vs 125.1) while keeping the tail gains. If a different trade-off is ever needed, port the corresponding law's `step()` into `src/aimbot.cu` (units/quantization/counts/estimator must match line for line).
+**Laws not shipped** (kept in `arena/`): `ballistic_ff` has the fastest convergence segment (step settle 167ms, relock 219ms, accel 3.9px) but pays worst-mismatch 135.0 and slightly higher event overshoot under flaky detection, and keeps the L80 settle-fail. `sliding_obs` is the robustness record (full L20–80 + s0.7–1.3 band, flattest profile, OVERALL 138.1) but its P-only tail makes first-reach slow, and hard y-axis stops can trip the CUSUM reset. `mpc_osc` holds the best worst-mismatch (113.4) and fixes L20, but solves a QP per tick — unverified against Jetson 500Hz embedded compute — and keeps the L80 knife-edge. `pi_guard` is pi_pm's no-FF structure plus model-break reset (full band pass); without FF the accel lag a/(Ki·ig) is structural. `kalman_pi`/`smith_filt` are covered on the Pareto front: the Kalman estimator's model overtrust makes a FF+CUSUM pack unfixable under mismatch (measured across 50+ configurations), and smith_filt's settle/relock/recovery records (151ms/198ms/9ms) are bound to an unfiltered extrapolation whose L80/s0.7 corners are structural. `pi_pm`/`sliding`/`ballistic` remain as undominated baselines (their successors carry disclosed regressions). `imm_pi` is the best matched/FPS law of the whole set (accel 4.3px / maneuver 13.6px, FPS RMSE 17.1px / event recovery 7ms) but fails the mismatch band outright. `reseed_pi` keeps ff_pi-level nominal behavior with an evidence-gated seed (exact counts-window junk bound) and now ties the zero-reset design at the mismatch edge (125.6 vs 125.1) while keeping the tail gains. If a different trade-off is ever needed, port the corresponding law's `step()` into `src/core/control.cu` and `src/core/estimator.cu` (units/quantization/counts/estimator must match line for line).
 
 **Rejected paths (documented so they aren't re-explored)**: re-aiming the FF through a fast second velocity channel raises estimator loop gain and diverges at L30–70; hot design points (PM45–55 × β0≥0.06) pass matched but their estimator contamination makes step hunting at the band edges — the mismatch band is the hard constraint of the linear Smith+PI+FF family, and PM50/β0.03 is its test-suite-selected fastest point. Always-on maneuver-adaptive estimation (IMM, `imm_pi`) dies the same death from inside the estimator: under mismatch the Smith window misalignment turns own-command transients into large innovations, large innovations always favor the wide-covariance maneuver model, and the resulting ghost v̂ closes its loop through the physical plant — every σ̂-normalized gate (NIS authority gate, CUSUM) goes blind exactly when the loop self-oscillates, because the filter's covariance and the σ̂ EMA absorb the oscillation as "noise" (the σ̂ EMA runs away and the NIS gate collapses to unity). Online residual-delay adaptation is unobservable in this bookkeeping: the Smith error is first-order exact under constant velocities (the anchor offset cancels between the α-β velocity bias and the ê assembly), so the innovation carries no steady-state signature of Δ = L_true − L̂ — only transient bursts proportional to own-accel × Δ, which are exactly the frames where any estimate is contaminated. Event-overshoot peaks are bounded below by v·L (delay floor) plus the ~2–3 frame CUSUM alarm latency (set by the anti-false-alarm per-frame cap), so no estimator-side fix can cut them; only the post-peak tail is attackable, and paying mismatch margin for it loses on the composite. Evidence-gated adaptation is the counter-principle that works: keep the adaptive channel closed (or frozen) whenever own-motion contamination is possible and let it in only on sustained, plausibility-checked evidence — the validated instances are ff_pi_acc's triple-gated â channel, mpc_osc's innovation-alternation signature gate, and reseed_pi's window-junk-bound seed gate.
 
 Same status, **the FF+CUSUM pack does not transfer onto a Kalman estimator** — its model overtrust (position gain ~0.04/frame vs α-β's 0.5) integrates the signed mismatch junk ∝ own-accel × Δ into v̂ where no gate can separate it from true target motion, and the L20 corner (phantom error v̂·35ms) forbids exactly the estimator bandwidth the accel tail needs (50+ official test-suite configurations, all reject). **The filtered-Smith family's L80/s0.7 corners are structural**: the pseudo-residual (window mismatch × own velocity) and real target disturbances are inseparable inside the residual channel; exact cleaning would need L_true, which is not in the law's input, and every online gating criterion either leaves one contamination window open or fires on legitimate re-capture transients (const_vel/accel break first). **imm_pi's own docstring premise was false**: the steady-state Riccati gain k2 was used with the wrong units (per-sample velocity gain treated as the per-frame α-β β), so its "low model" actually ran at β≈0.25 — 8.3× the documented 0.03; the same too-fast channel produces both the matched wins and the mismatch collapse. A rebuilt steady-gain MMAE on the corrected semantics tracks markedly better on matched and accel with L30–70 finite, but still fails s0.7/L80 and pays a large maneuver and framerate penalty — rejected by the gates (kept out of the library; recoverable from git history).
 
-**Header constants** (constants area of `src/aimbot.cu`; principled rationale in `arena/laws/ff_pi_acc.py`'s docstring):
+**Header constants** (constants area of `src/core/control.h`, the calibration ones in `src/core/calib.h`; principled rationale in `arena/laws/ff_pi_acc.py`'s docstring):
 
 | constant | default | source |
 |---|---|---|
@@ -368,12 +380,12 @@ Same status, **the FF+CUSUM pack does not transfer onto a Kalman estimator** —
 - mpc_osc solves a QP per tick; 500Hz embedded compute is unverified (feasible in arena); shipping it would need explicit MPC or a lower solve rate.
 - Every law degrades under extreme mismatch (|L_true−L̂|>~30ms or s error >~40%) — beyond what calibration should ever produce; ff_pi_acc holds L20–70 + s0.7–1.3 fully, and at the L80 (+30ms) corner its step settle rides the 3px knife edge (final ≈3–4px, no divergence). Rely on calibration, not on the law toughing it out.
 
-- `src/aimbot.cu` advances the filter's `dt` once per frame regardless of whether a detection was produced (`t_prev` is updated outside the `found` branch), so across a detection gap the prediction advances by a single frame interval and `beta` stays at `PRED_BETA0` — where arena uses the interval since the previous *detection*, which is what invariant 1 means. A re-acquisition frame therefore carries the whole gap's displacement in its innovation, making the `TRACK_JUMP_GATE` hard reset (and its ~417 ms weak-tracking window) more likely. Emulating that deviation (clamping the filter's `dt` to the frame interval) is nevertheless measurably neutral rather than harmful under the flaky FPS variant — airborne RMSE equal to slightly better than the current law, with the same on-body fraction — because holding `alpha` at its frame-rate value makes the re-acquisition update more conservative, not less. Fixing it is therefore not a route to the reported trailing, and carries on-device risk for no measured gain. Changing the control section needs an on-device rebuild.
+- `src/core/estimator.cu` advances the filter's `dt` once per frame regardless of whether a detection was produced (`t_prev` is updated outside the `found` branch), so across a detection gap the prediction advances by a single frame interval and `beta` stays at `PRED_BETA0` — where arena uses the interval since the previous *detection*, which is what invariant 1 means. A re-acquisition frame therefore carries the whole gap's displacement in its innovation, making the `TRACK_JUMP_GATE` hard reset (and its ~417 ms weak-tracking window) more likely. Emulating that deviation (clamping the filter's `dt` to the frame interval) is nevertheless measurably neutral rather than harmful under the flaky FPS variant — airborne RMSE equal to slightly better than the current law, with the same on-body fraction — because holding `alpha` at its frame-rate value makes the re-acquisition update more conservative, not less. Fixing it is therefore not a route to the reported trailing, and carries on-device risk for no measured gain. Changing the control section needs an on-device rebuild.
 
 ### How to rerun & extend
 
 1. `.venv\Scripts\python.exe -m arena.selftest` to confirm arena alignment.
 2. After changing/adding a law: `arena.eval <law>` for the standard test suite; `arena.integrate <law>` for the integration (mismatch/relock/framerate included).
 3. To see *which layer* a scenario's error lives in before changing anything: `arena.diag <law> [scenario ...]` — `est_share` says whether the error is worth attacking with a better estimator (high) or is the delay/loop/saturation bound (low); `arena.trace <law> <scenario> --csv out.csv` gives the per-tick process.
-4. Once a better law is found, port its `step()` logic line for line into the control section of `src/aimbot.cu`. Units/quantization/counts/estimator must match the winning law exactly.
+4. Once a better law is found, port its `step()` logic line for line into the firmware control section (`src/core/control.cu` + `src/core/estimator.cu`). Units/quantization/counts/estimator must match the winning law exactly.
 5. Tuning stands on arena measurements, and **delay mismatch must be tested** (the wide-delay sweep in `integrate.py`); a scheme that diverges under mismatch loses, no matter how fast.

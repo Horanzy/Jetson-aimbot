@@ -39,7 +39,7 @@ PARAM_DEFS = {
     "cooldown_ms":     dict(kind="int",   lo=0, hi=60000, default=800),
     "jpeg_q":          dict(kind="int",   lo=1, hi=100, default=95),
 }
-# 热参数白名单: param key → 固件通道 key (对应 src/aimbot.cu hotctl_thread)
+# 热参数白名单: param key → 固件通道 key (对应 src/io/hotctl.cu hotctl_thread)
 HOT_WIRE_KEYS = {"conf": "t", "y_offset": "y", "max_speed": "x", "fov": "fov", "aim_key": "k",
                  "aim_enabled": "aim", "cap_fire": "cap_fire", "cap_det": "cap_det",
                  "cap_auto": "cap_auto"}

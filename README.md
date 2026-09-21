@@ -16,14 +16,16 @@ Aim at a static background with texture and hold both side keys for 5 seconds: t
 
 ## Control law
 
-The single binary `bin/aimbot` runs **ff_pi**: pole-placement PI + type-2 velocity feedforward with direction-contradiction CUSUM velocity reset, plus optional training-data collection (`-o`, otherwise pure aimbot). The law was selected and tuned in `arena/`, a neutral pure-Python plant+sensor simulator that also hosts the alternative laws (ballistic, sliding, MPC, …) kept as Pareto points in speed/robustness. `AGENTS.md` is the full design document; `arena/AUTHORING.md` is the law-author guide.
+The single binary `bin/aimbot` runs **ff_pi_acc**: pole-placement PI + type-2 velocity feedforward with direction-contradiction CUSUM velocity reset and an innovation-mean acceleration channel, plus optional training-data collection (`-o`, otherwise pure aimbot). The law was selected and tuned in `arena/`, a neutral pure-Python plant+sensor simulator that also hosts the alternative laws (ballistic, sliding, MPC, …) kept as Pareto points in speed/robustness. `AGENTS.md` is the full design document; `arena/AUTHORING.md` is the law-author guide.
 
 ## Repository layout
 
 ```
-src/       CUDA/C++ source (aimbot.cu — the ff_pi law)
+src/       CUDA/C++ source — main.cu (entry) + core/ (shared state, control law, estimator,
+           calibration, TensorRT helpers) + io/ (capture, HID mouse, hot params)
 scripts/   compile.sh / convert.sh (ONNX→engine) / setup_mouse.sh (USB gadget) / game/template.sh.example
 arena/     pure-Python control-law simulator + benchmark suite
+build/     per-TU object files (not committed)
 engine/    TensorRT engines (not committed)
 onnx/      ONNX models (not committed)
 ```
@@ -47,6 +49,6 @@ Requires JetPack with TensorRT 10, CUDA, OpenCV 4, GStreamer, and a UVC capture 
 python3 -m venv .venv
 .venv/Scripts/python.exe -m pip install -r requirements.txt   # Windows dev machine
 .venv/Scripts/python.exe -m arena.selftest                    # validate the simulator
-.venv/Scripts/python.exe -m arena.eval ff_pi                  # standard test suite for the main law
+.venv/Scripts/python.exe -m arena.eval ff_pi_acc              # standard test suite for the main law
 .venv/Scripts/python.exe -m arena.integrate                   # all-law leaderboard + robustness sweeps
 ```

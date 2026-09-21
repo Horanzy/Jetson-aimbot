@@ -4,6 +4,8 @@
 *.sh.example text eol=lf
 *.py text eol=lf
 *.cu text eol=lf
+# 头文件与 .cu 同属源码: 部署机 tar 同步不经 git 归一化, 检出必须就是 LF
+*.h text eol=lf
 *.md text eol=lf
 *.js text eol=lf
 *.css text eol=lf

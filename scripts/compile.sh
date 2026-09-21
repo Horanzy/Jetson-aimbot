@@ -2,22 +2,38 @@
 # ==============================================================================
 #  编译脚本 — 在 Jetson 上执行, 产物输出到 <根目录>/bin/
 #  路径相对脚本自身解析, 与部署位置无关。
+#  模块结构: main (入口) + core/ (共享状态/控制律/估计器/标定/TRT 辅助)
+#            + io/ (采集/HID 鼠标/热参); 逐编译单元编译到 build/ 再链接。
 # ==============================================================================
 set -e
 ROOT="$(cd "$(dirname "$(realpath "$0")")/.." && pwd)"
 SRC="$ROOT/src"
+BUILD="$ROOT/build"
 BIN="$ROOT/bin"
-mkdir -p "$BIN"
+mkdir -p "$BUILD" "$BIN"
 
 NVCC=/usr/local/cuda/bin/nvcc
 NVCC_FLAGS="-O3 -DNDEBUG -std=c++17 --use_fast_math"
-INCLUDES="-I/usr/include/opencv4 -I/usr/local/cuda/include"
+INCLUDES="-I$SRC -I/usr/include/opencv4 -I/usr/local/cuda/include"
 LIBS="-L/usr/local/cuda/lib64 -L/usr/lib/aarch64-linux-gnu"
 OCV="-lopencv_core -lopencv_videoio -lopencv_highgui -lopencv_imgproc -lopencv_video"
 TRT="-lnvinfer -lnvinfer_plugin -lcudart -Xcompiler -pthread"
 
-# 主程序: ff_pi_acc 控制律 + 可选训练数据采集 (截图写盘需要 imgcodecs)
-$NVCC "$SRC/aimbot.cu" $NVCC_FLAGS $INCLUDES $LIBS \
-    $OCV -lopencv_imgcodecs $TRT -o "$BIN/aimbot"
+# 模块清单 = src/ 下的全部编译单元 (main.cu 与 core/io 各 .cu 逐一对应)
+MODULES="main \
+         core/control core/estimator core/calib core/trt core/state \
+         io/capture io/hid_mouse io/hotctl"
+
+OBJS=""
+for m in $MODULES; do
+    obj="$BUILD/$(echo "$m" | tr '/' '_').o"
+    # shellcheck disable=SC2086
+    $NVCC -c "$SRC/$m.cu" $NVCC_FLAGS $INCLUDES -o "$obj"
+    OBJS="$OBJS $obj"
+done
+
+# 链接: 控制律 ff_pi_acc + 可选训练数据采集 (截图写盘需要 imgcodecs)
+# shellcheck disable=SC2086
+$NVCC $OBJS $LIBS $OCV -lopencv_imgcodecs $TRT -o "$BIN/aimbot"
 
 echo "✅ 编译完成 → $BIN"
