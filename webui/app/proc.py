@@ -2,8 +2,8 @@
 
 启动序列与 game 脚本完全同构: jetson_clocks → setup_mouse.sh → bin/aimbot
 (全量参数, -S 指向 profile 脚本使标定回写照旧落进脚本)。命令行的中段由脚本的
-OUTPUT_MODE 决定 (hid: -D; pad/p5g: -M/-P/-T/--pad-dump), 延迟取本模式那条标定
-VAR (hid L_EST / 手柄 L_EST_PAD) —— 与脚本同一条规则, 不引入第二个事实源。
+OUTPUT_MODE 决定 (hid: -D; pad/p5g: -M/-P/-T/--pad-dump), 延迟与四个倍率取本模式
+那一槽 (脚本里三套输出各占一组) —— 与脚本同一条规则, 不引入第二个事实源。
 
 权限: euid==0 (部署推荐形态: systemd root 服务) 时三步都直接执行; 否则给前两步加
 sudo 前缀 (需 NOPASSWD), aimbot 本身仍以服务身份运行 —— 它要的 /dev/raw-gadget
@@ -56,13 +56,17 @@ def fmt_num(v):
     return str(v)
 
 
-def build_argv(root: Path, params: dict, calib: dict, script_path: Path) -> list:
+def build_argv(root: Path, params: dict, script_path: Path) -> list:
     """拼装 aimbot 命令行 (与 game 脚本逐项同构)。
 
     输出模式决定中间那一段: hid 用 -D 选鼠标; pad/p5g 用 -M 选后端 + -P 选手柄 + -T
-    触发阈值 (pad/p5g 展开一致, 只换 -M 的值), 外加可选的 --pad-dump。延迟从本模式那条
-    标定 VAR 取 (hid → L_EST, pad/p5g → L_EST_PAD); 缺值时省略 -l, 固件按默认兜底。"""
+    触发阈值 (pad/p5g 展开一致, 只换 -M 的值), 外加可选的 --pad-dump。延迟与四个倍率
+    取**本模式那一槽** (脚本里三套输出各占一组, 切模式就是整套换); 延迟缺值时省略 -l,
+    固件按默认兜底。"""
     mode = str(params.get("output_mode") or "hid")
+    if mode not in discover.OUTPUT_MODES:
+        mode = "hid"
+    slot = lambda a: params.get("%s_%s" % (mode, a), 100)
     model = str(params.get("model") or "")
     model_abs = model if os.path.isabs(model) else str(root / model)
     argv = [str(root / "bin" / "aimbot"),
@@ -75,16 +79,17 @@ def build_argv(root: Path, params: dict, calib: dict, script_path: Path) -> list
             "-x", fmt_num(params.get("max_speed", 1500.0)),
             "-S", str(script_path),
             # 拉枪速度倍率 (逐轴, 100 = 基线) — 与脚本同构地显式给出, 缺省即脚本值
-            "--spd", "%d,%d" % (params.get("spd_x", 100), params.get("spd_y", 100)),
-            "--ads-spd", "%d,%d" % (params.get("ads_spd_x", 100),
-                                    params.get("ads_spd_y", 100)),
+            "--spd", "%d,%d" % (slot("spd_x"), slot("spd_y")),
+            "--ads-spd", "%d,%d" % (slot("ads_spd_x"), slot("ads_spd_y")),
             "-k", str(params.get("aim_key", "both")),
             "-a", "y" if params.get("aim_enabled", True) else "n",
             "-r", fmt_num(params.get("fov", 150.0)),
             "-v", "y" if params.get("preview") else "n"]
-    l_key = discover.mode_l_key(mode)
-    if calib.get(l_key) is not None:
-        argv += ["-l", fmt_num(calib[l_key])]
+    # 本模式那一槽的延迟 = 本模式那条标定 VAR (hid → HID_L_EST, pad → PAD_L_EST,
+    #   p5g → P5G_L_EST); 缺行缺值时省略 -l, 固件按默认兜底
+    l_v = params.get(discover.mode_l_key(mode))
+    if l_v is not None:
+        argv += ["-l", fmt_num(l_v)]
     if mode in ("pad", "p5g"):
         argv += ["-M", mode, "-P", str(params.get("pad_keyword") or ""),
                  "-T", fmt_num(params.get("pad_trig_thr", 6.0))]
@@ -231,7 +236,7 @@ class InstanceManager:
     # ---------- 启动 ----------
 
     def start(self, root: Path, profile: str, display_name: str,
-              params: dict, calib: dict, script_path: Path):
+              params: dict, script_path: Path):
         with self._lock:
             # 【启动】= 以新设置重启 = 保存 + 清场 + 拉起: 在跑的实例 (含 SSH 手跑被认领的)
             # 先停掉 —— 否则"按【启动】接管"只是一个不成立的提示。清场后 state 落到
@@ -250,7 +255,7 @@ class InstanceManager:
             model_abs = model if os.path.isabs(model) else str(root / model)
             if not Path(model_abs).is_file():
                 return False, "模型不存在: %s (先 convert 或重选)" % model
-            argv = build_argv(root, params, calib, script_path)
+            argv = build_argv(root, params, script_path)
             self._user_stop = False
             self.state = "starting"
             self.profile = profile

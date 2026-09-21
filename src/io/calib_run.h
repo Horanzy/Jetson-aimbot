@@ -1,6 +1,7 @@
 // ============================================================================
-//  calib_run.h — 标定执行侧 (hid 与 pad 共用同一个引擎: 同一套测量法、同一份状态机、
-//    同一份拟合; 两模式只给"激励计划 + 注入单位 + 聚合/回写 VAR 名")。
+//  calib_run.h — 标定执行侧 (三套输出共用同一个引擎: 同一套测量法、同一份状态机、
+//    同一份拟合; 输出模式只给"激励计划 (hid 一套, pad 与 p5g 共用一套) + 注入单位 +
+//    聚合诊断 + 回写的延迟 VAR 名")。
 //
 //  标定只出**环路延迟 L**。速度是四个逐轴倍率的手动项 (core/state.h 的 spd), 标定
 //  既不测速度也不回写速度 —— 激励段里顺带量到的屏速只进日志, 供现场手算 spd 起点。
@@ -35,8 +36,8 @@
 //        要求它 ≤ 边沿读数的量化 dt/2 ⇒ v ≥ 2σ√n/dt。实测 σ 0.03–0.1px/帧 (数字采集,
 //        半分辨率域), n≈20, dt=8.33ms → v ≥ 0.11px/ms; 设计值 1.5px/ms, 13 倍余量。
 //    换算成注入量:
-//      hid: 速率 r = v*/s_hid_now(ads, axis) (counts/ms; s 是 spd 口径的有效灵敏度,
-//        没有 S_EST 那一层), 按每拍整数量化 + 余量累加 (平均率精确)。
+//      hid: 速率 r = v*/s_hid_now(ads, axis) (counts/ms; s 已是 spd 倍率折算后的有效
+//        灵敏度), 按每拍整数量化 + 余量累加 (平均率精确)。
 //      pad: 偏转 d = clamp(v*·1000/gain_pad_eff(spd_axis(ads,axis)), CAL_PAD_DEFL_MIN, 1)
 //        — 上界 1 = 满偏 (物理行程), 下界 0.30 = 实测死区地板 (10% 偏转几乎不动
 //        画面的现场读数; 该轴有效增益被 spd 调得很大时 d 会撞上 1, 段随之变长,
@@ -80,9 +81,11 @@
 //   停顿长于 L 上界  | 尾迹读数 ≤ S(=160ms) 且 |读数| ≤ 停顿; L > L_MAX 失败并说明
 //   散度             | 每个读数族的 MAD ≤ 一个**实测**采样间隔 dt (读数的量化单位;
 //                     | 超一格说明它们不是同一次物理测量的重复)
-//   两读数一致性     | |中位(尾迹) − 中位(停止沿)| ≤ 3·√(SE² 之和), SE 用族内 MAD 与
-//                     | 量化底 dt/√12 的较大者 (3σ 统计门; 量化底必须进 SE — 边沿读数
-//                     | 的量化是物理的, 不像相位相关噪声那样可以忽略)
+//   两读数一致性     | |中位(尾迹) − 中位(起始沿)| ≤ 3·√(SE² 之和) + max(一个实测帧长,
+//                     | 0.3·|L|), SE 用族内 MAD 与量化底 dt/√12/√n 的较大者 (3σ 统计门;
+//                     | 量化底必须进 SE — 边沿读数的量化是物理的, 不像相位相关噪声那样
+//                     | 可以忽略); 后两项是边沿自身的帧格量化与控制律被证明吸收的失配带。
+//                     | 停止沿照进日志但不做门 (平滑把命令沿磨圆后它天然晚几十毫秒)
 //   L 物理带         | [L_MIN, L_MAX] = [0, 120] (上界出处见 core/calib.h)
 //   运动前置         | 至少一段测到运动, 否则整轮失败 ("屏幕未响应")
 //   读数数量         | 每轴 2 对 (4 段 × 3 读数 = 12 个读数/轴) ≥ 5 (中位数 + MAD
@@ -108,8 +111,9 @@
 //  上一轮的结论)。热参请求在标定进行中到达: 一次消费即清并记一行丢弃, 绝不重入。
 //
 //  --- 回写 ---
-//  成功只写该模式的一条 VAR: hid → L_EST, pad → L_EST_PAD (persist_calibration 原子
-//  替换), 运行进程内的 l_est 由采集侧接着更新。失败什么都不写。
+//  成功只写该输出模式的一条延迟 VAR: hid → HID_L_EST, pad → PAD_L_EST, p5g →
+//  P5G_L_EST (persist_calibration 原子替换; 三套输出各一格, 互不覆盖), 运行进程内的
+//  l_est 由采集侧接着更新。失败什么都不写。
 // ============================================================================
 
 #pragma once
@@ -130,9 +134,12 @@ enum CalMode { CAL_MODE_HID = 0, CAL_MODE_PAD = 1 };
 constexpr int CAL_MODES_N = 2;
 
 // ---- 计划参数 (推导见文件头) ----
-// 回写的 VAR 名: 一个输出模式一个, 两套互不覆盖 (速度 VAR 是手动项, 固件永不写)
-constexpr const char* CAL_VAR_HID = "L_EST";
-constexpr const char* CAL_VAR_PAD = "L_EST_PAD";
+// 回写的 VAR 名: 一个输出模式一条 (三套输出各占一格延迟, 互不覆盖; 速度 VAR 是手动项,
+//   固件永不写)。pad 与 p5g 共用同一套激励计划, 但各写各的延迟槽 —— 手柄输出到 PC 与
+//   到 PS5 的环路不同 (p5g 多一跳签名往返), 一个数代表不了另一条。
+constexpr const char* CAL_VAR_HID = "HID_L_EST";
+constexpr const char* CAL_VAR_PAD = "PAD_L_EST";
+constexpr const char* CAL_VAR_P5G = "P5G_L_EST";
 // 每轴对 (方向 +/−) 数: 读数族要有 ≥ CAL_MIN_READINGS 条才谈得上"中位 + MAD".
 //   pad 只扫一轴 → 该轴的对数就是全轮的对数 → 3 对 = 6 个尾迹读数 (>5);
 //   hid 两轴合并 → 2 对 = 8 条 (>5), 逐轴 4 条只作并列报出的诊断。
@@ -256,9 +263,9 @@ int cal_done_code(const CalResult& r);
 // 诊断行 (无论成败都打 — 失败时它就是现场证据): 逐段原始行 + 读数族汇总 + 模式结论
 void cal_print_diag(CalMode mode, const CalResult& r, size_t hist_n);
 
-// 回写 (成功路径): 只写该模式的一条延迟 VAR (hid: L_EST / pad: L_EST_PAD; 原子替换)。
-// persist_path 为空则跳过。返回是否写入成功。
-bool cal_writeback(CalMode mode, const CalResult& r, const std::string& persist_path);
+// 回写 (成功路径): 只写调用方给的那条延迟 VAR (CAL_VAR_HID / CAL_VAR_PAD / CAL_VAR_P5G
+// 三选一, 由当前输出模式定; 原子替换)。persist_path 为空则跳过。返回是否写入成功。
+bool cal_writeback(const char* var, const CalResult& r, const std::string& persist_path);
 
 // ---- 状态机 ----
 // btns: 人类逻辑键位字 (hid: HID 按钮位; pad: PadBtn 位表)。返回本拍是否处于标定中及

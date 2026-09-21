@@ -88,6 +88,45 @@ async function api(path, opts) {
 }
 
 /* ================= 参数定义 (ⓘ 文案与热/冷标记) ================= */
+/* ---- 三套输出各占一组 5 个值 (延迟 1 + 拉枪倍率 4) ----
+   切换【输出模式】= 显示/编辑另一槽的这 5 个值; 保存只提交本槽 (savePatch), 标定回写也只
+   落进本槽 (固件的 HID_L_EST / PAD_L_EST / P5G_L_EST 三选一)。分槽是必须的: 同一个倍率数
+   在两套口径下含义不同 (下面的 base), 延迟也各是自己的物理量 (p5g 还多一跳加密狗签名往返)。 */
+const MODE_SLOT = [
+  { mode: "hid", title: "hid — USB 鼠标 → PC", lvar: "HID_L_EST",
+    base: "基线 = 1.0 px/count (counts 直接进游戏, 游戏内鼠标灵敏度是另一半)" },
+  { mode: "pad", title: "pad — XInput 手柄 → PC", lvar: "PAD_L_EST",
+    base: "基线 = 满偏屏速 3000 px/s (控制律的注入按它折算摇杆偏转)" },
+  { mode: "p5g", title: "p5g — P5 General → PS5", lvar: "P5G_L_EST",
+    base: "基线 = 满偏屏速 3000 px/s (与 pad 同一条注入/合并链, 线上那端是 PS5)" },
+];
+const SLOT_SPD = [
+  { a: "spd_x", label: "速度倍率 X — 腰射", hot: "spdx",
+    info: "拉枪速度倍率, 与有效灵敏度成反比 (有效灵敏度 = 基线/(倍率/100)): 调大 = 同样的期望屏幕速度发出更多 counts / 更大的摇杆偏转 = 屏幕跟得更快。整数步进 (105 / 109), 100 = 基线; 有意义的带是 5..2000, 越界会被固件夹取。本槽的基线见组标题。" },
+  { a: "spd_y", label: "速度倍率 Y — 腰射", hot: "spdy",
+    info: "Y 轴同一刻度 (100 = 基线)。与 X 分开是因为同一灵敏度下垂直与水平的屏速比是游戏属性 —— 俯仰灵敏度常更低, 于是这里通常要给更大的值; 一个总倍率会把两轴绑死。" },
+  { a: "ads_spd_x", label: "速度倍率 X — ADS", hot: "adsspdx",
+    info: "ADS 键 (右键 / LT) 按住期间的 X 倍率, 同一刻度 (100 = 基线)。按住的那一拍整套切换, 与腰射那对互不影响; 开镜灵敏度常设得更低, 故这里通常比腰射更大。" },
+  { a: "ads_spd_y", label: "速度倍率 Y — ADS", hot: "adsspdy",
+    info: "ADS 键按住期间的 Y 倍率, 同一刻度 (100 = 基线)。" },
+];
+const MODE_SLOT_KEYS = {};
+function modeSlotRows() {
+  const out = [];
+  MODE_SLOT.forEach(sl => {
+    const group = "延迟与拉枪倍率 — " + sl.title;
+    MODE_SLOT_KEYS[sl.mode] = new Set(["l_" + sl.mode].concat(
+      SLOT_SPD.map(sp => sl.mode + "_" + sp.a)));
+    out.push({ group: group, key: "l_" + sl.mode, label: "延迟 L (" + sl.lvar + ")",
+      type: "num", min: 0, max: 120, step: 0.1, unit: "ms", hot: false, showIfMode: [sl.mode],
+      info: "本输出模式的环路延迟 ms —— 标定成功就写进这一格, 也可手填。控制律带宽由它导出 (wn=(90°−PM)π/180/L), 所以它是唯一进运行态的标定量, 越准越好; 另两套输出的延迟各有自己的槽, 标定与保存都不会碰。缺行/缺值时固件按 60 兜底。❄ 冷参数 (下次【启动】生效)。" });
+    SLOT_SPD.forEach(sp => out.push({ group: group, key: sl.mode + "_" + sp.a,
+      label: sp.label, type: "num", min: 1, max: 10000, step: 1, hot: true, showIfMode: [sl.mode],
+      info: sp.info + " 本槽 " + sl.base + "。🔥 热参数 (" + sp.hot + "), 当前实例跑的就是本模式时保存即生效。" }));
+  });
+  return out;
+}
+
 const PARAM_DEFS = [
   { group: "输出模式与设备", key: "output_mode", label: "输出模式", type: "select", options: ["hid", "pad", "p5g"], hot: false,
     labels: { hid: "hid — USB 鼠标 → PC", pad: "pad — XInput 手柄 → PC", p5g: "p5g — P5 General → PS5" },
@@ -115,14 +154,9 @@ const PARAM_DEFS = [
     info: "关闭后固件只透传真实鼠标, 不注入任何移动; 检测与采集照常运行 —— 模型未完善、只想采数据时的形态, 随时可再打开恢复控制输出。🔥 热参数, 保存即生效。" },
   { group: "瞄准", key: "fov", label: "FOV 半径", type: "num", min: 10, max: 1000, step: 5, unit: "px", hot: true,
     info: "FOV 同时是目标筛选圈与积分器启动边界 (一值两用)。几何关系: 模型输入是 1080p 画面中心裁剪出的 640×640, 模型像素与屏幕像素 1:1, 检测范围为以准星为中心 ±320px (对角约 452px), 因此调到 452 以上没有额外效果。调大: 更远/更偏的目标进入筛选圈, 多目标抢锁风险上升; 调小: 只锁准星附近。🔥 热参数, 保存即生效。" },
-  { group: "拉枪速度 (每游戏自调)", key: "spd_x", label: "速度倍率 X — 腰射", type: "num", min: 1, max: 10000, step: 1, hot: true,
-    info: "拉枪速度倍率, 与有效灵敏度成反比 (有效灵敏度 = 基线/(倍率/100)): 调大 = 同样的期望屏幕速度发出更多 counts = 屏幕跟得更快。整数步进 (105 / 109), 100 = 基线 (出厂手感); 有意义的带是 5..2000 (对应 0.05–20 px/count), 越界会被固件夹取。🔥 热参数, 保存即生效。" },
-  { group: "拉枪速度 (每游戏自调)", key: "spd_y", label: "速度倍率 Y — 腰射", type: "num", min: 1, max: 10000, step: 1, hot: true,
-    info: "Y 轴同一刻度 (100 = 基线)。与 X 分开是因为同一灵敏度下垂直/水平的屏速比是游戏属性 —— 俯仰灵敏度常更低, 于是这里通常要给更大的值; 一个总倍率会把两轴绑死。🔥 热参数, 保存即生效。" },
-  { group: "拉枪速度 (每游戏自调)", key: "ads_spd_x", label: "速度倍率 X — ADS", type: "num", min: 1, max: 10000, step: 1, hot: true,
-    info: "ADS 键 (右键) 按住期间的 X 倍率, 同一刻度 (100 = 基线)。按住的那一拍整套切换, 与腰射那对互不影响。开镜灵敏度常设得更低, 故这里通常比腰射更大。🔥 热参数, 保存即生效。" },
-  { group: "拉枪速度 (每游戏自调)", key: "ads_spd_y", label: "速度倍率 Y — ADS", type: "num", min: 1, max: 10000, step: 1, hot: true,
-    info: "ADS 键按住期间的 Y 倍率, 同一刻度 (100 = 基线)。🔥 热参数, 保存即生效。" },
+  // 三套输出各占一组 5 个值 (延迟 1 + 拉枪倍率 4): 由 MODE_SLOT 生成 —— 切换【输出模式】
+  // 显示/编辑的就是本槽那一组, 保存也只提交本槽 (见 savePatch)
+  ...modeSlotRows(),
   { group: "瞄准", key: "class_id", label: "目标类别 ID", type: "num", min: 0, max: 255, step: 1, hot: false,
     info: "锁定哪个检测类别 (依模型标签, 如 0=头, 1=身)。❄ 冷参数, 下次启动生效。" },
   { group: "瞄准", key: "cam_fps", label: "采集帧率", type: "select", options: [120, 60], hot: false,
@@ -383,10 +417,13 @@ function renderRunTab() {
   const calibProf = runProf || p;
   const mode = (calibProf && calibProf.script_params && calibProf.script_params.output_mode)
     || (S.params && S.params.output_mode) || "hid";
-  const lKey = (mode === "pad" || mode === "p5g") ? "l_pad" : "l_hid";
-  const lVar = lKey === "l_pad" ? "L_EST_PAD" : "L_EST";
+  // 延迟: 本模式那一槽 (三套输出各一格), 与固件回写的 VAR 同一条规则
+  const slot = MODE_SLOT.find(sl => sl.mode === mode) || MODE_SLOT[0];
+  const lKey = "l_" + slot.mode;
+  const lVar = slot.lvar;
+  const scriptL = calibProf && calibProf.script_params ? calibProf.script_params[lKey] : null;
   const calib = inst.calib_live && inst.calib_live.l != null ? inst.calib_live
-              : (calibProf ? calibProf.calib : null);
+              : (scriptL != null ? { l: scriptL } : null);
   const soc = tel && tel.soc_temp != null ? tel.soc_temp : null;
   const cap = inst.capture;
   const capTotal = cap ? cap.fire + cap.det + cap.auto : null;
@@ -408,9 +445,9 @@ function renderRunTab() {
     { k: "GPU", v: tel && tel.gpu != null ? tel.gpu : "—", small: "%" },
     { k: "内存", v: tel && tel.mem ? tel.mem.percent : "—", small: tel && tel.mem ? "· " + tel.mem.used_mb + "MB" : "" },
     { k: "SoC 温度", v: soc != null ? soc.toFixed(0) : "—", small: "°C", cls: soc >= 85 ? "err" : soc >= 70 ? "warn" : "" },
-    { k: "标定延迟 L (" + esc(lVar) + ")", v: calib && calib[lKey] != null ? calib[lKey] : "—",
+    { k: "标定延迟 L (" + esc(lVar) + ")", v: calib ? calib.l : "—",
       small: "ms · " + (inst.calib_live ? "运行中回执" : "脚本值"),
-      t: "本模式的延迟: " + lVar + " (hid 与手柄模式各一条, 互不覆盖)。标定只出这一个量, 由它导出控制律带宽; 手感由「拉枪速度」那组的四个倍率调 — 固件不写它们。" },
+      t: "本输出模式的延迟: " + lVar + " (三套输出各一格, 互不覆盖)。标定只出这一个量, 由它导出控制律带宽; 手感由「延迟与拉枪倍率」那组的四个倍率调 — 固件不写它们。也可在参数页手填。" },
     { k: "热参数通道", v: inst.state === "running" ? (inst.hot_capable ? "已启用" : "不可用") : (S.state.scan.binary && S.state.scan.binary.hot_capable ? "固件支持" : "固件不支持"), small: inst.hot_port ? ":" + inst.hot_port : "", cls: (inst.state === "running" && !inst.hot_capable) ? "warn" : (inst.hot_capable ? "ok" : "") },
   ];
   $("#statusCards").innerHTML = cards.map(c =>
@@ -600,8 +637,11 @@ function renderParams() {
     if (!g) { g = { name: d.group, rows: [] }; groups.push(g); }
     g.rows.push(d);
   });
-  $("#paramGroups").innerHTML = groups.map(g =>
-    `<div class="pgroup"><h4>${esc(g.name)}</h4>` + g.rows.map(paramRow).join("") + `</div>`).join("");
+  // 空组不渲染: 三套输出的槽组各含 showIfMode, 只有当前模式的组有可见行
+  $("#paramGroups").innerHTML = groups.map(g => {
+    const rows = g.rows.map(paramRow).join("");
+    return rows.trim() ? `<div class="pgroup"><h4>${esc(g.name)}</h4>${rows}</div>` : "";
+  }).join("");
 }
 
 function renderParamsMeta() {
@@ -633,9 +673,33 @@ function markDirty() {
 }
 
 /* ================= 保存 / 启动 / 停止 ================= */
+/* 保存的提交体 = 补丁: 只提交与脚本现值不同的键, 且**不含**其它输出槽的槽键 ——
+   于是"保存只写当前模式那一槽"成立: 切换模式后原样保存, 另两槽的 10 个 VAR 逐字不动
+   (参数页只显示本槽, 另两槽即使被改过也不提交, 切槽时会提示)。*/
+function savePatch() {
+  const cur = S.params.output_mode || "hid";
+  const drop = new Set();
+  Object.keys(MODE_SLOT_KEYS).forEach(m => {
+    if (m !== cur) MODE_SLOT_KEYS[m].forEach(k => drop.add(k));
+  });
+  const out = {};
+  PARAM_DEFS.forEach(d => {
+    if (drop.has(d.key)) return;
+    if (!sameVal(S.params[d.key], S.savedParams[d.key])) out[d.key] = S.params[d.key];
+  });
+  return out;
+}
+
 async function saveProfile(silent) {
+  const patch = savePatch();
+  const changed = Object.keys(patch).length;
+  if (!changed) {                       // 无改动不发请求: 不重写脚本 (行不会被规范化改写)
+    if (!silent) toast("没有改动需要保存", "");
+    S.dirty = false;
+    return { ok: true, hot_applied: {} };
+  }
   const r = await api("/api/profiles/" + encodeURIComponent(S.selected),
-                      { method: "PUT", body: { params: S.params } });
+                      { method: "PUT", body: { params: patch } });
   S.savedParams = Object.assign({}, S.params);
   S.dirty = false;
   // 脚本是唯一事实源: 保存 = 服务端已写回脚本; 拉回最新扫描并回读刷新表单 (显示规范值)
@@ -646,7 +710,7 @@ async function saveProfile(silent) {
     } else if (r.hot_reason) {
       toast("已保存并写回脚本; " + r.hot_reason, "warn");
     } else {
-      toast("已保存并写回脚本", "ok");
+      toast("已保存并写回脚本 (本槽 " + changed + " 项)", "ok");
     }
   }
   selectProfile(S.selected, { force: true });
@@ -932,7 +996,14 @@ function bindEvents() {
       S.params[k] = e.target.checked;
       if (d.captureSwitch) renderParams();          // 开关控制整组显隐
     } else S.params[k] = e.target.value;
-    if (k === "output_mode") renderParams();        // 模式决定 -D 与 -P/-T 哪一组可见
+    if (k === "output_mode") {                       // 模式决定 -D 与 -P/-T 哪一组可见
+      renderParams();
+      // 切槽 = 换显示的另一组 5 个值; 保存只提交本槽, 所以另两槽未保存的改动不会被提交
+      const other = Object.keys(MODE_SLOT_KEYS).filter(m => m !== S.params.output_mode)
+        .filter(m => Array.from(MODE_SLOT_KEYS[m]).some(x => !sameVal(S.params[x], S.savedParams[x])));
+      if (other.length) toast("已切到 " + S.params.output_mode + " 槽: 保存只写本槽的 5 个值 — " +
+        other.join("/") + " 槽未保存的改动不会被提交", "warn");
+    }
     if (d.type !== "bool") markDirtyLite(k);
     markDirty();
   });
@@ -1063,7 +1134,15 @@ function bindEvents() {
       S.params = Object.assign(blankParams(), clean);
       renderParams();
       markDirty();
-      toast("已导入参数到表单 — 检查后点【保存】写回脚本", "ok");
+      // 导入文件可能含另两输出槽的键 —— 它们进表单但对当前模式不可见, 保存也不提交
+      const cur = S.params.output_mode || "hid";
+      let foreign = 0;
+      Object.keys(MODE_SLOT_KEYS).forEach(m => {
+        if (m === cur) return;
+        MODE_SLOT_KEYS[m].forEach(k => { if (!sameVal(clean[k], S.savedParams[k])) foreign++; });
+      });
+      toast("已导入参数到表单 — 检查后点【保存】写回脚本" +
+            (foreign ? " (文件里有 " + foreign + " 项属于另两输出槽: 保存只写当前模式那一槽, 需要时切模式后再导入)" : ""), "ok");
     } catch (err) { toast("导入失败: " + err.message, "err"); }
   });
 

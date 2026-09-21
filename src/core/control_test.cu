@@ -9,9 +9,9 @@
 //        在飞补偿 (s·Δcounts) 与估计器自身运动补偿 (预测减法/清洗创新/自身加速度
 //        活动门) 在同一状态下取同一值, 且随 spd 成比例变化
 //    [5] 夹取: spd_clamp 的 [SPD_MIN, SPD_MAX] 带 (CLI 与热参共用的唯一定义点)
-//    [6] 热参路径: spdx 改后下一拍生效; 非数值/未知 key (含已删除的 s) 被拒绝
-//    [7] 标定回写: 只写调用方给的那个延迟 VAR (速度倍率逐字不变, 无速度 VAR),
-//        换名即另一套 (手柄输出的延迟 VAR 与 hid 各占一行, 互不覆盖)
+//    [6] 热参路径: spdx 改后下一拍生效; 非数值与不在白名单里的 key 被拒绝
+//    [7] 标定回写: 三套输出各写各的延迟 VAR (整体逐字比对: 只动自己那一格的那一个
+//        字符区间), 模板的守卫写法与行内注释原样保住; 裸行/缺行两种落点各有一种写法
 //  全部断言通过输出 ALL PASS 并返回 0; 任一断言失败返回非零 (compile.sh 的 set -e
 //  终止编译)。
 // ============================================================================
@@ -33,7 +33,7 @@
 #include "core/control.h"
 #include "core/estimator.h"
 #include "core/state.h"
-#include "io/calib_run.h"      // CAL_VAR_HID/CAL_VAR_PAD (回写 VAR 名)
+#include "io/calib_run.h"      // CAL_VAR_HID/CAL_VAR_PAD/CAL_VAR_P5G (回写 VAR 名)
 #include "io/hotctl.h"
 
 static int g_fail = 0;
@@ -293,7 +293,7 @@ int main() {
         CHECK(!hotctl_apply("spdx", "1e3x") && g_spd_x.load() == keep,
               "spdx=1e3x 被拒绝 (整对消费, 尾随垃圾不收)");
         CHECK(!hotctl_apply("spd", "5") && !hotctl_apply("s", "5"),
-              "未知 key (含已删除的 s 与拼错的 spd) 被拒绝");
+              "未知 key (拼错的 spd 与单字母缩写 s) 被拒绝");
         CHECK(hotctl_apply("spdx", "0") && g_spd_x.load() == SPD_MIN,
               "热参侧的越界值同样被夹取 (与 CLI 同一个 spd_clamp)");
         g_spd_x.store(SPD_BASE); g_ads_spd_y.store(SPD_BASE);
@@ -301,33 +301,59 @@ int main() {
               "既有键的非法值照旧被拒绝 (白名单语义未变)");
     }
 
-    std::cout << "[7] 标定回写: 只写调用方给的那个延迟 VAR\n";
+    std::cout << "[7] 标定回写: 三套输出各写各的延迟 VAR + 守卫写法原样保住\n";
     {
         const std::string path = "/tmp/control_test_script.sh";
-        { std::ofstream o(path, std::ios::trunc);
-          o << "#!/bin/bash\nSPDX=105\nL_EST=60.0\nSPDY=110\n"; }
+        // 脚本头 = 模板形态: 三格延迟各一行 —— 两行守卫写法 (一行带行内注释), 一行裸赋值,
+        // 另有一行无关的守卫 VAR (它必须逐字不动)。三种落点各验一次, 比对是整文件逐字的
+        // (回写只该动自己那一格的那一个字符区间)
+        const std::string head = "#!/bin/bash\n"
+            "MAX_SPEED=\"${MAX_SPEED:-2000}\"\n"
+            "HID_L_EST=\"${HID_L_EST:-60.0}\"\n"
+            "PAD_L_EST=\"${PAD_L_EST:-60.0}\"    # 手柄槽\n"
+            "P5G_L_EST=60.0\n";
+        { std::ofstream o(path, std::ios::trunc); o << head; }
         ::chmod(path.c_str(), 0755);
         const auto slurp = [&]() {
             std::ifstream in(path);
             return std::string((std::istreambuf_iterator<char>(in)),
                                std::istreambuf_iterator<char>()); };
-        const bool ok = persist_calibration(path, CAL_VAR_HID, 42.5f);
-        const std::string all = slurp();
+        CHECK(persist_calibration(path, CAL_VAR_HID, 42.5f) && slurp() ==
+              "#!/bin/bash\n"
+              "MAX_SPEED=\"${MAX_SPEED:-2000}\"\n"
+              "HID_L_EST=\"${HID_L_EST:-42.5}\"\n"
+              "PAD_L_EST=\"${PAD_L_EST:-60.0}\"    # 手柄槽\n"
+              "P5G_L_EST=60.0\n",
+              "hid 槽写在自己那一格, 守卫写法与其余每一行逐字保留");
+        CHECK(persist_calibration(path, CAL_VAR_PAD, 77.0f) && slurp() ==
+              "#!/bin/bash\n"
+              "MAX_SPEED=\"${MAX_SPEED:-2000}\"\n"
+              "HID_L_EST=\"${HID_L_EST:-42.5}\"\n"
+              "PAD_L_EST=\"${PAD_L_EST:-77.0}\"    # 手柄槽\n"
+              "P5G_L_EST=60.0\n",
+              "pad 槽: 守卫与行内注释同时保住 (已标定的 hid 槽不受影响)");
+        CHECK(persist_calibration(path, CAL_VAR_P5G, 61.0f) && slurp() ==
+              "#!/bin/bash\n"
+              "MAX_SPEED=\"${MAX_SPEED:-2000}\"\n"
+              "HID_L_EST=\"${HID_L_EST:-42.5}\"\n"
+              "PAD_L_EST=\"${PAD_L_EST:-77.0}\"    # 手柄槽\n"
+              "P5G_L_EST=61.0\n",
+              "p5g 槽: 裸赋值行按裸赋值回写 (不凭空造守卫, 行数不变)");
+        CHECK(persist_calibration(path, CAL_VAR_P5G, 58.0f) && slurp() ==
+              "#!/bin/bash\n"
+              "MAX_SPEED=\"${MAX_SPEED:-2000}\"\n"
+              "HID_L_EST=\"${HID_L_EST:-42.5}\"\n"
+              "PAD_L_EST=\"${PAD_L_EST:-77.0}\"    # 手柄槽\n"
+              "P5G_L_EST=58.0\n",
+              "重复回写仍落在那一格 (是替换不是追加)");
         struct stat st{};
         ::stat(path.c_str(), &st);
-        CHECK(ok && all.find("L_EST=42.5") != std::string::npos,
-              "L 写进调用方给的 VAR (CAL_VAR_HID = L_EST)");
-        CHECK(all.find("SPDX=105") != std::string::npos
-              && all.find("SPDY=110") != std::string::npos
-              && all.find("S_EST") == std::string::npos,
-              "速度倍率 VAR 逐字不变, 也没有任何速度 VAR 被写进脚本");
         CHECK((st.st_mode & 0777) == 0755, "原子替换保留执行位");
-        const bool ok2 = persist_calibration(path, CAL_VAR_PAD, 77.0f);
-        const std::string all2 = slurp();
-        CHECK(ok2 && all2.find("L_EST_PAD=77.0") != std::string::npos,
-              "换一个 VAR 名即另一套 (手柄输出的名字由调用方给), 追加而非覆盖");
-        CHECK(all2.find("L_EST=42.5") != std::string::npos,
-              "两套延迟 VAR 同时存在, 各自独立");
+        { std::ofstream o(path, std::ios::trunc);
+          o << "#!/bin/bash\nHID_L_EST=\"${HID_L_EST:-60.0}\"\n"; }   // 缺行情形
+        CHECK(persist_calibration(path, CAL_VAR_P5G, 58.0f)
+              && slurp() == "#!/bin/bash\nHID_L_EST=\"${HID_L_EST:-60.0}\"\nP5G_L_EST=58.0\n",
+              "缺行 → 追加 (写的是调用方给的 VAR 名, 与 webui 追加同一种写法)");
         ::unlink(path.c_str());
     }
 

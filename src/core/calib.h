@@ -171,9 +171,11 @@ struct CalibSample {
     int   slot = -1;
 };
 
-// 标定回写: 只替换以 var 开头的行为值 (缺行追加到末尾), 临时文件 + rename 原子替换,
-//   原文件权限/属主继承。VAR 名由调用方给 (hid: L_EST / pad: L_EST_PAD — 两套互不覆盖),
-//   机制与名无关。临时名带 pid: 同一脚本可能同时被另一写者改写 (webui 保存用它自己的
-//   临时文件), 共用一个 ".tmp" 会让两份内容在重命名前互相穿插。
+// 标定回写: 只替换以 var 开头的行 (缺行追加到末尾), 临时文件 + rename 原子替换,
+//   原文件权限/属主继承。VAR 名由调用方给 (HID_L_EST / PAD_L_EST / P5G_L_EST — 三套
+//   输出各一格, 互不覆盖), 机制与名无关。原行是模板的守卫写法时回写成守卫形式 (值落在
+//   默认位上) —— 脚本"少写一行也能起"的承诺不因为一次标定而失效。临时名带 pid: 同一
+//   脚本可能同时被另一写者改写 (webui 保存用它自己的临时文件), 共用一个 ".tmp" 会让
+//   两份内容在重命名前互相穿插。
 bool persist_calibration(const std::string& path, const std::string& var, float l);
 std::string resolve_cam_device(const std::string& spec);

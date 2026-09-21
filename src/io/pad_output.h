@@ -64,12 +64,13 @@ extern CountsHistory g_pad_ledger;
 // 自身运动账本的模式路由 (不变式 3 的消费端): hid = g_counts (px = s·Δcounts),
 //   pad = 摇杆账本 (px = s_rp·Δ(偏转·ms))。估计器 (预测减法/创新清洗/自身活动门)
 //   与控制律 (在飞补偿) 共用这一个来源选择, 两账本同为 CountsHistory。模式由 main
-//   启动时设定 (两模式单次运行只居其一), 缺省 hid。
+//   启动时设定 (三套输出单次运行只居其一), 缺省 hid。
 void own_motion_ledger_set(bool pad);
 const CountsHistory& own_motion_ledger();
 
-// 账本 → 像素 的逐轴比例 (自身运动补偿的唯一换算来源; 消费端数学两模式同形:
-//   px = 比例 × 账本增量)。hid = 该轴有效灵敏度 s_hid_now(ads, axis) (px/count);
+// 账本 → 像素 的逐轴比例 (自身运动补偿的唯一换算来源; 消费端数学在 hid 与手柄两种
+//   通道同形: px = 比例 × 账本增量)。hid = 该轴有效灵敏度 s_hid_now(ads, axis)
+//   (px/count);
 //   pad = 该轴有效满偏屏速的换算 px per 偏转·ms = pad_s_rp_from_gain(gain_pad_eff)。
 //   逐轴是必须的 — 两轴的 spd 可以不同, 一个因子会让 Y 轴系统性偏差。
 //   ADS 键状态与注入换算取自同一时刻的 g_ads_down (拍内自洽)。

@@ -37,7 +37,8 @@
 //    或 webui 的「开始标定」按钮 (热参 padcalib=1)。激励期程序独占注入通道 (手柄
 //    模式整只手柄归中, 按键照旧透传), 每段行程到位即停 + 段后停顿, 停顿里给出
 //    三个独立读数 (尾迹和 = 主读数, 停止沿, 起始沿) → 中位 + MAD 判定;
-//    成功 = 点头 + 只回写该模式的延迟 VAR (hid: L_EST / pad: L_EST_PAD), 失败 =
+//    成功 = 点头 + 只回写本输出模式的延迟 VAR (hid: HID_L_EST / pad: PAD_L_EST /
+//    p5g: P5G_L_EST — 三套输出各一格, 互不覆盖), 失败 =
 //    摇头 + 原因, 绝不写编造的值。速度一概不标 (手感走下面四个倍率)。
 //
 //  拉枪速度: 四个逐轴倍率 —— 腰射一对 (--spd), ADS 键 (右键) 按住期间一对
@@ -132,7 +133,8 @@ int main(int argc, char* argv[]) {
                 "  -y <偏移>  部位       -d <采集卡> 名字或 /dev/videoN\n"
                 "  -f <帧率>  120/60     -x <速度> 最大px/s\n"
                 "  -l <L>     初始延迟\n"
-                "  -S <脚本>  回写路径 (标定只写延迟: hid → L_EST, pad/p5g → L_EST_PAD)\n"
+                "  -S <脚本>  回写路径 (标定只写本输出模式的延迟 VAR:\n"
+                "             hid → HID_L_EST, pad → PAD_L_EST, p5g → P5G_L_EST)\n"
                 "  -k <键>   fire/ads/both  -v <y/n> 预览\n"
                 "  --spd <x>[,<y>]      拉枪速度倍率逐轴 (默认 100 = 基线; 调大=更快; 热参 spdx/spdy)\n"
                 "  --ads-spd <x>[,<y>]  ADS 键按住时的同一对 (默认 100; 热参 adsspdx/adsspdy)\n"
@@ -211,6 +213,9 @@ int main(int argc, char* argv[]) {
     }
     const bool p5g_mode=(out_mode=="p5g");
     const bool pad_mode=(out_mode!="hid");        // 手柄通道: 输入/合并/标定/账本路由
+    // 标定回写的延迟 VAR: 三套输出各一格 (各脚本里各占一行), 按本次输出模式三选一。
+    //   激励计划仍只有两套 (hid 一套, pad 与 p5g 共用), 变的是值落在哪个槽里。
+    const char* cal_var = p5g_mode ? CAL_VAR_P5G : (pad_mode ? CAL_VAR_PAD : CAL_VAR_HID);
     if (!a_P.empty()&&!pad_mode) std::cout<<"⚠ 忽略 -P (仅手柄模式: 手柄选择)\n";
     if (!a_T.empty()&&!pad_mode) std::cout<<"⚠ 忽略 -T (仅手柄模式: 扳机触发阈值)\n";
     if (pad_dump&&!pad_mode) std::cout<<"⚠ 忽略 --pad-dump (仅手柄模式)\n";
@@ -286,7 +291,10 @@ int main(int argc, char* argv[]) {
     // 自身运动账本的来源与账本→像素比例随输出模式 (io/pad_output.h; 单次运行一模式)
     own_motion_ledger_set(pad_mode);
 
-    std::cout<<"初始: L="<<init_l<<" spd_x="<<spd_x<<" spd_y="<<spd_y
+    // 启动行: 模式名 + 本模式那一组参数 (延迟 4 个 spd) + 延迟落在哪条 VAR 上 ——
+    //   现场第一眼要看清"现在用的是哪个槽"
+    std::cout<<"初始: 模式="<<out_mode<<" L="<<init_l<<" ("<<cal_var<<")"
+             <<" spd_x="<<spd_x<<" spd_y="<<spd_y
              <<" ads_spd_x="<<ads_spd_x<<" ads_spd_y="<<ads_spd_y<<" fov="<<fov_r<<"\n";
     if (p5g_mode)
         std::cout<<"模式: p5g (对 PS5 呈现 P5 General 手柄 0x2B81/0x0101, 真加密狗"
@@ -295,6 +303,9 @@ int main(int argc, char* argv[]) {
     else if (pad_mode)
         std::cout<<"模式: pad (XInput 手柄 0x045E/0x028E 呈现给宿主, 物理手柄全透传"
                  <<(pad_dump?", --pad-dump 叠加打印":"")<<")  触发阈值="<<pad_trig_thr<<"%\n";
+    else
+        std::cout<<"模式: hid (USB raw_gadget 通用鼠标, 物理鼠标经 EVIOCGRAB 独占读取"
+                    "并合并注入)\n";
     std::cout<<(pad_mode?"辅助瞄准注入: ":"鼠标接管: ")
              <<(aim_on?"开":"关 (纯透传: 原样透传, 检测/采集照常)")<<"\n";
     if (do_collect) {
@@ -319,7 +330,7 @@ int main(int argc, char* argv[]) {
     std::thread writer; if (do_collect) writer=std::thread(writer_thread,jpeg_q);
     std::thread hot(hotctl_thread);
     std::thread ai(ai_thread,model_path,cls,cam_dev,cam_fps,preview,
-                   init_l,persist_path,
+                   init_l,persist_path,cal_var,
                    pad_mode?CAL_MODE_PAD:CAL_MODE_HID,
                    a_o,fire_ms,auto_s,cooldown_ms,jpeg_q);
 

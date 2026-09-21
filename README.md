@@ -17,7 +17,7 @@ Capture card (UVC 1080p NV12) → GStreamer nvvidconv → CUDA preprocess → Te
 
 ## No hand-tuned gains
 
-Aim at a static background with texture, take both hands off the controls and hold both side keys for 5 seconds (the gamepad modes: L3+R3, or the webui's 「开始标定」 button). The program excites the loop — per axis, alternating deflections that stop the moment the picture has travelled far enough, each followed by a quiet pause — measures the background motion with block phase correlation, and estimates the **loop delay `L` (ms)**, the one calibrated quantity, from three independent readings of that same observation stream (a sub-frame-exact tail sum plus two frame-quantized edges). Success is a nod and writes back that mode's delay VAR (`L_EST` for hid, `L_EST_PAD` for pad) into the per-game launch script; a failure is a shake that writes nothing and states its reason and evidence in the log. The control-law bandwidth is then derived from `L` via phase margin (`wn=(90°−PM)π/180/L`, PM=50°) and the per-game speed feel is dialled by four per-axis **pull-speed ratios** (`--spd`, `--ads-spd`: effective sensitivity = baseline / (ratio/100), so `100` is the baseline and a larger ratio means a faster pull) — no hand-tuned magic numbers, adapts to PC/PS5 and 60/120fps.
+Aim at a static background with texture, take both hands off the controls and hold both side keys for 5 seconds (the gamepad modes: L3+R3, or the webui's 「开始标定」 button). The program excites the loop — per axis, alternating deflections that stop the moment the picture has travelled far enough, each followed by a quiet pause — measures the background motion with block phase correlation, and estimates the **loop delay `L` (ms)**, the one calibrated quantity, from three independent readings of that same observation stream (a sub-frame-exact tail sum plus two frame-quantized edges). Success is a nod and writes back that output mode's delay VAR (`HID_L_EST` for hid, `PAD_L_EST` for pad, `P5G_L_EST` for p5g) into the per-game launch script; a failure is a shake that writes nothing and states its reason and evidence in the log. The control-law bandwidth is then derived from `L` via phase margin (`wn=(90°−PM)π/180/L`, PM=50°) and the per-game speed feel is dialled by four per-axis **pull-speed ratios** (`--spd`, `--ads-spd`: effective sensitivity = baseline / (ratio/100), so `100` is the baseline and a larger ratio means a faster pull) — no hand-tuned magic numbers, adapts to PC/PS5 and 60/120fps.
 
 ## Control law
 
@@ -58,19 +58,27 @@ launches; the WebUI reads the guard's effective value, not its literal text.
 | `PAD_KEYWORD` | `-P` | pad/p5g: gamepad match substring (empty = any `*-event-joystick`; the dongle's own node is excluded) |
 | `PAD_TRIG_THR` | `-T` | pad/p5g: trigger threshold in % of full scale, shared by RT and LT; it gates the aim-trigger decision only — the analog value passes through 1:1 (hot param `padthr`) |
 | `PAD_DUMP` | `--pad-dump` | pad/p5g: log the merged logical state every ≥50 ms (injection debugging) |
-| `SPDX` / `SPDY` | `--spd` | hip-fire pull-speed ratio, per axis (integer; `100` = baseline, larger = faster, meaningful band `5..2000`) |
-| `ADS_SPDX` / `ADS_SPDY` | `--ads-spd` | the same pair while the ADS key is held |
+| `HID_L_EST` / `PAD_L_EST` / `P5G_L_EST` | `-l` | the calibrated loop delay, **one slot per output mode** — the only quantity the firmware ever writes back (each is hand-editable too) |
+| `HID_SPDX` `HID_SPDY` `HID_ADS_SPDX` `HID_ADS_SPDY` | `--spd` / `--ads-spd` | hid slot: pull-speed ratios, per axis (integer; `100` = baseline, larger = faster, meaningful band `5..2000`) |
+| `PAD_SPDX` `PAD_SPDY` `PAD_ADS_SPDX` `PAD_ADS_SPDY` | `--spd` / `--ads-spd` | pad slot: the same four in the gamepad channel's units |
+| `P5G_SPDX` `P5G_SPDY` `P5G_ADS_SPDX` `P5G_ADS_SPDY` | `--spd` / `--ads-spd` | p5g slot: the same four for the PS5 channel |
 | `MAX_SPEED` | `-x` | crosshair speed cap px/s (derivation in the template) |
-| `L_EST` / `L_EST_PAD` | `-l` | the calibrated loop delay, **one per output mode** — the only quantity the firmware ever writes back |
 | `AIM_KEY` / `AIM_ENABLED` / `FOV_R` / `PREVIEW` | `-k` / `-a` / `-r` / `-v` | trigger key, mouse takeover, FOV radius, preview |
 | `CAPTURE` `CAP_FIRE` `CAP_DET` `CAP_AUTO` `OUT_DIR` `FIRE_MS` `AUTO_S` `COOLDOWN_MS` `JPEG_Q` | `-o` `-e` `-F` `-A` `-C` `-q` | training-data collection |
 
-A per-axis `-s`/`S_EST`, a `-G`/`PAD_STICK_GAIN` entry and the old single `vcoef` do not exist: the
-per-game feel is the four integer ratios above, each an inverse factor on the effective gain
-(`base × 100 / ratio`), and both bases are compile-time constants (`S_HID_BASE`, `GAIN_PAD_BASE`).
-The base only decides how close a ratio's first guess is; the ratios are what gets dialled, and the
-injection, the ledger→pixel scale and the own-motion compensation all consume the same per-axis
-effective gain, so they cannot desynchronize.
+**Each output mode owns a slot of five values** (one delay + four ratios), and switching
+`OUTPUT_MODE` switches the whole slot: the launcher's `case` takes that slot's delay and ratios, the
+firmware writes a calibration back only into that slot's delay VAR, and the WebUI shows, edits and
+saves only the current mode's slot. The slots are not interchangeable, which is why they exist: the
+same ratio number means different speeds under the two bases below, and each mode's loop delay is
+its own physical quantity (`p5g` adds the dongle's signing round trip to it).
+
+The per-game feel is the four integer ratios of the active slot — there is no per-axis sensitivity
+entry, no second gain and no curve coefficient. Each ratio is an inverse factor on the effective gain
+(`base × 100 / ratio`), and both bases are compile-time constants (`S_HID_BASE` = 1.0 px/count,
+`GAIN_PAD_BASE` = 3000 px/s full deflection). The base only decides how close a ratio's first guess
+is; the ratios are what gets dialled, and the injection, the ledger→pixel scale and the own-motion
+compensation all consume the same per-axis effective gain, so they cannot desynchronize.
 
 ## Hot-parameter channel
 
@@ -97,11 +105,13 @@ It is an **orchestrator, not a replacement**: it runs the same three steps a lau
 profile script so calibration writes back to the same place). Adding a game means copying
 `scripts/game/template.sh.example` → `<game>.sh` (the WebUI has a "copy profile" button too); the new
 script shows up in the profile list on the next scan. The output mode is a field of the profile, and
-the rows a mode owns (`-D` for hid, `-P`/`-T`/`--pad-dump` for pad/p5g) are shown only for that mode
-— switching it changes which device VARs reach the generated command line, and the `-l` source VAR
-switches with it (`L_EST` ↔ `L_EST_PAD`). Calibration runs from the launcher's key hold (both side
+the rows a mode owns (`-D` for hid, `-P`/`-T`/`--pad-dump` for pad/p5g) and the mode's five-value
+slot (delay + four ratios) are shown only for that mode — switching it changes which device VARs
+reach the generated command line, and the delay plus all four ratios switch with it
+(`HID_L_EST`/`HID_SPDX`… ↔ `PAD_L_EST`/`PAD_SPDX`… ↔ `P5G_L_EST`/`P5G_SPDX`…); a save writes back
+only the current mode's slot. Calibration runs from the launcher's key hold (both side
 keys for hid, L3+R3 for the gamepad modes) or, for pad/p5g, from the WebUI's 「开始标定」 button (hot
-param `padcalib=1`). The `[标定]` lines, the per-level readings and the verdict stay visible in the
+param `padcalib=1`). The `[标定]` lines, the per-segment readings and the verdict stay visible in the
 page's log stream; the 60 s report-rate lines (`[USB-HID]`/`[PAD-USB]`), `[AI FPS]` and `[SAVE]` are
 filtered out of it (they appear as cards and history instead, and the raw ring is still in the
 download). `webui/README.md` is the operator manual (permissions, security, discovery model,

@@ -1,4 +1,8 @@
 * text=auto
+# 规则文件自身也按 LF: CRLF 会让每一条模式带上尾随 \r — 在 Jetson (git 解析 LF)
+#   上等于把 eol 与 binary 全部变成未识别的属性值, 静默失效
+/.gitattributes text eol=lf
+/.gitignore text eol=lf
 *.sh text eol=lf
 # 启动脚本模板同样按脚本强制 LF (Jetson bash 不认 CRLF/BOM)
 *.sh.example text eol=lf

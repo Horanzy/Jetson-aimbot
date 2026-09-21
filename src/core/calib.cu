@@ -168,12 +168,35 @@ bool persist_calibration(const std::string& path, const std::string& var, float 
     std::ifstream in(path); if (!in.good()) return false;
     std::vector<std::string> lines; std::string line;
     while (std::getline(in,line)) lines.push_back(line); in.close();
-    char buf[64];
-    snprintf(buf,sizeof(buf),"%s=%.1f",var.c_str(),(double)l);
+    char val[32];
+    snprintf(val,sizeof(val),"%.1f",(double)l);
     const std::string key=var+"=";
     bool found=false;
-    for (auto& ln:lines) if (ln.rfind(key,0)==0) { ln=buf; found=true; }
-    if (!found) lines.push_back(buf);
+    for (auto& ln:lines) {
+        if (ln.rfind(key,0)!=0) continue;
+        found=true;
+        // 原行是模板的守卫写法 "${VAR:-旧值}" 时回写成守卫形式, 只换默认位: 守卫是脚本
+        //   "少写一行也能起"的承诺, 一次回写把它抹成裸赋值就撕毁了这个承诺 (该行此后
+        //   不再有兜底值)。值后的行内注释 (脚本约定: 空白 + #) 照原样留在行尾。
+        //   非守卫行 (裸赋值) 按裸赋值重写 —— 回写只认自己那一个值的落点, 不去猜别人的
+        //   写法; 守卫名与 VAR 不同名时同样按裸行处理 (那不是本 VAR 的守卫)。
+        const std::string rhs=ln.substr(key.size());
+        size_t cut=rhs.size();
+        const size_t hash=rhs.find('#');
+        if (hash!=std::string::npos && hash>0 && (rhs[hash-1]==' '||rhs[hash-1]=='\t')) {
+            cut=hash;
+            while (cut>0 && (rhs[cut-1]==' '||rhs[cut-1]=='\t')) --cut;   // 对齐空白归注释
+        }
+        const std::string body=rhs.substr(0,cut), tail=rhs.substr(cut);
+        const char q=body.size()>=2 ? body.front() : '\0';
+        const bool quoted=(q=='"'||q=='\'') && body.back()==q;
+        const std::string inner=quoted ? body.substr(1,body.size()-2) : body;
+        const std::string guard="${"+var+":-";
+        ln = (quoted && inner.rfind(guard,0)==0 && inner.back()=='}')
+           ? key + q + guard + val + "}" + q + tail     // 守卫形式: 只换默认位
+           : key + val + tail;                           // 裸形式/缺守卫: 裸赋值
+    }
+    if (!found) lines.push_back(key+val);
     struct stat st{}; bool have=(stat(path.c_str(),&st)==0);
     std::string tmp=path+".tmp."+std::to_string((long)getpid());
     { std::ofstream o(tmp,std::ios::trunc); if (!o.good()) return false;

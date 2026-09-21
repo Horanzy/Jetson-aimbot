@@ -17,6 +17,8 @@ from . import config
 
 VAR_RE = re.compile(r"^\s*([A-Z_][A-Z0-9_]*)\s*=\s*(.*?)\s*$")
 SCRIPT_STEM_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+# 输出模式: 三套输出互斥, 各自独占 UDC (顺序也是 UI 里分组的顺序)
+OUTPUT_MODES = ("hid", "pad", "p5g")
 # 模板约定: 每个手改量写成 ${VAR:-默认}, 缺行也能起。读脚本时必须解析到**有效值**,
 #   否则 UI 看到的是 ${CLASS_ID:-0} 这样的字面量而不是 0。
 _GUARD_RE = re.compile(r"^\$\{[A-Za-z_][A-Za-z0-9_]*:-?(.*)\}$", re.S)
@@ -30,14 +32,8 @@ PARAM_DEFS = {
     "cam_dev":         dict(kind="str",   default="Asus"),
     "cam_fps":         dict(kind="int",   lo=1, hi=240, default=120),
     "max_speed":       dict(kind="float", lo=100.0, hi=20000.0, default=1500.0),
-    # 拉枪速度倍率 (逐轴, 100 = 基线): 与有效灵敏度成反比, 调大 = 更快;
-    #   范围 = 固件 spd_clamp 的夹取带 (防误输入), 有意义的带是 5..2000
-    "spd_x":           dict(kind="int",   lo=1, hi=10000, default=100),
-    "spd_y":           dict(kind="int",   lo=1, hi=10000, default=100),
-    "ads_spd_x":       dict(kind="int",   lo=1, hi=10000, default=100),
-    "ads_spd_y":       dict(kind="int",   lo=1, hi=10000, default=100),
     # 输出模式 (冷: 它决定整条输出后端, 运行中不可换) 与各模式的设备选择
-    "output_mode":     dict(kind="enum",  choices=("hid", "pad", "p5g"), default="hid"),
+    "output_mode":     dict(kind="enum",  choices=OUTPUT_MODES, default="hid"),
     "mouse_keyword":   dict(kind="str",   default=""),
     "pad_keyword":     dict(kind="str",   default=""),
     # 手柄触发阈值 (% 满量程, RT/LT 共享; 只门控触发判定, 扳机模拟量仍 1:1 透传)
@@ -57,12 +53,34 @@ PARAM_DEFS = {
     "cooldown_ms":     dict(kind="int",   lo=0, hi=60000, default=800),
     "jpeg_q":          dict(kind="int",   lo=1, hi=100, default=95),
 }
-# 热参数白名单: param key → 固件通道 key (对应 src/io/hotctl.cu hotctl_thread)
+# 三套输出各占一组 5 个值: 延迟 1 + 拉枪倍率 4。分槽是必须的 —— 同一个倍率数在两套
+#   口径下含义不同 (hid 基线 1.0 px/count, 手柄基线 3000 px/s 满偏屏速), 延迟也各是一个
+#   物理量 (p5g 还多一跳真加密狗的签名往返), 共用一套等于让一个模式的取值去服务另一套
+#   基线。切换 output_mode 就是整套自动换, 保存/标定回写只落进本模式那一格。
+# 倍率刻度: 整数, 100 = 基线, 与有效灵敏度成反比 (有效灵敏度 = 基线/(倍率/100)),
+#   范围 = 固件 spd_clamp 的夹取带 (防误输入), 有意义的带是 5..2000。
+SPEED_SLOTS = (("spd_x", "SPDX"), ("spd_y", "SPDY"),
+               ("ads_spd_x", "ADS_SPDX"), ("ads_spd_y", "ADS_SPDY"))
+for _m in OUTPUT_MODES:
+    PARAM_DEFS["l_%s" % _m] = dict(kind="float", lo=0.0, hi=120.0, default=60.0)
+    for _a, _v in SPEED_SLOTS:
+        PARAM_DEFS["%s_%s" % (_m, _a)] = dict(kind="int", lo=1, hi=10000, default=100)
+# 热参数白名单: param key → 固件通道 key (对应 src/io/hotctl.cu hotctl_thread)。
+#   固件侧的倍率热参只有一套 (spdx/spdy/adsspdx/adsspdy, 作用于运行中实例的当前输出
+#   模式), 所以槽键→线上键的映射按模式取 (mode_spd_keys): 保存 pad 槽而实例跑 hid 时,
+#   改的是下次启动的取值, 不外发热参。
 HOT_WIRE_KEYS = {"conf": "t", "y_offset": "y", "max_speed": "x", "fov": "fov", "aim_key": "k",
                  "aim_enabled": "aim", "cap_fire": "cap_fire", "cap_det": "cap_det",
-                 "cap_auto": "cap_auto", "spd_x": "spdx", "spd_y": "spdy",
-                 "ads_spd_x": "adsspdx", "ads_spd_y": "adsspdy",
-                 "pad_trig_thr": "padthr"}
+                 "cap_auto": "cap_auto", "pad_trig_thr": "padthr"}
+
+
+def mode_spd_keys(mode) -> dict:
+    """某输出模式的四个倍率参数键 → 热参线上键 (模式是槽唯一的身份)。"""
+    m = mode if mode in OUTPUT_MODES else "hid"
+    return {"%s_%s" % (m, a): w for a, w in
+            (("spd_x", "spdx"), ("spd_y", "spdy"),
+             ("ads_spd_x", "adsspdx"), ("ads_spd_y", "adsspdy"))}
+
 
 SCRIPT_VARS = {
     "CLASS_ID": "class_id", "CONF_THRESH": "conf", "Y_OFFSET": "y_offset",
@@ -72,19 +90,24 @@ SCRIPT_VARS = {
     "PAD_KEYWORD": "pad_keyword",                        # pad/p5g: -P
     "PAD_TRIG_THR": "pad_trig_thr",                      # pad/p5g: -T (热参 padthr)
     "PAD_DUMP": "pad_dump",                              # pad/p5g: --pad-dump
-    "SPDX": "spd_x", "SPDY": "spd_y",                    # 腰射拉枪速度倍率 (逐轴, 唯一手感旋钮)
-    "ADS_SPDX": "ads_spd_x", "ADS_SPDY": "ads_spd_y",    # ADS 键按住时的同一对
     "AIM_KEY": "aim_key", "AIM_ENABLED": "aim_enabled", "PREVIEW": "preview",
     "CAPTURE": "capture_enabled", "CAP_FIRE": "cap_fire", "CAP_DET": "cap_det",
     "CAP_AUTO": "cap_auto", "OUT_DIR": "capture_dir", "FIRE_MS": "fire_ms",
     "AUTO_S": "auto_s", "COOLDOWN_MS": "cooldown_ms", "JPEG_Q": "jpeg_q",
     "MODEL_PATH": "model", "FOV_R": "fov",
 }
-# 固件标定回写量 (脚本 VAR → 只读展示键): 标定只写延迟, 速度倍率是手动项。
-#   两个输出模式各占一条, 互不覆盖: hid → L_EST, pad/p5g → L_EST_PAD。
-CALIB_VARS = {"L_EST": "l_hid", "L_EST_PAD": "l_pad"}
+# 三套输出的 5 个值各自的 VAR 名: <模式>_L_EST (固件标定回写目标) + <模式>_SPDX/SPDY/
+#   ADS_SPDX/ADS_SPDY; 模式前缀是必需的身份 —— 同一个数在两套口径下含义不同, 所以每个值
+#   只有一个拼写, 且它自带模式。
+for _m in OUTPUT_MODES:
+    SCRIPT_VARS["%s_L_EST" % _m.upper()] = "l_%s" % _m
+    for _a, _v in SPEED_SLOTS:
+        SCRIPT_VARS["%s_%s" % (_m.upper(), _v)] = "%s_%s" % (_m, _a)
+# 固件标定回写量 (脚本 VAR → 参数键): 标定只写延迟, 速度倍率是手动项。三套输出各一条,
+#   互不覆盖 (delay 是三者各自的物理量: p5g 的回路还含一跳加密狗签名往返)。
+CALIB_VARS = {"%s_L_EST" % m.upper(): "l_%s" % m for m in OUTPUT_MODES}
 # 模式 → 本模式那条延迟的键 (冷参数 output_mode 决定, 与固件 -l 的来源同一条规则)
-MODE_L_KEY = {"hid": "l_hid", "pad": "l_pad", "p5g": "l_pad"}
+MODE_L_KEY = {m: "l_%s" % m for m in OUTPUT_MODES}
 
 
 def mode_l_key(output_mode) -> str:
@@ -145,13 +168,15 @@ def _coerce(key: str, val: str, root: Path):
 
 
 def parse_script(path: Path, root: Path):
-    """只读解析 game 脚本顶部 VAR=value 块。返回 (params, calib)。"""
+    """只读解析 game 脚本顶部 VAR=value 块 → 参数集。
+
+    延迟与四个倍率一样是**可编辑参数** (三套输出各占一槽), 只是它的落点同时是固件标定
+    的回写目标 (CALIB_VARS) —— 同一份值只解析一次, 没有第二处存储。"""
     params = {k: d["default"] for k, d in PARAM_DEFS.items()}
-    calib = {v: None for v in CALIB_VARS.values()}
     try:
         text = path.read_text(encoding="utf-8-sig", errors="replace")   # 脚本带 BOM
     except OSError:
-        return params, calib
+        return params
     for line in text.splitlines():
         line = re.split(r"\s#", line, maxsplit=1)[0].strip()            # 脚本约定: # 前有空格的行内注释
         m = VAR_RE.match(line)
@@ -165,16 +190,10 @@ def parse_script(path: Path, root: Path):
         if g:
             v = g.group(1)
         v = v.replace("$ROOT", str(root))
-        if name in CALIB_VARS:
-            try:
-                calib[CALIB_VARS[name]] = float(v)
-            except ValueError:
-                pass
-            continue
         key = SCRIPT_VARS.get(name)
         if key is not None:
             params[key] = _coerce(key, v, root)
-    return params, calib
+    return params
 
 
 def validate_params(user: dict, root: Path, partial: bool = False) -> dict:
@@ -228,8 +247,13 @@ def _fmt_value(key: str, val, root: Path) -> str:
 
     脚本尾部以路径变量直接展开传参, 相对路径会随 cwd 漂 —— 所以部署根内的路径一律写成
     `$ROOT/<相对>`, 解析时再还原。这一对是往返恒等的, 一次保存不会把用户写好的
-    `$ROOT/engine/x.engine` 改写成绝对路径 (那会让"只改目标 VAR"变成两处改动)。"""
+    `$ROOT/engine/x.engine` 改写成绝对路径 (那会让"只改目标 VAR"变成两处改动)。
+
+    延迟是唯一的浮点手改量, 写法固定一位小数 (= 固件标定回写的格式): 它是往返恒等的,
+    于是保存 pad 槽时 hid/p5g 槽的延迟行逐字不动。"""
     d = PARAM_DEFS[key]
+    if key in CALIB_VARS.values():          # 三套输出各一槽延迟 (L_MIN..L_MAX)
+        return "%.1f" % float(val)
     if d["kind"] == "int":
         return str(int(val))
     if d["kind"] == "float":
@@ -340,12 +364,11 @@ def scan_profiles(root: Path) -> list:
     for p in sorted(game_dir.glob("*.sh")):
         if not SCRIPT_STEM_RE.match(p.stem):
             continue
-        script_params, calib = parse_script(p, root)
+        script_params = parse_script(p, root)
         out.append({
             "file": p.stem,
             "display_name": p.stem,
-            "script_params": script_params,
-            "calib": calib,                 # 标定值永远以脚本为权威 (固件 -S 回写目标)
+            "script_params": script_params,   # 三套输出的 5 个值都在里面 (脚本 = 唯一事实源)
         })
     return out
 

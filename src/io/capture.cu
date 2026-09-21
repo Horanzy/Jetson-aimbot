@@ -33,7 +33,8 @@
 // conf / y_off / fov 每帧从热参数原子取快照 (帧内一致), 未收热参时值与 CLI 一致
 void ai_thread(std::string model_path, int target_cls,
                std::string cam_dev, int cam_fps, bool preview,
-               float init_l, std::string persist_path, CalMode cal_mode,
+               float init_l, std::string persist_path, const char* cal_var,
+               CalMode cal_mode,
                std::string out_dir, int fire_ms, double auto_s,
                int cooldown_ms, int jpeg_quality) {
     const int cam_w=1920, cam_h=1080;
@@ -261,7 +262,7 @@ void ai_thread(std::string model_path, int target_cls,
 
         if (g_calib_request.exchange(false)) {
             // 拟合 (停顿 + 三读数; 账本不参与 — 测量完全来自屏幕位移), 诊断与回写
-            //   都在 io/calib_run.cu 里 (两模式同一份口径)
+            //   都在 io/calib_run.cu 里 (hid 与手柄两种通道同一份口径)
             const CalResult cr=cal_fit(cal_mode,hist,g_cal_win.snapshot());
             const int done=cal_done_code(cr);
             cal_print_diag(cal_mode,cr,hist.size());
@@ -281,9 +282,9 @@ void ai_thread(std::string model_path, int target_cls,
             }
             if (done==1) {
                 if (!persist_path.empty()) {
-                    if (cal_writeback(cal_mode,cr,persist_path))
-                        std::cout<<"[标定] 已回写 "<<persist_path
-                                 <<(cal_mode==CAL_MODE_HID?" (L_EST)":" (L_EST_PAD)")<<"\n";
+                    // 回写 VAR 名由输出模式在 main 里选好 (三套输出各一格延迟)
+                    if (cal_writeback(cal_var,cr,persist_path))
+                        std::cout<<"[标定] 已回写 "<<persist_path<<" ("<<cal_var<<")\n";
                     else std::cerr<<"[标定] 回写失败\n"; }
                 l_est=cr.l_est;      // 只标延迟: 唯一进运行态的标定量
             } else std::cout<<"[标定] 失败, 未回写 (无编造的值)\n";

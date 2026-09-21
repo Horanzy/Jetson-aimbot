@@ -139,11 +139,6 @@ int cal_note_sample(const CalibSample& s) {
 
 namespace {
 
-inline std::chrono::steady_clock::time_point shift_ticks(
-        const std::chrono::steady_clock::time_point& t, int ticks) {
-    return shift_ms(t, (double)ticks * (double)TICK_MS);
-}
-
 float median_of(std::vector<float> v) {
     if (v.empty()) return 0.0f;
     std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
@@ -243,8 +238,8 @@ SegOut measure_seg(const std::deque<CalibSample>& hist, int slot, const CalSegWi
     //   2–4ms, 高速段就是 10% 偏差)。两端都在同一条观测流上 → 环路延迟在斜率里相消。
     double acc = 0.0, a_prev = 0.0, t_prev = 0.0;
     bool have_on = false, have_off = false, have_25 = false, have_75 = false;
-    double t_i0 = 0, a_i0 = 0, t_off = 0, t_25 = 0, t_75 = 0;
-    int n_mid = 0, n_idx = 0;
+    double a_i0 = 0, t_25 = 0, t_75 = 0;
+    int n_idx = 0;
     const double sig = (double)sigma;
     for (auto* s : v) {
         const double proj = (double)w.dir * (double)(w.axis ? s->sy : s->sx);
@@ -253,7 +248,7 @@ SegOut measure_seg(const std::deque<CalibSample>& hist, int slot, const CalSegWi
         const int n_cur = ++n_idx;
         const double env = (double)CAL_EDGE_SNR * sig * std::sqrt((double)n_cur);
         if (!have_on && a_cur > env) {                 // 越过噪声包络 = 画面开始响应
-            t_i0 = t_cur; a_i0 = a_cur; have_on = true;
+            a_i0 = a_cur; have_on = true;
             // 起始沿: 画面开始动的第一个样本落在 (t0+L, t0+L+dt] 内 → 中位括号 ±dt/2
             o.l_onset = (float)(t_cur - 0.5 * (double)s->dt_ms);
         }
@@ -265,13 +260,7 @@ SegOut measure_seg(const std::deque<CalibSample>& hist, int slot, const CalSegWi
         };
         if (!have_25 && cross(0.25 * (double)target, t_25)) have_25 = true;
         if (!have_75 && cross(0.75 * (double)target, t_75)) have_75 = true;
-        if (!have_off && a_cur >= (double)target) {
-            const double den = a_cur - a_prev;
-            t_off = (a_prev >= (double)target || !(den > 0))
-                  ? t_prev : t_prev + ((double)target - a_prev) / den * (t_cur - t_prev);
-            have_off = true;
-        }
-        if (have_on && !have_off) ++n_mid;
+        if (!have_off && a_cur >= (double)target) have_off = true;
         acc = a_cur; a_prev = a_cur; t_prev = t_cur;
     }
     o.t_last = (float)acc;
@@ -525,10 +514,9 @@ void cal_print_diag(CalMode mode, const CalResult& r, size_t hist_n) {
     fflush(stdout);
 }
 
-bool cal_writeback(CalMode mode, const CalResult& r, const std::string& persist_path) {
+bool cal_writeback(const char* var, const CalResult& r, const std::string& persist_path) {
     if (!r.ok || persist_path.empty()) return false;
-    return persist_calibration(persist_path, mode == CAL_MODE_HID ? CAL_VAR_HID : CAL_VAR_PAD,
-                               r.l_est);
+    return persist_calibration(persist_path, var, r.l_est);
 }
 
 // ========================= 状态机 =========================
@@ -588,8 +576,6 @@ template <size_t N>
 void enter(CalSt& s, const CalibSeg (&seq)[N], CalPhase ph) {
     s.seq = seq; s.slen = (int)N; s.si = s.st = 0; s.phase = ph;
 }
-template <size_t N>
-int seq_len(const CalibSeg (&)[N]) { return (int)N; }
 
 void start_round(CalSt& s, CalMode mode) {
     g_cal_win.reset(mode);

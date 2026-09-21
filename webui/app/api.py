@@ -244,20 +244,23 @@ def _wire_value(pk: str, v):
 def api_profile_put(stem: str, inp: ProfileIn):
     """保存 = 原子写回脚本 (脚本 = 唯一事实源), 然后与脚本现值做热参差量下发。
 
-    提交体是**补丁**: 只校验并写回它点名的键, 其余 VAR 保持脚本现值 —— 一次只改 spd
-    的提交不会把别的 VAR 打回默认。"""
+    提交体是**补丁**: 只校验并写回它点名的键, 其余 VAR 保持脚本现值 —— UI 只提交本模式
+    那一槽的改动 (切换 output_mode 后原样保存不会碰另两槽的任何一行), 后端也照补丁语义
+    写回, 于是"保存只写当前槽"在两头都成立。"""
     p = _find_profile(stem)
     if p is None:
         raise HTTPException(404, "未知的游戏 profile: %s" % stem)
     script_path = S.root() / "scripts" / "game" / (stem + ".sh")
-    old_params, _ = discover.parse_script(script_path, S.root())
+    old_params = discover.parse_script(script_path, S.root())
     new_params = dict(old_params)
     new_params.update(discover.validate_params(inp.params or {}, S.root(), partial=True))
     try:
         discover.write_script_params(script_path, new_params, S.root())
     except OSError as e:
         raise HTTPException(500, "写回脚本失败: %s" % e)
-    # 热参数: 本次保存中变化的热项 → 直接下发运行中实例 (即时生效, 不重启)
+    # 热参数: 本次保存中变化的热项 → 直接下发运行中实例 (即时生效, 不重启)。
+    #   倍率热参只有一套 (作用于运行中实例的当前输出模式), 所以槽键按**运行中实例的模式**
+    #   取: 改的是另两槽的值时它只是脚本改动, 下次【启动】才生效。
     applied, reason = {}, None
     inst = S.inst.snapshot()
     if inst["state"] == "running":
@@ -266,7 +269,11 @@ def api_profile_put(stem: str, inp: ProfileIn):
         elif not inst["hot_capable"]:
             reason = "运行中的二进制不支持热参数通道 (旧版固件, 重编译后启动即可)"
         elif inst["profile"] == stem:
-            for pk, wk in discover.HOT_WIRE_KEYS.items():
+            run_mode = str(old_params.get("output_mode") or "hid")   # 实例启动时的模式
+            hot_keys = dict(discover.HOT_WIRE_KEYS)
+            if run_mode in discover.OUTPUT_MODES:
+                hot_keys.update(discover.mode_spd_keys(run_mode))
+            for pk, wk in hot_keys.items():
                 if not discover._same(old_params.get(pk), new_params.get(pk)):
                     applied[wk] = _wire_value(pk, new_params[pk])
             if applied:
@@ -274,6 +281,8 @@ def api_profile_put(stem: str, inp: ProfileIn):
                     proc.send_hot(inst["hot_port"] or S.cfg["hot_port"], applied)
                 except OSError as e:
                     reason = "热参发送失败: %s (实例可能刚好退出)" % e
+            elif new_params.get("output_mode") != run_mode:
+                reason = "输出模式已改 (冷参数): 下次【启动】生效, 本次不发热参"
         else:
             reason = "运行中的是其它 profile, 本 profile 的改动将在下次【启动】生效"
     S.rescan()
@@ -310,7 +319,7 @@ def api_instance_cmd(profile: str):
     p = _find_profile(profile)
     if p is None:
         raise HTTPException(404, "未知的游戏 profile: %s" % profile)
-    argv = proc.build_argv(S.root(), p["script_params"], p["calib"],
+    argv = proc.build_argv(S.root(), p["script_params"],
                            S.root() / "scripts" / "game" / (profile + ".sh"))
     return {"cmd": proc.cmd_string(argv)}
 
@@ -322,7 +331,7 @@ def api_instance_start(body: dict):
     if p is None:
         raise HTTPException(404, "未知的游戏 profile: %s" % stem)
     ok, err = S.inst.start(S.root(), p["file"], p["display_name"], p["script_params"],
-                           p["calib"], S.root() / "scripts" / "game" / (stem + ".sh"))
+                           S.root() / "scripts" / "game" / (stem + ".sh"))
     if not ok:
         raise HTTPException(409, err)
     return {"ok": True}
@@ -341,7 +350,8 @@ def api_instance_calib():
     """请求运行中的实例跑一轮标定 (热参 padcalib=1, 固件一次消费即清)。
 
     只有手柄模式有这条入口 —— hid 的触发是鼠标双侧键长按 5 秒, 固件不给按钮路径。
-    落地量永远是延迟 (hid 写 L_EST, pad/p5g 写 L_EST_PAD), 结论看日志的 `[标定]` 行。"""
+    落地量永远是延迟, 写进**当前输出模式**那一格 (HID_L_EST / PAD_L_EST / P5G_L_EST),
+    结论看日志的 `[标定]` 行。"""
     inst = S.inst.snapshot()
     if inst["state"] != "running":
         raise HTTPException(409, "实例未在运行 —— 标定要在运行中触发")

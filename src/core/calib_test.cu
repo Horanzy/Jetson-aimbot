@@ -474,7 +474,14 @@ int main() {
     std::cout << "[6] 不可测的诚实性: 失败 + 不写回\n";
     {
         const std::string path = "/tmp/calib_test_script.sh";
-        { std::ofstream o(path, std::ios::trunc); o << "#!/bin/bash\nL_EST=60.0\nL_EST_PAD=60.0\n"; }
+        // 模板形态的脚本: 三套输出各一格延迟, 都是守卫写法 —— 回写要落在本模式那一格,
+        //   且不该把守卫写法抹成裸赋值 (control_test [7] 逐字钉住写法的细节)
+        const std::string script =
+            "#!/bin/bash\n"
+            "HID_L_EST=\"${HID_L_EST:-60.0}\"\n"
+            "PAD_L_EST=\"${PAD_L_EST:-60.0}\"\n"
+            "P5G_L_EST=\"${P5G_L_EST:-60.0}\"\n";
+        { std::ofstream o(path, std::ios::trunc); o << script; }
         const auto slurp = [&]() { std::ifstream in(path);
             return std::string((std::istreambuf_iterator<char>(in)),
                                std::istreambuf_iterator<char>()); };
@@ -483,7 +490,7 @@ int main() {
             const E2E e = run_e2e(CAL_MODE_HID, {40, 1.5, 0, 0.0, 0, 1}, 120, 3u, true);
             CHECK(!e.ok && std::string(e.r.err).find("静止") != std::string::npos,
                   "画面完全静止 → 失败并说明原因 (不允许硬算)");
-            CHECK(!cal_writeback(CAL_MODE_HID, e.r, path), "失败路径不写回");
+            CHECK(!cal_writeback(CAL_VAR_HID, e.r, path), "失败路径不写回");
         }
         // 只有噪声、没有任何响应 (画面在抖但不跟命令)
         {
@@ -497,7 +504,7 @@ int main() {
                    cal_plan_worst_ms(CAL_MODE_HID));
             CHECK(e.ticks <= cal_plan_worst_ms(CAL_MODE_HID),
                   "不响应轴被跳过 → 整轮时长不超过上限 (不会跑满最坏时长)");
-            CHECK(!cal_writeback(CAL_MODE_HID, e.r, path), "失败路径不写回");
+            CHECK(!cal_writeback(CAL_VAR_HID, e.r, path), "失败路径不写回");
         }
         // 尾迹被停顿截断: L 远超静止参考窗起点 → 失败而不是给一个偏小的数
         {
@@ -506,18 +513,24 @@ int main() {
             CHECK(std::string(e.r.err).find("截断") != std::string::npos
                   || std::string(e.r.err).find("物理带") != std::string::npos,
                   "失败原因 = 尾迹被停顿截断 / 超出物理带 (绝不给截断后的偏小值)");
-            CHECK(std::string(slurp()).find("L_EST=60.0") != std::string::npos,
-                  "脚本里的 L_EST 一字未动 (失败不写回)");
+            CHECK(slurp() == script, "失败路径下三格延迟逐字未动 (绝不写编造的值)");
         }
-        // 成功路径: 写回 + 只写该模式的那一条
+        // 成功路径: 写本模式那一格 (pad 与 p5g 共用激励计划, 但各写各的延迟槽)
         {
             const E2E e = run_e2e(CAL_MODE_PAD, {40, 1.5, 0, 0.03, 0, 1}, 120, 9u, false);
             CHECK(e.ok, "手柄模式 (单轴) 整轮成功");
-            CHECK(cal_writeback(CAL_MODE_PAD, e.r, path), "成功路径写回");
+            CHECK(cal_writeback(CAL_VAR_PAD, e.r, path), "成功路径写回");
+            char want[128];
+            snprintf(want,sizeof(want),"PAD_L_EST=\"${PAD_L_EST:-%.1f}\"\n",(double)e.r.l_est);
             const std::string all = slurp();
-            CHECK(all.find("L_EST_PAD=") != std::string::npos
-                  && all.find("L_EST=60.0") != std::string::npos,
-                  "只写该模式的 VAR (L_EST_PAD), 另一模式的原值不变");
+            CHECK(all.find(want) != std::string::npos,
+                  "只写本模式的 VAR (PAD_L_EST), 且守卫写法原样保住");
+            CHECK(all.find("HID_L_EST=\"${HID_L_EST:-60.0}\"") != std::string::npos
+                  && all.find("P5G_L_EST=\"${P5G_L_EST:-60.0}\"") != std::string::npos,
+                  "另两格延迟原值不变");
+            CHECK(cal_writeback(CAL_VAR_P5G, e.r, path)
+                  && slurp().find("P5G_L_EST=\"${P5G_L_EST:-") != std::string::npos,
+                  "第三种输出 (p5g) 写的是它自己那一格 (VAR 名由调用方三选一)");
         }
         ::unlink(path.c_str());
     }
