@@ -112,7 +112,7 @@ SCRIPT_PATH="$(realpath "$0")"
 MODE_ARGS=()
 case "${OUTPUT_MODE:-hid}" in
   pad|p5g)
-    MODE_ARGS=(-M "${OUTPUT_MODE:-hid}" -P "${PAD_KEYWORD:-}" -T "${PAD_TRIG_THR:-6}")
+    MODE_ARGS=(-M "${OUTPUT_MODE}" -P "${PAD_KEYWORD:-}" -T "${PAD_TRIG_THR:-6}")
     [ "${PAD_DUMP:-n}" = "y" ] && MODE_ARGS+=(--pad-dump)
     L_V="${L_EST_PAD:-60.0}"
     ;;
